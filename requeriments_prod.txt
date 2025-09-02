@@ -1,0 +1,15 @@
+pandas
+numpy
+python-binance
+yfinance
+python-dotenv
+requests
+joblib
+scikit-learn
+lightgbm
+matplotlib
+streamlit
+plotly
+psycopg2-binary
+schedule
+python-telegram-bot

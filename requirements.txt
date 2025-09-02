@@ -1,0 +1,12 @@
+pandas
+numpy
+python-binance
+yfinance
+python-dotenv
+requests
+joblib
+scikit-learn
+lightgbm
+matplotlib
+streamlit
+plotly
