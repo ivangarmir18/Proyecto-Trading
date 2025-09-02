@@ -126,7 +126,7 @@ if DASHBOARD_PASSWORD:
             st.text_input("Password", type="password", key="pwd")
             if st.button("Entrar"):
                 if check_password():
-                    st.experimental_rerun()
+                    st.rerun()()
                 else:
                     st.error("Password incorrecto")
         else:
@@ -200,7 +200,7 @@ sort_desc = st.sidebar.checkbox("Descendente", value=True)
 # Refresh / batch actions
 st.sidebar.header("Acciones")
 if st.sidebar.button("Refresh tabla (releer scores)"):
-    st.experimental_rerun()
+    st.rerun()()
 
 # Main table
 st.subheader("Listado de activos y scores")
@@ -255,7 +255,7 @@ if selected is not None and len(selected) > 0:
                 try:
                     fetch_and_score(storage, fetcher, sel_asset, sel_interval)
                     st.success("Símbolo actualizado y score recalculado.")
-                    st.experimental_rerun()
+                    st.rerun()()
                 except Exception as e:
                     st.error(f"Error update: {e}")
     with colC:
@@ -266,7 +266,7 @@ if selected is not None and len(selected) > 0:
                     start_ms = end_ms - 30 * 24 * 3600 * 1000
                     df_back = fetcher.backfill_range(sel_asset, sel_interval, start_ms, end_ms, save_callback=storage.make_save_callback(), progress=False)
                     st.success(f"Backfill completado: {len(df_back)} velas")
-                    st.experimental_rerun()
+                    st.rerun()()
                 except Exception as e:
                     st.error(f"Backfill error: {e}")
 
@@ -316,7 +316,7 @@ with col2:
                 except Exception as e:
                     logger.exception("Score fail for %s: %s", a, e)
             st.success("Scores recalculados.")
-            st.experimental_rerun()
+            st.rerun()()
 
 with col3:
     if st.button("Entrenar IA (últimos assets seleccionados)"):
