@@ -33,7 +33,7 @@ except Exception:
 from binance.client import Client as BinanceClient
 
 # storage helper (expects save_candles(df, db_path=...))
-from core.storage import save_candles
+from core.storage_postgres import save_candles
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / "data" / "cache"

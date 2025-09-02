@@ -1,0 +1,21 @@
+# Entornos virtuales
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Archivos de configuración sensibles
+.env
+.env.*
+!example.env   # si quieres dejar un ejemplo vacío
+
+# Bases de datos locales
+*.db
+data/db/
+
+# Logs
+logs/
+*.log
+
+# Archivos temporales
+*.tmp

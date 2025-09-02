@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 
 # local imports (assume these files exist and are as previously provided)
-from core.storage import load_candles, save_scores  # load_candles(symbol, interval) -> df
+from core.storage_postgres import load_candles, save_scores  # load_candles(symbol, interval) -> df
 from indicators.ema import ema
 from indicators.rsi import rsi
 from indicators.atr import atr

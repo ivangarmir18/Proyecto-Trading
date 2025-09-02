@@ -3,11 +3,20 @@ services:
     name: watchlist-dashboard
     env: python
     plan: free
-    buildCommand: pip install -r requirements_prod.txt
-    startCommand: streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0
-  - type: worker
-    name: watchlist-worker
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements_prod.txt
-    startCommand: python run_service.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run dashboard/app.py --server.port 10000 --server.address 0.0.0.0"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: FINNHUB_KEYS
+        sync: false
+      - key: BINANCE_KEY
+        sync: false
+      - key: BINANCE_SECRET
+        sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
