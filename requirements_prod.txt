@@ -1,15 +1,28 @@
-pandas
-numpy
-python-binance
-yfinance
-python-dotenv
-requests
-joblib
-scikit-learn
-lightgbm
-matplotlib
-streamlit
-plotly
-psycopg2-binary
-schedule
-python-telegram-bot
+# Core data & computation
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Trading APIs
+python-binance>=2.1.0
+yfinance>=0.2.40
+
+# Env & requests
+python-dotenv>=1.0.0
+requests>=2.32.0
+
+# Modeling & ML
+joblib>=1.3.2
+scikit-learn>=1.3.0
+lightgbm>=4.5.0
+
+# Visualization
+matplotlib>=3.9.0
+plotly>=6.0.0
+streamlit>=1.26.0
+
+# Database
+psycopg2-binary>=2.9.10
+
+# Scheduling & bots
+schedule>=1.2.0
+python-telegram-bot>=20.7
