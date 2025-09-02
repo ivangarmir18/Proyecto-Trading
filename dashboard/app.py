@@ -1,427 +1,335 @@
+# dashboard/app.py
 """
-Streamlit dashboard mejorado para Watchlist (Cripto & Acciones).
-
-Cambios principales:
-- Corrige indentaciones y estructura general.
-- Top-bar (header) con elementos de control principales (filtro global, búsqueda/añadir asset, refresh, backfill).
-- Añadir asset desde UI: seleccionar tipo (crypto/stock) y símbolo; guarda en CSV local (data/config/) y lanza backfill.
-- Tabla superior compacta (summary) con la última fila de score por asset, ordenable por columnas (usando st.dataframe).
-- Filtros en una barra horizontal encima de la tabla (intervalo, fecha, score range, ordenación).
-- Panel de detalle y gráfico de velas para la fila seleccionada.
-- Uso de variables de entorno (para Render) y lectura de config.json cuando esté disponible.
-
-Notas:
-- Algunas funciones auxiliares (load_config, get_db_path, load_scores_df, load_candles_df,
-  call_backfill_historical, call_refresh_watchlist, ts_to_iso) se importan de dashboard.utils o utils.
-  Si sus firmas son diferentes, se intentan llamadas alternativas con comprobaciones.
-- No se incluye ninguna clave o secret en este fichero.
+Streamlit dashboard for Proyecto Trading
+- Requisitos: streamlit, plotly, pandas
+- Run: streamlit run dashboard/app.py
 """
-
-from __future__ import annotations
 import os
-from pathlib import Path
+import json
 import time
-import datetime
+import logging
 from typing import Optional, List, Dict
 
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
+import plotly.graph_objs as go
 
-# Intentar imports robustos para ejecutar desde la raíz o desde el folder dashboard/
-try:
-    from dashboard.utils import (
-        load_config,
-        get_db_path,
-        load_scores_df,
-        load_candles_df,
-        call_refresh_watchlist,
-        call_backfill_historical,
-        ts_to_iso,
-    )
-except Exception:
-    from utils import (
-        load_config,
-        get_db_path,
-        load_scores_df,
-        load_candles_df,
-        call_refresh_watchlist,
-        call_backfill_historical,
-        ts_to_iso,
-    )
+# Import your core modules (asegúrate de que el path PYTHONPATH incluye repo root)
+from core.storage_postgres import make_storage_from_env, PostgresStorage
+from core.fetch import Fetcher
+from core.score import compute_and_save_scores_for_asset
+# ai_train optional import later when needed
 
-# UI constants
-APP_TITLE = "Watchlist Dashboard — Crypto & Stocks"
-DEFAULT_CONFIG_PATH = "config.json"
-CSV_CONFIG_DIR = Path("data/config")
+logger = logging.getLogger("dashboard")
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    logger.addHandler(ch)
+logger.setLevel(os.getenv("DASHBOARD_LOG_LEVEL", "INFO"))
 
-st.set_page_config(APP_TITLE, layout="wide")
+# Config
+PROJECT_CONFIG_PATH = os.getenv("PROJECT_CONFIG_PATH", "config.json")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")  # set in env for basic protection
 
-# ---- Authentication (very simple) ----
-PASSWORD = os.getenv("DASHBOARD_PASSWORD", None)
+st.set_page_config(page_title="Proyecto Trading — Dashboard", layout="wide")
 
+# ---------- Helpers ----------
+@st.cache_resource
+def get_storage():
+    return make_storage_from_env()
 
-def auth_check() -> bool:
-    """Basic password gate stored in DASHBOARD_PASSWORD env var. Uses session_state."""
-    if PASSWORD is None:
+@st.cache_resource
+def get_fetcher():
+    # Fetcher will read ENV keys if not provided
+    return Fetcher(binance_api_key=os.getenv("ENV_BINANCE_KEY"), binance_secret=os.getenv("ENV_BINANCE_SECRET"), rate_limit_per_min=int(os.getenv("ENV_RATE_LIMIT","1200")))
+
+def load_config():
+    try:
+        with open(PROJECT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"No pude leer config.json ({PROJECT_CONFIG_PATH}): {e}")
+        return {}
+
+def save_config(cfg: dict):
+    with open(PROJECT_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+def add_symbol_to_config(symbol: str, kind: str):
+    cfg = load_config()
+    assets = cfg.setdefault("assets", {})
+    key = "cripto" if kind == "crypto" else "acciones"
+    lst = assets.setdefault(key, [])
+    if symbol in lst:
+        return False
+    lst.append(symbol)
+    save_config(cfg)
+    return True
+
+def query_latest_scores(storage: PostgresStorage, limit: Optional[int] = 1000) -> pd.DataFrame:
+    """
+    Select latest score per asset+interval using DISTINCT ON.
+    """
+    q = """
+    SELECT DISTINCT ON (asset, interval) asset, interval, score, range_min, range_max, stop, target, created_at, ts
+    FROM scores
+    ORDER BY asset, interval, created_at DESC
+    LIMIT %s
+    """
+    with storage.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (limit,))
+            rows = cur.fetchall()
+            cols = ["asset", "interval", "score", "range_min", "range_max", "stop", "target", "created_at", "ts"]
+            df = pd.DataFrame(rows, columns=cols)
+            if not df.empty:
+                df["created_at"] = pd.to_datetime(df["created_at"], unit="ms", utc=True)
+                df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    return df
+
+def query_latest_candle(storage: PostgresStorage, asset: str, interval: str) -> Optional[pd.Series]:
+    df = storage.get_ohlcv(asset, interval, limit=1)
+    if df is None or df.empty:
+        return None
+    return df.iloc[-1]
+
+def fetch_and_score(storage: PostgresStorage, fetcher: Fetcher, asset: str, interval: str):
+    """Quick fetch latest and recompute score for asset/interval"""
+    save_cb = storage.make_save_callback()
+    df = fetcher.fetch_ohlcv(asset, interval=interval, since=None, limit=500, save_callback=save_cb, meta={"ui_refresh": True})
+    # compute and save score (last lookback maybe 500)
+    compute_and_save_scores_for_asset(storage, asset, interval, lookback_bars=500)
+    return df
+
+# ---------- Authentication ----------
+def check_password():
+    if not DASHBOARD_PASSWORD:
+        return True  # open but warn
+    pwd = st.session_state.get("pwd", "")
+    if pwd == DASHBOARD_PASSWORD:
+        st.session_state["authed"] = True
         return True
-    if "auth_ok" not in st.session_state:
-        st.session_state.auth_ok = False
-    if st.session_state.auth_ok:
-        return True
-
-    # Simple login form (modal-like in sidebar)
-    with st.sidebar:
-        st.write("**Dashboard — Autenticación**")
-        pw = st.text_input("Contraseña", type="password")
-        if st.button("Entrar"):
-            if pw == PASSWORD:
-                st.session_state.auth_ok = True
-                st.experimental_rerun()
-            else:
-                st.error("Contraseña incorrecta")
     return False
 
+# ---------- UI ----------
+st.title("Proyecto Trading — Dashboard")
 
-# ---- Cached loaders ----
-@st.cache_data(ttl=30)
-def _load_scores(asset: str, interval: str, db: Optional[str], limit: int = 5000) -> pd.DataFrame:
-    try:
-        return load_scores_df(asset, interval, db_path=db, limit=limit)
-    except TypeError:
-        # fallback if signature differs
-        return load_scores_df(asset, interval, db, limit)
+if DASHBOARD_PASSWORD:
+    if "pwd" not in st.session_state:
+        st.session_state["pwd"] = ""
+    if "authed" not in st.session_state:
+        st.session_state["authed"] = False
 
-
-@st.cache_data(ttl=30)
-def _load_candles(asset: str, interval: str, db: Optional[str], limit: int = 2000) -> pd.DataFrame:
-    try:
-        return load_candles_df(asset, interval, db_path=db, limit=limit)
-    except TypeError:
-        return load_candles_df(asset, interval, db, limit)
-
-
-def parse_interval_seconds(itv: str) -> int:
-    try:
-        import re
-        m = re.match(r"(\d+)([mhdw]+)$", itv)
-        if not m:
-            return 0
-        n = int(m.group(1)); unit = m.group(2)
-        if unit.startswith('m'):
-            return n * 60
-        if unit.startswith('h'):
-            return n * 3600
-        if unit.startswith('d'):
-            return n * 86400
-        if unit.startswith('w'):
-            return n * 604800
-    except Exception:
-        return 0
-    return 0
-
-
-# ---- Utilities for assets list management ----
-
-def read_assets_from_config(cfg: dict) -> Dict[str, List[str]]:
-    """Return dict with keys 'crypto' and 'stock' containing lists."""
-    res = {'crypto': [], 'stock': []}
-    try:
-        assets = cfg.get('assets', {})
-        res['crypto'] = assets.get('cripto', []) or assets.get('crypto', []) or []
-        res['stock'] = assets.get('acciones', []) or assets.get('stocks', []) or assets.get('acciones', []) or []
-    except Exception:
-        pass
-    return res
-
-
-def read_assets_from_csvs() -> Dict[str, List[str]]:
-    res = {'crypto': [], 'stock': []}
-    try:
-        CSV_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        c1 = CSV_CONFIG_DIR / 'cryptos.csv'
-        c2 = CSV_CONFIG_DIR / 'actions.csv'
-        if c1.exists():
-            try:
-                dfc = pd.read_csv(c1)
-                if 'symbol' in [c.lower() for c in dfc.columns]:
-                    key = next(c for c in dfc.columns if c.lower() == 'symbol')
-                    res['crypto'] = dfc[key].astype(str).str.strip().tolist()
+    with st.sidebar:
+        st.header("Acceso")
+        if not st.session_state.get("authed", False):
+            st.text_input("Password", type="password", key="pwd")
+            if st.button("Entrar"):
+                if check_password():
+                    st.experimental_rerun()
                 else:
-                    res['crypto'] = dfc.iloc[:, 0].astype(str).str.strip().tolist()
-            except Exception:
-                res['crypto'] = []
-        if c2.exists():
-            try:
-                dfa = pd.read_csv(c2)
-                if 'symbol' in [c.lower() for c in dfa.columns]:
-                    key = next(c for c in dfa.columns if c.lower() == 'symbol')
-                    res['stock'] = dfa[key].astype(str).str.strip().tolist()
-                else:
-                    res['stock'] = dfa.iloc[:, 0].astype(str).str.strip().tolist()
-            except Exception:
-                res['stock'] = []
-    except Exception:
-        pass
-    return res
+                    st.error("Password incorrecto")
+        else:
+            st.success("Autenticado")
 
+else:
+    st.sidebar.info("Dashboard sin password (setea DASHBOARD_PASSWORD en entorno para protegerlo)")
 
-def append_asset_to_csv(symbol: str, asset_type: str) -> None:
-    csv_path = CSV_CONFIG_DIR / ('cryptos.csv' if asset_type == 'crypto' else 'actions.csv')
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    if csv_path.exists():
-        # Avoid duplicates
-        try:
-            df = pd.read_csv(csv_path)
-            cols_low = [c.lower() for c in df.columns]
-            if 'symbol' in cols_low:
-                key = next(c for c in df.columns if c.lower() == 'symbol')
-                existing = df[key].astype(str).str.strip().tolist()
-            else:
-                existing = df.iloc[:, 0].astype(str).str.strip().tolist()
-        except Exception:
-            existing = []
-        if symbol in existing:
-            return
-        with csv_path.open('a', encoding='utf-8', newline='') as fh:
-            fh.write(f"{symbol}\n")
-    else:
-        with csv_path.open('w', encoding='utf-8', newline='') as fh:
-            fh.write('symbol\n')
-            fh.write(f"{symbol}\n")
+storage = get_storage()
+fetcher = get_fetcher()
 
+st.sidebar.header("Acciones rápidas")
+cfg = load_config()
+assets_cfg = cfg.get("assets", {})
+total_assets = len((assets_cfg.get("cripto") or []) + (assets_cfg.get("acciones") or []))
+st.sidebar.markdown(f"**Activos configurados:** {total_assets}")
 
-# ---- Main ----
-
-def main():
-    if not auth_check():
-        return
-
-    # Load config if exists
-    cfg = {}
-    try:
-        cfg = load_config(DEFAULT_CONFIG_PATH)
-    except Exception:
-        try:
-            import json
-            p = Path(DEFAULT_CONFIG_PATH)
-            if p.exists():
-                cfg = json.loads(p.read_text(encoding='utf-8'))
-        except Exception:
-            cfg = {}
-
-    db_path = None
-    try:
-        db_path = get_db_path(cfg)
-    except Exception:
-        db_path = os.environ.get('DATABASE_URL') or cfg.get('app', {}).get('db_path')
-
-    # Build initial assets list from config + CSVs
-    assets_cfg = read_assets_from_config(cfg)
-    assets_csv = read_assets_from_csvs()
-    all_crypto = sorted(list(dict.fromkeys(assets_cfg.get('crypto', []) + assets_csv.get('crypto', []))))
-    all_stock = sorted(list(dict.fromkeys(assets_cfg.get('stock', []) + assets_csv.get('stock', []))))
-    all_assets = all_crypto + all_stock
-
-    # Top bar: header + quick summary and add asset
-    header_col, controls_col = st.columns([3, 1])
-    with header_col:
-        st.title(APP_TITLE)
-        st.caption("Monitorización técnica — Cripto & Acciones — actualizado")
-
-    with controls_col:
-        # Quick actions
-        if st.button('Refresh watchlist'):
-            try:
-                call_refresh_watchlist()
-                st.success('Refresh lanzado')
-            except Exception as e:
-                st.error(f'Error lanzando refresh: {e}')
-        if st.button('Backfill (emergency)'):
-            try:
-                call_backfill_historical()
-                st.success('Backfill lanzado (global)')
-            except Exception as e:
-                st.error(f'Error lanzando backfill: {e}')
-
-    st.markdown('---')
-
-    # Filters row
-    c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
-    with c1:
-        chosen_type = st.selectbox('Tipo', ['all', 'crypto', 'stock'], index=0)
-        assets_options = all_assets if chosen_type == 'all' else (all_crypto if chosen_type == 'crypto' else all_stock)
-        chosen_assets = st.multiselect('Assets', options=assets_options, default=assets_options[:10])
-    with c2:
-        interval = st.selectbox('Intervalo', options=['5m', '30m', '1h', '4h', '1d'], index=0)
-        # derived seconds
-        _ = parse_interval_seconds(interval)
-    with c3:
-        today = datetime.date.today()
-        date_range = st.date_input('Rango fecha', value=(today - datetime.timedelta(days=30), today))
-    with c4:
-        score_min, score_max = st.slider('Score range', 0.0, 1.0, (0.0, 1.0), step=0.01)
-    with c5:
-        sort_by = st.selectbox('Ordenar por', options=['ts', 'score', 'asset'], index=0)
-        sort_order = st.selectbox('Orden', options=['desc', 'asc'], index=0)
-
-    # Add new asset UI (compact)
-    add_col1, add_col2 = st.columns([3, 2])
-    with add_col1:
-        st.subheader('Añadir nuevo asset')
-        new_sym = st.text_input('Símbolo (p.e. BTCUSDT o AAPL)', value='')
-    with add_col2:
-        type_choice = st.selectbox('Tipo asset', ['crypto', 'stock'], index=0)
-        if st.button('Añadir y lanzar backfill'):
-            sym = new_sym.strip().upper()
-            if not sym:
-                st.error('Introduce un símbolo válido')
-            else:
-                try:
-                    append_asset_to_csv(sym, 'crypto' if type_choice == 'crypto' else 'stock')
-                    st.success(f'{sym} añadido a la lista de {type_choice}s')
-                    # Try best-effort to call backfill for the symbol
+# Add symbol form
+with st.sidebar.expander("Añadir símbolo"):
+    kind = st.selectbox("Tipo", ("crypto", "action"))
+    symbol_input = st.text_input("Símbolo (ej. BTCUSDT o AAPL)", key="add_symbol")
+    add_backfill = st.checkbox("Hacer backfill al añadir (rango por defecto)", value=False)
+    if st.button("Añadir símbolo"):
+        if not symbol_input:
+            st.sidebar.error("Introduce símbolo válido")
+        else:
+            added = add_symbol_to_config(symbol_input.strip().upper(), kind)
+            if added:
+                st.sidebar.success(f"{symbol_input.upper()} añadido a config ({'crypto' if kind=='crypto' else 'acciones'})")
+                if add_backfill:
+                    st.sidebar.info("Iniciando backfill... (esto puede tardar)")
+                    # trigger backfill via fetcher.backfill_range; conservative default: last 30 days
                     try:
-                        # Try common signature first
-                        call_backfill_historical(asset=sym, asset_type=type_choice, interval=interval)
-                        st.success('Backfill para símbolo lanzado')
-                    except TypeError:
-                        # fallback to generic call
-                        try:
-                            call_backfill_historical()
-                            st.info('Backfill global lanzado como fallback')
-                        except Exception as e:
-                            st.warning(f'No se pudo lanzar backfill automáticamente: {e}')
+                        end_ms = int(time.time() * 1000)
+                        start_ms = end_ms - 30 * 24 * 3600 * 1000
+                        df_back = fetcher.backfill_range(symbol_input.strip().upper(), "5m" if kind == "crypto" else "1h", start_ms, end_ms, save_callback=storage.make_save_callback(), progress=False)
+                        st.sidebar.success(f"Backfill completado: {len(df_back)} velas")
                     except Exception as e:
-                        st.warning(f'Backfill: {e}')
+                        st.sidebar.error(f"Backfill fallo: {e}")
+            else:
+                st.sidebar.warning("Símbolo ya presente en config.json")
+
+# Top legend / quick metrics
+st.markdown("---")
+st.header("Resumen")
+col1, col2, col3, col4 = st.columns([2,2,2,4])
+with col1:
+    st.metric("Activos totales", total_assets)
+with col2:
+    df_scores = query_latest_scores(storage, limit=2000)
+    avg_score = float(df_scores["score"].mean()) if not df_scores.empty else 0.0
+    st.metric("Score medio", f"{avg_score:.3f}")
+with col3:
+    last_update = df_scores["created_at"].max() if not df_scores.empty else None
+    st.metric("Última actualización", last_update.strftime("%Y-%m-%d %H:%M:%S") if last_update is not None else "n/a")
+with col4:
+    st.write("**Leyenda / Orden**: Puedes filtrar y ordenar la tabla abajo. Selecciona filas para ver vela y ejecutar acciones (Refresh, Backfill, Train).")
+
+st.markdown("---")
+
+# Filters and controls
+st.sidebar.header("Filtros tabla")
+asset_type = st.sidebar.selectbox("Tipo de activo", ("All", "Crypto", "Actions"))
+search = st.sidebar.text_input("Buscar (asset)", "")
+score_min, score_max = st.sidebar.slider("Rango score", 0.0, 1.0, (0.0, 1.0), step=0.01)
+date_from = st.sidebar.date_input("Desde", value=None)
+date_to = st.sidebar.date_input("Hasta", value=None)
+sort_by = st.sidebar.selectbox("Ordenar por", ("score", "asset", "created_at", "ts"))
+sort_desc = st.sidebar.checkbox("Descendente", value=True)
+
+# Refresh / batch actions
+st.sidebar.header("Acciones")
+if st.sidebar.button("Refresh tabla (releer scores)"):
+    st.experimental_rerun()
+
+# Main table
+st.subheader("Listado de activos y scores")
+df = df_scores.copy() if not df_scores.empty else pd.DataFrame(columns=["asset","interval","score","range_min","range_max","stop","target","created_at","ts"])
+
+# Filter by asset type using config
+if asset_type != "All":
+    cfg = load_config()
+    if asset_type == "Crypto":
+        allowed = set([s.upper() for s in (cfg.get("assets",{}).get("cripto") or [])])
+    else:
+        allowed = set([s.upper() for s in (cfg.get("assets",{}).get("acciones") or [])])
+    df = df[df["asset"].str.upper().isin(allowed)]
+
+if search:
+    df = df[df["asset"].str.contains(search.strip(), case=False)]
+
+df = df[(df["score"] >= float(score_min)) & (df["score"] <= float(score_max))]
+
+# date filters if set
+if date_from:
+    df = df[df["created_at"] >= pd.to_datetime(pd.to_datetime(date_from).tz_localize("UTC"))]
+if date_to:
+    df = df[df["created_at"] <= pd.to_datetime(pd.to_datetime(date_to).tz_localize("UTC") + pd.Timedelta(days=1))]
+
+if not df.empty:
+    df_display = df.sort_values(by=sort_by, ascending=not sort_desc)
+else:
+    df_display = df
+
+st.write(f"Mostrando {len(df_display)} filas")
+# selectable table
+selected = st.experimental_data_editor(df_display, num_rows="dynamic", use_container_width=True)
+
+# If a single row is selected (or table clicked), show details
+if selected is not None and len(selected) > 0:
+    # We'll take the first selected row for detailed view
+    sel = selected.iloc[0]
+    sel_asset = sel["asset"]
+    sel_interval = sel["interval"]
+    st.markdown("---")
+    st.subheader(f"Detalle: {sel_asset} — {sel_interval}")
+    colA, colB, colC = st.columns([3,1,1])
+    with colA:
+        st.write(f"Score: **{sel['score']:.3f}**")
+        st.write(f"Range: {sel['range_min']} — {sel['range_max']}")
+        st.write(f"Stop: {sel['stop']} / Target: {sel['target']}")
+        st.write(f"Última vela ts: {sel['ts']} — last update: {sel['created_at']}")
+    with colB:
+        if st.button("Refresh símbolo"):
+            with st.spinner("Actualizando..."):
+                try:
+                    fetch_and_score(storage, fetcher, sel_asset, sel_interval)
+                    st.success("Símbolo actualizado y score recalculado.")
+                    st.experimental_rerun()
                 except Exception as e:
-                    st.error(f'Error guardando el símbolo: {e}')
+                    st.error(f"Error update: {e}")
+    with colC:
+        if st.button("Backfill símbolo (30d)"):
+            with st.spinner("Haciendo backfill 30d..."):
+                try:
+                    end_ms = int(time.time() * 1000)
+                    start_ms = end_ms - 30 * 24 * 3600 * 1000
+                    df_back = fetcher.backfill_range(sel_asset, sel_interval, start_ms, end_ms, save_callback=storage.make_save_callback(), progress=False)
+                    st.success(f"Backfill completado: {len(df_back)} velas")
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"Backfill error: {e}")
 
-    st.markdown('---')
-
-    # If no assets selected -> show info
-    if not chosen_assets:
-        st.info('Selecciona uno o varios assets en el filtro superior.')
-        st.stop()
-
-    # Build summary table (latest score per asset)
-    summary_rows = []
-    for sym in chosen_assets:
+    # Price chart
+    df_candles = storage.get_ohlcv(sel_asset, sel_interval, limit=400)
+    if df_candles is not None and not df_candles.empty:
+        fig = go.Figure(data=[go.Candlestick(x=df_candles["ts"],
+                                             open=df_candles["open"], high=df_candles["high"],
+                                             low=df_candles["low"], close=df_candles["close"], name=sel_asset)])
+        # overlay ema if present in indicators table by trying to get indicators via storage (join omitted for speed)
         try:
-            s = _load_scores(sym, interval, db=db_path, limit=5)
-            if s is None or s.empty:
-                continue
-            latest = s.sort_values('ts', ascending=False).iloc[0]
-            summary_rows.append({
-                'asset': sym,
-                'ts': int(latest.get('ts', 0)),
-                'score': float(latest.get('score', 0.0)),
-                'range_min': latest.get('range_min'),
-                'range_max': latest.get('range_max'),
-                'stop': latest.get('stop'),
-                'target': latest.get('target'),
-            })
+            # attempt to read indicators from indicators table via SQL
+            with storage.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT ts, ema9, ema40 FROM indicators WHERE asset=%s AND interval=%s ORDER BY ts ASC", (sel_asset, sel_interval))
+                    rows = cur.fetchall()
+                    if rows:
+                        inds = pd.DataFrame(rows, columns=["ts", "ema9", "ema40"])
+                        inds["ts"] = pd.to_datetime(inds["ts"], unit="ms", utc=True)
+                        fig.add_trace(go.Scatter(x=inds["ts"], y=inds["ema9"], mode="lines", name="EMA9"))
+                        fig.add_trace(go.Scatter(x=inds["ts"], y=inds["ema40"], mode="lines", name="EMA40"))
         except Exception as e:
-            st.warning(f'No se pudo cargar score para {sym}: {e}')
-
-    if not summary_rows:
-        st.warning('No hay datos de scores para los assets seleccionados.')
-        st.stop()
-
-    summary_df = pd.DataFrame(summary_rows)
-
-    # Apply score/date filters to summary (coarse)
-    try:
-        start_dt, end_dt = date_range
-        start_ts = int(datetime.datetime.combine(start_dt, datetime.time.min).timestamp())
-        end_ts = int(datetime.datetime.combine(end_dt, datetime.time.max).timestamp())
-        summary_df = summary_df[(summary_df['ts'] >= start_ts) & (summary_df['ts'] <= end_ts)]
-    except Exception:
-        pass
-    summary_df = summary_df[(summary_df['score'] >= score_min) & (summary_df['score'] <= score_max)]
-
-    # Sorting summary
-    asc = True if sort_order == 'asc' else False
-    if sort_by in summary_df.columns:
-        summary_df = summary_df.sort_values(sort_by, ascending=asc)
+            logger.debug("No pude leer indicators: %s", e)
+        fig.update_layout(height=400, margin=dict(t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        summary_df = summary_df.sort_values('ts', ascending=False)
+        st.info("No hay velas para mostrar.")
 
-    st.subheader('Resumen rápido (último score por asset)')
-    st.dataframe(summary_df.reset_index(drop=True))
+# Footer actions: CSV, train model
+st.markdown("---")
+col1, col2, col3 = st.columns([1,1,1])
+with col1:
+    if st.button("Descargar CSV listado"):
+        tmp = df_display.copy()
+        tmp["created_at"] = tmp["created_at"].astype(str)
+        csv = tmp.to_csv(index=False)
+        st.download_button("Descargar CSV", csv, file_name="scores_list.csv", mime="text/csv")
 
-    # Select a row to deep-dive
-    st.markdown('---')
-    st.subheader('Detalle y vela')
-    sel_asset = st.selectbox('Elige asset para detalle', options=summary_df['asset'].tolist(), index=0)
-    # load latest score row for selected
-    sel_scores = _load_scores(sel_asset, interval, db=db_path, limit=200)
-    if sel_scores is None or sel_scores.empty:
-        st.warning('No hay scores para el asset seleccionado')
-        st.stop()
-    sel_row = sel_scores.sort_values('ts', ascending=False).iloc[0]
+with col2:
+    if st.button("Recalcular scores para todo (puede tardar)"):
+        with st.spinner("Recalculando scores para todos..."):
+            assets_all = (cfg.get("assets",{}).get("cripto",[]) or []) + (cfg.get("assets",{}).get("acciones",[]) or [])
+            for a in assets_all:
+                try:
+                    interval = "5m" if a in (cfg.get("assets",{}).get("cripto",[]) or []) else "1h"
+                    compute_and_save_scores_for_asset(storage, a, interval, lookback_bars=500)
+                except Exception as e:
+                    logger.exception("Score fail for %s: %s", a, e)
+            st.success("Scores recalculados.")
+            st.experimental_rerun()
 
-    # Show JSON + metrics
-    cols = st.columns([2, 1, 1, 1])
-    with cols[0]:
-        st.json({
-            'ts': int(sel_row['ts']),
-            'dt': ts_to_iso(int(sel_row['ts'])),
-            'asset': sel_asset,
-            'score': float(sel_row.get('score', 0.0)),
-            'range_min': sel_row.get('range_min'),
-            'range_max': sel_row.get('range_max'),
-            'stop': sel_row.get('stop'),
-            'target': sel_row.get('target'),
-        })
-    with cols[1]:
-        st.metric('Score', f"{float(sel_row.get('score',0.0)):.3f}")
-    with cols[2]:
-        if sel_row.get('stop') is not None:
-            st.metric('Stop', f"{float(sel_row.get('stop')):.6f}")
-    with cols[3]:
-        if sel_row.get('target') is not None:
-            st.metric('Target', f"{float(sel_row.get('target')):.6f}")
+with col3:
+    if st.button("Entrenar IA (últimos assets seleccionados)"):
+        st.warning("Entrenamiento IA lanzado desde UI. Revisa logs. Puede tardar.")
+        # optional: call ai_train.train_model for selected asset(s)
+        try:
+            from core.ai_train import train_model
+            if "sel_asset" in locals():
+                res = train_model(storage, sel_asset, sel_interval, lookback=2000)
+                st.success(f"Modelo entrenado: {res}")
+            else:
+                st.warning("Selecciona un símbolo antes de entrenar.")
+        except Exception as e:
+            st.error(f"Error entrenando IA: {e}")
 
-    # Plot candles around selected ts
-    try:
-        candles_df = _load_candles(sel_asset, interval, db=db_path, limit=2000)
-    except Exception as e:
-        st.error(f'Error cargando velas: {e}')
-        candles_df = pd.DataFrame()
-
-    if candles_df is None or candles_df.empty:
-        st.warning('No hay velas disponibles para el asset seleccionado')
-        return
-
-    candles_df['ts'] = candles_df['ts'].astype(int)
-    sel_ts = int(sel_row['ts'])
-    if sel_ts in candles_df['ts'].values:
-        center_idx = candles_df.index[candles_df['ts'] == sel_ts][0]
-    else:
-        center_idx = (candles_df['ts'] - sel_ts).abs().idxmin()
-
-    window = 150
-    lo = max(0, center_idx - window)
-    hi = min(len(candles_df) - 1, center_idx + window)
-    view = candles_df.iloc[lo:hi+1].copy()
-
-    fig = go.Figure(data=[
-        go.Candlestick(x=pd.to_datetime(view['ts'], unit='s'),
-                       open=view['open'],
-                       high=view['high'],
-                       low=view['low'],
-                       close=view['close'])
-    ])
-    if pd.notna(sel_row.get('stop')):
-        fig.add_hline(y=float(sel_row['stop']), line_dash='dot', annotation_text='Stop')
-    if pd.notna(sel_row.get('target')):
-        fig.add_hline(y=float(sel_row['target']), line_dash='dot', annotation_text='Target')
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.caption('Dashboard — diseñado para MVP intermedio. Protege la instancia en producción y desarrollo')
-
-
-if __name__ == '__main__':
-    main()
+st.write("Dashboard versión — integrado con storage_postgres, fetcher, score y ai_train")

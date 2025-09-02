@@ -1,411 +1,269 @@
 # core/score.py
 """
-Score engine for crypto & stocks.
-- Computes indicators (assumes indicators modules exist).
-- Computes multi-dim score (EMA, support proximity, ATR, MACD, RSI, Fibonacci).
-- Computes range_min, range_max, stop, target.
-- Saves scores via core.storage.save_scores (rows list).
+Score module
+
+- compute_scores(df, weights) -> DataFrame with normalized indicator columns + 'score' (0..1)
+- compute_and_save_scores_for_asset(storage, asset, interval, cfg) -> calcula últimos scores y los guarda en la tabla `scores`
+- utilities: normalization helpers, atr, ema fallback si no existen indicadores
+
+Assumptions:
+- Input candles DataFrame has columns: ts (pd.Timestamp UTC) open high low close volume
+- If indicator columns (ema9, ema40, atr, macd, rsi, support, resistance) do NOT exist, the module computes basic versions:
+    - ema9, ema40 using pandas ewm
+    - atr simple using True Range & SMA
+    - rsi basic implementation
+- Scores are written to `scores` table in Postgres via storage.get_conn()
 """
 
-from pathlib import Path
-import json
-import math
-import time
-from typing import Dict, List, Tuple, Optional, Any
+from __future__ import annotations
+import logging
+import os
+from typing import Dict, Any, Optional
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# local imports (assume these files exist and are as previously provided)
-from core.storage_postgres import load_candles, save_scores  # load_candles(symbol, interval) -> df
-from indicators.ema import ema
-from indicators.rsi import rsi
-from indicators.atr import atr
-from indicators.macd import macd
-from indicators.fibonacci import compute_fibonacci_levels, nearest_level, proximity_score, save_levels_cache
+logger = logging.getLogger("core.score")
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    logger.addHandler(ch)
+logger.setLevel(os.getenv("SCORE_LOG_LEVEL", "INFO"))
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = ROOT / "config.json"
+# Default weights (same as tu memoria técnica, configurables en config.json)
+DEFAULT_WEIGHTS = {
+    "ema": 0.25,
+    "support": 0.20,
+    "atr": 0.15,
+    "macd": 0.15,
+    "rsi": 0.10,
+    "fibonacci": 0.15,  # if fibonacci not present it's ignored
+}
 
-# timeframe hierarchy to find adjacent lower/higher resolutions
-# Note: keys are in your project notation ("5m","1h","4h","1d","1w")
-TF_HIERARCHY = ["5m", "1h", "2h", "4h", "1d", "1w"]
+# ---------- Indicator fallback computations ----------
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
+def compute_ema_columns(df: pd.DataFrame):
+    if "ema9" not in df.columns:
+        df["ema9"] = ema(df["close"], 9)
+    if "ema40" not in df.columns:
+        df["ema40"] = ema(df["close"], 40)
+    return df
 
-# --------------------------
-# Helpers
-# --------------------------
-def load_config(path: Path = None) -> dict:
-    if path is None:
-        path = CONFIG_PATH
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"] - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr
 
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    tr = true_range(df)
+    return tr.rolling(period, min_periods=1).mean()
 
-def find_adjacent_higher(tf: str) -> Optional[str]:
-    """Return the next *higher resolution* (coarser) in TF_HIERARCHY, e.g. 4h -> 1d.
-       If not found, return None."""
-    try:
-        idx = TF_HIERARCHY.index(tf)
-    except ValueError:
-        return None
-    # higher = next index to the right (coarser)
-    if idx + 1 < len(TF_HIERARCHY):
-        return TF_HIERARCHY[idx + 1]
-    return None
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-9)
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
 
+def compute_basic_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = compute_ema_columns(df)
+    if "atr" not in df.columns:
+        df["atr"] = atr(df)
+    if "rsi" not in df.columns:
+        df["rsi"] = rsi(df["close"])
+    # MACD (simple): ema12 - ema26
+    if "macd" not in df.columns:
+        ema12 = ema(df["close"], 12)
+        ema26 = ema(df["close"], 26)
+        df["macd"] = ema12 - ema26
+        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    # supports/resistances: simple local min/max over window if not present
+    if "support" not in df.columns:
+        df["support"] = df["low"].rolling(window=20, min_periods=1).min()
+    if "resistance" not in df.columns:
+        df["resistance"] = df["high"].rolling(window=20, min_periods=1).max()
 
-def normalize_between_0_1(value: float, vmin: float, vmax: float) -> float:
-    if vmin == vmax:
-        return 0.5
-    return max(0.0, min(1.0, (value - vmin) / (vmax - vmin)))
+    return df
 
+# ---------- Normalizers ----------
+def normalize_between_0_1(series: pd.Series) -> pd.Series:
+    # robust scaler to 0..1
+    minv = series.min()
+    maxv = series.max()
+    if pd.isna(minv) or pd.isna(maxv) or maxv == minv:
+        return pd.Series(0.5, index=series.index)
+    return (series - minv) / (maxv - minv)
 
-def sigmoid(x: float) -> float:
-    # stable sigmoid mapped to (0,1)
-    try:
-        return 1.0 / (1.0 + math.exp(-x))
-    except OverflowError:
-        return 0.0 if x < 0 else 1.0
+def normalize_rsi_to_01(rsi_series: pd.Series) -> pd.Series:
+    # rsi 0..100 -> 0..1
+    return rsi_series.clip(0,100) / 100.0
 
-
-# --------------------------
-# Indicator-derived scoring functions
-# --------------------------
-def score_trend(close: float, ema9: float, ema40: float) -> float:
+# ---------- Score computation ----------
+def compute_scores(df: pd.DataFrame, weights: Optional[Dict[str, float]] = None) -> pd.DataFrame:
     """
-    Trend score:
-    - 1.0 if close > ema40
-    - 0.0 if close < ema9
-    - linear interpolation between ema9..ema40 otherwise
+    Returns a copy of df with new columns:
+      - score (0..1)
+      - score_components (dict-like columns optional)
     """
-    if ema40 is None or math.isnan(ema40) or ema9 is None or math.isnan(ema9):
-        # fallback: price above ema9 -> 0.6, else 0.4 (weak signal)
-        return 0.6 if ema9 is not None and close > ema9 else 0.4 if ema9 is not None else 0.5
-    if close > ema40:
-        return 1.0
-    if close < ema9:
-        return 0.0
-    denom = (ema40 - ema9)
-    if denom == 0:
-        return 0.5
-    return max(0.0, min(1.0, (close - ema9) / denom))
+    weights = weights or DEFAULT_WEIGHTS.copy()
+    df = df.copy()
+    df = compute_basic_indicators(df)
 
+    # Component normalizations
+    # 1) Trend: price relative to ema9/ema40 (prefer price > ema40)
+    df["trend_raw"] = 0.0
+    price = df["close"]
+    ema9 = df["ema9"]
+    ema40 = df["ema40"]
+    # simple rule: if price > ema40 => 1; if price < ema9 => 0; else linear between
+    cond_up = price > ema40
+    cond_down = price < ema9
+    mid_mask = ~(cond_up | cond_down)
+    df.loc[cond_up, "trend_raw"] = 1.0
+    df.loc[cond_down, "trend_raw"] = 0.0
+    # linear interpolation between ema9 and ema40 for mid
+    denom = (ema40 - ema9).replace(0, np.nan)
+    df.loc[mid_mask, "trend_raw"] = ((price - ema9) / denom).clip(0,1).fillna(0.5)
 
-def score_atr_rel(atr_val: float, price: float, atr_norm_scale: float = 0.02) -> float:
-    """
-    Normalize ATR relative to price: smaller ATR => higher score.
-    atr_norm_scale: e.g. 0.02 means 2% of price is reference scale.
-    """
-    if price is None or price == 0:
-        return 0.5
-    atr_rel = (atr_val / price) if price else 0.0
-    # map: 0 -> 1, atr_norm_scale -> 0, linear below atr_norm_scale
-    val = 1.0 - (atr_rel / atr_norm_scale)
-    return max(0.0, min(1.0, val))
+    # 2) proximity to support: distance / (3*ATR)
+    df["dist_support"] = (price - df["support"]).abs()
+    df["support_score_raw"] = (1 - (df["dist_support"] / (3 * df["atr"] + 1e-9))).clip(0,1)
 
+    # 3) atr score (less atr = more stable) -> invert normalized atr (lower atr => higher score)
+    df["atr_norm"] = normalize_between_0_1(df["atr"].fillna(0))
+    df["atr_score_raw"] = 1.0 - df["atr_norm"]
 
-def score_macd_hist(macd_hist: float, atr_val: float) -> float:
-    """
-    Normalize MACD histogram relative to ATR:
-    - compute macd_signal = hist / (atr + eps)
-    - pass through sigmoid shifted to map negative-><0.5, positive->>0.5
-    """
-    eps = 1e-9
-    denom = (atr_val + eps)
-    x = (macd_hist) / denom
-    # scale factor to reduce extreme values
-    x_scaled = x * 0.5
-    return sigmoid(x_scaled)
+    # 4) macd: normalize macd by absolute range
+    df["macd_norm"] = normalize_between_0_1(df["macd"].fillna(0))
+    df["macd_score_raw"] = df["macd_norm"]  # more macd -> stronger momentum
 
+    # 5) rsi
+    df["rsi_score_raw"] = normalize_rsi_to_01(df["rsi"].fillna(50))
 
-def score_rsi_val(rsi_val: float) -> float:
-    if rsi_val is None or math.isnan(rsi_val):
-        return 0.5
-    return max(0.0, min(1.0, rsi_val / 100.0))
-
-
-def score_fibonacci_and_support(close: float, atr_val: float, fib_levels: Dict[str, float]) -> Tuple[float, Optional[float]]:
-    """
-    Returns (fibonacci_score, nearest_level_value)
-    - Uses proximity_score (which uses ATR as scale).
-    """
-    if not fib_levels:
-        return 0.5, None
-    _, level = nearest_level(close, fib_levels)
-    if level is None:
-        return 0.5, None
-    sc = proximity_score(close, level, atr_val)
-    return sc, float(level)
-
-
-# --------------------------
-# Range / stop / target helpers
-# --------------------------
-def compute_stop_target(last_price: float, atr_val: float, multipliers: dict, support_level: Optional[float], resistance_level: Optional[float]) -> Tuple[float, float]:
-    stop_mult = multipliers.get("stop", 1.3)
-    target_mult = multipliers.get("target", 1.3)
-    # If we have a realistic support/resistance use them, otherwise fall back to price +/- ATR*multipliers
-    if support_level is not None:
-        stop = support_level - stop_mult * atr_val
+    # 6) fibonacci: placeholder (if you have levels column you can implement)
+    if "fibonacci" in df.columns:
+        # assume fibonacci already encoded 0..1 proximity score
+        df["fib_score_raw"] = normalize_between_0_1(df["fibonacci"].astype(float).fillna(0))
     else:
-        stop = last_price - stop_mult * atr_val
-    if resistance_level is not None:
-        target = resistance_level + target_mult * atr_val
-    else:
-        target = last_price + target_mult * atr_val
-    return float(stop), float(target)
+        df["fib_score_raw"] = 0.5
 
+    # Compose weighted score (only keys present in weights)
+    # map weights keys to component columns
+    comp_map = {
+        "ema": "trend_raw",
+        "support": "support_score_raw",
+        "atr": "atr_score_raw",
+        "macd": "macd_score_raw",
+        "rsi": "rsi_score_raw",
+        "fibonacci": "fib_score_raw",
+    }
 
-# --------------------------
-# Main processing per symbol / interval
-# --------------------------
-def process_symbol_interval(symbol: str, interval: str = "1h", config: dict = None, save_rows: bool = True) -> Optional[dict]:
-    """
-    Process a single symbol at `interval`.
-    - loads candles via core.storage.load_candles(symbol, interval)
-    - computes indicators, score, range, stop, target per candle
-    - persists scores via core.storage.save_scores if save_rows True
-    - returns dict {"last": last_row_dict, "rows": rows_list} for inspection
-    """
-    if config is None:
-        config = load_config()
-    weights = config.get("weights", {"ema": 0.25, "support": 0.20, "atr": 0.15, "macd": 0.15, "rsi": 0.10, "fibonacci": 0.15})
-    multipliers = config.get("atr_multipliers", {"stop": 1.3, "target": 1.3})
-    atr_norm_scale = config.get("atr_norm_scale", 0.02)  # 2% price = normalization
+    # Sum weighted components; make sure total weight sums to 1 (normalize if not)
+    total_w = sum(weights.values()) if weights else 1.0
+    if total_w <= 0:
+        total_w = 1.0
 
-    # load main candles for this symbol & interval
-    df = load_candles(symbol, interval=interval)
-    if df is None or df.empty:
-        print(f"[score] no candles for {symbol} {interval}")
-        return None
-
-    df = df.sort_values("ts").reset_index(drop=True)
-
-    # compute indicators (vectorized)
-    df["EMA9"] = ema(df["close"], period=9)
-    df["EMA40"] = ema(df["close"], period=40)
-    df["RSI"] = rsi(df["close"], period=14)
-    df["ATR"] = atr(df, period=14)  # uses df high/low/close
-    macd_line, macd_signal, macd_hist = macd(df["close"])
-    df["MACD_hist"] = macd_hist
-
-    # Compute Fibonacci levels for this interval
-    fib_lookback = config.get("fibonacci_lookback", 144)
-    fib_levels_main = compute_fibonacci_levels(df, lookback=fib_lookback)
-
-    # Also compute Fibonacci for adjacent higher timeframe (if available) to "validate" levels
-    adj_higher = find_adjacent_higher(interval)
-    fib_levels_higher = {}
-    if adj_higher:
-        # attempt load candles from higher timeframe to compute levels; if not available skip
-        try:
-            df_higher = load_candles(symbol, interval=adj_higher)
-            if df_higher is not None and not df_higher.empty:
-                fib_lookback_higher = config.get("fibonacci_lookback_higher", fib_lookback)
-                fib_levels_higher = compute_fibonacci_levels(df_higher, lookback=fib_lookback_higher)
-        except Exception:
-            fib_levels_higher = {}
-
-    # combine levels: give priority to those that exist in both sets (within small tolerance)
-    combined_levels = {}
-    # add main levels
-    for r, val in fib_levels_main.items():
-        combined_levels[f"m_{r}"] = val
-    # add higher levels but tag differently; if a higher level is very close (within 0.2% price) to a main one, increase its significance
-    for r, val in fib_levels_higher.items():
-        # look for near duplicates
-        found = False
-        for k_main, v_main in list(combined_levels.items()):
-            if abs(v_main - val) <= max(1e-9, 0.002 * v_main):  # within 0.2% -> consider same
-                # average them (strengthen)
-                combined_levels[k_main] = float((v_main + val) / 2.0)
-                found = True
-                break
-        if not found:
-            combined_levels[f"h_{r}"] = val
-
-    # cache combined levels for inspection (optional)
-    try:
-        save_levels_cache(symbol, combined_levels)
-    except Exception:
-        pass
-
-    rows_to_save: List[Dict[str, Any]] = []
-
-    # iterate each candle and compute score
-    for _, row in df.iterrows():
-        close = float(row["close"])
-        ema9 = float(row.get("EMA9", np.nan)) if not pd.isna(row.get("EMA9", np.nan)) else None
-        ema40 = float(row.get("EMA40", np.nan)) if not pd.isna(row.get("EMA40", np.nan)) else None
-        rsi_v = float(row.get("RSI", 50.0)) if not pd.isna(row.get("RSI", 50.0)) else 50.0
-        atr_v = float(row.get("ATR", 0.0))
-        macd_h = float(row.get("MACD_hist", 0.0))
-
-        # components
-        comp = {}
-        comp["ema"] = score_trend(close, ema9, ema40)
-        comp["rsi"] = score_rsi_val(rsi_v)
-        comp["atr"] = score_atr_rel(atr_v, close, atr_norm_scale)
-        comp["macd"] = score_macd_hist(macd_h, atr_v)
-        fib_sc, nearest = score_fibonacci_and_support(close, atr_v, combined_levels)
-        comp["fibonacci"] = fib_sc
-
-        # support proximity: use the same nearest level (we treat fib as proxy for support/resistance)
-        comp["support"] = comp["fibonacci"]  # for now; could be extended with own support detection
-
-        # weighted sum
-        score_val = 0.0
-        for k, w in weights.items():
-            v = float(comp.get(k, 0.0))
-            score_val += v * float(w)
-        score_val = max(0.0, min(1.0, score_val))
-
-        # --- START: IA adjustment ---
-        try:
-            from core.ai_inference import predict_prob
-            # Preparar diccionario de features desde la vela actual
-            feat = {
-                "EMA9_EMA40_gap": (row["EMA9"] - row["EMA40"]) if row.get("EMA9") is not None and row.get("EMA40") is not None else 0.0,
-                "RSI": row["RSI"] if row.get("RSI") is not None else 50.0,
-                "ATR_rel": (row["ATR"] / row["close"]) if row.get("close") != 0 else 0.0,
-                "MACD_hist": row["MACD_hist"] if row.get("MACD_hist") is not None else 0.0,
-                "vol_over_ma5": (row["volume"] / (row.get("volume_ma5", 0.0)+1e-9)) if "volume_ma5" in row else 1.0,
-                "ret_1": row.get("ret_1", 0.0),
-                "ret_3": row.get("ret_3", 0.0)
-            }
-            model_feature_names = ["EMA9_EMA40_gap","RSI","ATR_rel","MACD_hist","vol_over_ma5","ret_1","ret_3"]
-            p_ml = predict_prob(feat, model_feature_names)
-        except Exception:
-            p_ml = None
-
-        if p_ml is not None:
-            # multiplicador configurable
-            min_mult = config.get("ai_multiplier_min", 0.85)
-            max_mult = config.get("ai_multiplier_max", 1.0)
-            multiplier = min_mult + (max_mult - min_mult) * p_ml
+    df["score"] = 0.0
+    for k, w in weights.items():
+        comp_col = comp_map.get(k)
+        if comp_col and comp_col in df.columns:
+            df["score"] += df[comp_col].fillna(0) * (w / total_w)
         else:
-            multiplier = 1.0
+            # missing comp: ignore but log once
+            logger.debug("Weight key %s has no corresponding component column", k)
 
-        # Score ajustado por IA
-        score_val = score_val * multiplier
-        score_val = max(0.0, min(1.0, score_val))
-        # --- END: IA adjustment ---
+    # clip and ensure numeric
+    df["score"] = df["score"].clip(0,1).fillna(0.0)
 
-        # compute ranges, stop, target - using nearest as support/resistance if present
-        # Determine resistance: next higher level above price (if any)
-        resistance_level = None
-        support_level = None
-        if combined_levels:
-            levels_vals = sorted(list(set([float(v) for v in combined_levels.values()])))
-            # nearest below = support, nearest above = resistance
-            below = [lv for lv in levels_vals if lv <= close]
-            above = [lv for lv in levels_vals if lv > close]
-            support_level = max(below) if below else None
-            resistance_level = min(above) if above else None
+    # Optionally compute range_min, range_max, stop, target using ATR and support/resistance
+    atr_mult_stop = float(os.getenv("ATR_STOP_MULT", "1.3"))
+    atr_mult_target = float(os.getenv("ATR_TARGET_MULT", "1.3"))
+    df["stop"] = df["support"] - atr_mult_stop * df["atr"]
+    df["target"] = df["resistance"] + atr_mult_target * df["atr"]
+    # range_min = support or open; range_max = price + atr*0.5
+    df["range_min"] = df["support"]
+    df["range_max"] = df["close"] + 0.5 * df["atr"]
 
-        range_min = float(close - 0.5 * atr_v)
-        range_max = float(close + 0.5 * atr_v)
-        stop, target = compute_stop_target(close, atr_v, multipliers, support_level, resistance_level)
+    return df
 
-        ts_val = int(row["ts"]) if "ts" in row else int(pd.to_datetime(row["timestamp"]).astype("int64") // 10**6)
-        ts_iso = pd.to_datetime(row["timestamp"]).isoformat() if "timestamp" in row else pd.to_datetime(ts_val, unit="ms").isoformat()
+# ---------- Save scores to Postgres ----------
 
-        rows_to_save.append({
-            "ts": int(ts_val),
-            "ts_iso": ts_iso,
-            "score": float(score_val),
-            "range_min": float(range_min),
-            "range_max": float(range_max),
-            "stop": float(stop),
-            "target": float(target),
-            "p_ml": float(p_ml) if p_ml is not None else None,
-            "multiplier": float(multiplier) if multiplier is not None else None
-        })
-
-    # persist
-    if save_rows and rows_to_save:
-        try:
-            # create DataFrame in the format expected by core.storage.save_scores
-            df_scores = pd.DataFrame(rows_to_save)
-            df_scores["asset"] = symbol
-            df_scores["interval"] = interval
-            # reorder columns to match expectations (optional)
-            cols_preferred = ["asset", "interval", "ts", "score", "range_min", "range_max", "stop", "target", "p_ml", "multiplier", "ts_iso"]
-            df_scores = df_scores[[c for c in cols_preferred if c in df_scores.columns]]
-            # call storage.save_scores
-            save_scores(df_scores)
-        except Exception as e:
-            print(f"[score] save_scores error for {symbol} {interval}: {e}")
-
-    # return last for quick inspection and also full rows
-    last = rows_to_save[-1] if rows_to_save else None
-    return {"last": last, "rows": rows_to_save}
-
-
-def compute_all_scores(*args, db_path: Optional[str] = None, config: dict = None):
+def save_scores_to_db(storage, df_scores: pd.DataFrame, asset: str, interval: str) -> int:
     """
-    Compute scores.
-
-    Backwards-compatible behavior:
-    - Called with no positional args: original behavior — compute scores for all symbols
-      from data/config/cryptos.csv and actions.csv (uses config file).
-    - Called as compute_all_scores(asset, interval, db_path=..., config=...):
-      compute scores for that single asset/interval and return a DataFrame suitable
-      for storage.save_scores(...) (so main.py can call storage.save_scores on it).
+    Guarda las filas relevantes de df_scores en la tabla `scores`.
+    df_scores debe contener columnas: ts (pd.Timestamp), score, range_min, range_max, stop, target
+    Devuelve número de filas insertadas/upserted.
     """
-    if config is None:
-        config = load_config()
+    if df_scores is None or df_scores.empty:
+        logger.debug("save_scores_to_db: vacío, nada que guardar")
+        return 0
 
-    # If called with two positional args, assume single-asset mode.
-    if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
-        asset = args[0]
-        interval = args[1]
-        # Use process_symbol_interval but avoid double-saving here — let main.py decide.
-        res = process_symbol_interval(asset, interval, config=config, save_rows=False)
-        if res is None:
-            return pd.DataFrame()  # empty DataFrame
-        rows = res.get("rows", [])
-        if not rows:
-            return pd.DataFrame()
-        df_scores = pd.DataFrame(rows)
-        df_scores["asset"] = asset
-        df_scores["interval"] = interval
-        # reorder columns
-        cols_preferred = ["asset", "interval", "ts", "score", "range_min", "range_max", "stop", "target", "p_ml", "multiplier", "ts_iso"]
-        df_scores = df_scores[[c for c in cols_preferred if c in df_scores.columns]]
-        return df_scores
+    df = df_scores.copy()
+    # ensure ts_ms int
+    if pd.api.types.is_datetime64_any_dtype(df["ts"]):
+        df["ts_ms"] = (df["ts"].astype("int64") // 1_000_000).astype("int64")
+    else:
+        df["ts_ms"] = df["ts"].astype("int64")
+    rows = []
+    now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+    for _, r in df.iterrows():
+        rows.append((
+            asset,
+            interval,
+            int(r["ts_ms"]),
+            float(r.get("score", 0.0)),
+            float(r.get("range_min")) if not pd.isna(r.get("range_min")) else None,
+            float(r.get("range_max")) if not pd.isna(r.get("range_max")) else None,
+            float(r.get("stop")) if not pd.isna(r.get("stop")) else None,
+            float(r.get("target")) if not pd.isna(r.get("target")) else None,
+            int(now_ms),
+        ))
 
-    # ---------- original behavior (no positional args) ----------
-    cfg_dir = ROOT / "data" / "config"
-    cryptos = []
-    stocks = []
+    upsert_sql = """
+    INSERT INTO scores (asset, interval, ts, score, range_min, range_max, stop, target, created_at)
+    VALUES %s
+    ON CONFLICT (asset, interval, ts) DO UPDATE
+      SET score = EXCLUDED.score,
+          range_min = EXCLUDED.range_min,
+          range_max = EXCLUDED.range_max,
+          stop = EXCLUDED.stop,
+          target = EXCLUDED.target,
+          created_at = EXCLUDED.created_at;
+    """
+
+    inserted = 0
     try:
-        p = cfg_dir / "cryptos.csv"
-        if p.exists():
-            cryptos = pd.read_csv(p)["symbol"].dropna().astype(str).tolist()
+        with storage.get_conn() as conn:
+            with conn.cursor() as cur:
+                import psycopg2.extras as pe
+                pe.execute_values(cur, upsert_sql, rows, template=None, page_size=200)
+                inserted = cur.rowcount if cur.rowcount is not None else len(rows)
+        logger.info("save_scores_to_db: insertadas %d filas para %s %s", inserted, asset, interval)
     except Exception:
-        cryptos = []
-    try:
-        p = cfg_dir / "actions.csv"
-        if p.exists():
-            stocks = pd.read_csv(p)["symbol"].dropna().astype(str).tolist()
-    except Exception:
-        stocks = []
+        logger.exception("Error guardando scores para %s %s", asset, interval)
+    return inserted
 
-    results = {}
-    for s in cryptos:
-        try:
-            results[s] = process_symbol_interval(s, interval=config.get("crypto_interval", "1h"), config=config, save_rows=True)
-            print(f"[score] processed {s} {config.get('crypto_interval', '1h')} -> {results[s]}")
-        except Exception as e:
-            print(f"[score] error processing {s}: {e}")
-
-    for s in stocks:
-        try:
-            results[s] = process_symbol_interval(s, interval=config.get("stock_interval", "1h"), config=config, save_rows=True)
-            print(f"[score] processed {s} {config.get('stock_interval', '1h')} -> {results[s]}")
-        except Exception as e:
-            print(f"[score] error processing {s}: {e}")
-
-    return results
+# ---------- High-level helper -----------
+def compute_and_save_scores_for_asset(storage, asset: str, interval: str, lookback_bars: int = 500, weights: Optional[Dict[str,float]] = None):
+    """
+    High level: obtiene candles desde storage, calcula indicadores y score, guarda en DB.
+    - lookback_bars: cuántas velas leer para calcular indicadores y scores
+    """
+    # obtener datos
+    # End using storage.get_ohlcv (returns ts pd.Timestamp)
+    df = storage.get_ohlcv(asset, interval, limit=lookback_bars)
+    if df is None or df.empty:
+        logger.warning("No hay velas para %s %s", asset, interval)
+        return 0
+    df_scored = compute_scores(df, weights=weights)
+    # guardamos solo las últimas N filas que contienen score calculado
+    inserted = save_scores_to_db(storage, df_scored[["ts", "score", "range_min", "range_max", "stop", "target"]], asset, interval)
+    return inserted
