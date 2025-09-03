@@ -4,7 +4,7 @@ import os
 import time
 import logging
 from dotenv import load_dotenv
-
+from datetime import datetime, timedelta
 import threading
 from core.fetch import Fetcher
 from core.storage_postgres import make_storage_from_env  # si exists; run_service ya usa esta
@@ -15,11 +15,40 @@ load_dotenv(".env.production")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("watchlist-service")
 
-storage = PostgresStorage()
-storage.init_db()
-
 # importa tu orquestador (main.run_pipeline)
 from main import run_pipeline, load_assets_from_config, load_json, run_cmd_backfill
+
+def backfill_all_assets():
+    """Hace backfill automático de todos los símbolos de la watchlist."""
+    storage = PostgresStorage()
+    fetcher = Fetcher(storage)
+
+    print("🔄 Iniciando backfill automático...")
+
+    watchlist = storage.get_watchlist()
+    if not watchlist:
+        print("⚠️ No hay símbolos en la watchlist. Añade alguno desde el dashboard.")
+        return
+
+    for asset in watchlist:
+        symbol = asset["symbol"]
+        interval = asset["interval"]
+
+        print(f"📥 Backfilling {symbol} ({interval})...")
+        last_candle = storage.get_last_candle(symbol, interval)
+
+        if last_candle:
+            start_time = last_candle["timestamp"] + timedelta(minutes=1)
+        else:
+            # Si no hay datos previos, descarga últimos 30 días
+            start_time = datetime.utcnow() - timedelta(days=30)
+
+        try:
+            fetcher.backfill_range(symbol, interval, start_time, datetime.utcnow())
+            print(f"✅ Backfill de {symbol} completo.")
+        except Exception as e:
+            print(f"❌ Error haciendo backfill de {symbol}: {e}")
+
 
 def send_telegram(message: str):
     # usa core.utils si ya existe; fallback básico
@@ -140,6 +169,8 @@ if __name__ == "__main__":
         from core.storage_postgres import PostgresStorage
         storage = PostgresStorage()
         storage.init_db()
+        backfill_all_assets()
+        
         logger.info("Database schema ensured by storage.init_db()")
     except Exception as e:
         logger.exception("Failed to init DB on worker startup: %s", e)
