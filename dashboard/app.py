@@ -25,6 +25,35 @@ import pandas as pd
 import sqlalchemy as sa
 import yaml
 
+# -------------------------
+# Helper: cargar assets desde CSV según config.json
+# -------------------------
+import json
+import csv
+
+def load_assets_from_csv(config_path: str = "config.json") -> list[str]:
+    """
+    Carga assets desde los CSV indicados en config.json bajo 'asset_files'.
+    Retorna una lista de strings con los activos.
+    """
+    assets = []
+    if not os.path.exists(config_path):
+        return assets
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    for key in ("cryptos", "stocks"):
+        path = cfg.get("asset_files", {}).get(key)
+        if path and os.path.exists(path):
+            with open(path, newline="", encoding="utf-8") as csvfile:
+                reader = csv.reader(csvfile)
+                for row in reader:
+                    if row and row[0].strip():
+                        assets.append(row[0].strip())
+    return assets
+
+
 # Import del storage y fetcher (deben existir en tu repo)
 from core.storage_postgres import PostgresStorage
 from core.fetch import Fetcher
@@ -273,6 +302,13 @@ def main():
 
     # Cargar watchlist (DB -> config -> env)
     assets, source = safe_load_watchlist(storage)
+    # Si safe_load_watchlist no encontró nada, intentar cargar desde CSV
+    if not assets:
+        assets = load_assets_from_csv("config.json")  # path a tu config.json
+    if assets:
+        source = "csv"
+        st.sidebar.success(f"Watchlist cargada desde CSV ({len(assets)} assets)")
+
     if not assets:
         st.warning("Watchlist deshabilitada (configuración requerida)")
         st.info("Opciones: crear tabla `watchlist` en Postgres; o poner WATCHLIST env; o config.yml con key 'watchlist'.")
