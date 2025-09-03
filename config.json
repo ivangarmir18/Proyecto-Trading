@@ -1,7 +1,7 @@
 {
   "weights": {
     "ema": 0.25,
-    "support": 0.20,
+    "support": 0.20, 
     "atr": 0.15,
     "macd": 0.15,
     "rsi": 0.10,
@@ -22,7 +22,7 @@
     "retrain_days": 7,
     "features": [
       "EMA9_EMA40_gap",
-      "RSI",
+      "RSI", 
       "ATR_rel",
       "MACD_hist",
       "vol_over_ma5",
@@ -34,5 +34,30 @@
   "asset_files": {
     "cryptos": "data/config/cryptos.csv",
     "stocks": "data/config/actions.csv"
+  },
+  
+  // AÑADIR ESTAS NUEVAS SECCIONES para el orchestrator
+  "app": {
+    "default_limit": 500
+  },
+  "api": {
+    "binance": {
+      "api_key": "pWToeNJhpx6FAnqhn7EiidQefEgmpkfY7A5VVdKLFqvds11umHmAleqfqschYSUu",
+      "api_secret": "oMaJr0riPq908VX5dxpGJSVOlcCdLvUlkHM4WET8rW72mCBVOTTlUMHHk3vNoFjR",
+      "rate_limit_per_min": 1200
+    },
+    "finnhub": {
+      "keys": ["d2qnmshr01qn21mkb99gd2qnmshr01qn21mkb9a0", "d2raic1r01qlk22sfbq0d2raic1r01qlk22sfbqg", "d2rail1r01qlk22sfd30d2rail1r01qlk22sfd3g", "d2raitpr01qlk22sfeb0d2raitpr01qlk22sfebg"]
+    }
+  },
+  "scheduler": {
+    "processing_interval_minutes": 15,
+    "crypto_cycle_minutes": 5,
+    "stocks_cycle_minutes": 60
+  },
+  "retention_days": {
+    "5m": 30,
+    "1h": 90,
+    "1d": 365
   }
 }

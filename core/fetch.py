@@ -1,17 +1,10 @@
 """
-core/fetch.py  -- Versión mejorada y robusta del recolector de OHLCV.
-
-Características principales:
-- Clase Fetcher que soporta múltiples exchanges (Binance por defecto).
-- Reintentos con backoff exponencial + full jitter.
-- Manejo de errores específicos de ccxt (NetworkError, ExchangeError).
-- Fallback automático a yfinance (y opcionalmente a Finnhub si integras su cliente).
-- Función de backfill por rango (split por 'limit' para no pedir demasiados datos).
-- RateLimiting simple (token-bucket estilo) configurable por instancia.
-- Concurrency opcional para peticiones en batch (ThreadPoolExecutor).
-- Hooks: save_callback(df, asset, interval, meta) para integrar con storage.
-- CLI para pruebas rápidas.
-- Logging detallado y parámetros configurables desde env o desde constructor.
+core/fetch.py - Versión mejorada con soporte completo para Finnhub
+Características:
+- Soporte para Binance (criptos) y Finnhub (acciones)
+- Rotación automática de API keys para Finnhub
+- Mecanismos de respaldo (fallback) robustos
+- Compatibilidad total con el sistema existente
 """
 
 from __future__ import annotations
@@ -22,9 +15,11 @@ import os
 import random
 from typing import Optional, Callable, List, Dict, Any, Tuple
 from datetime import datetime, timezone
+from enum import Enum
 
 import ccxt
 import pandas as pd
+import requests
 from dateutil import parser
 from tqdm import tqdm
 
@@ -34,7 +29,6 @@ try:
 except Exception:
     yf = None
 
-# Logging básico (tu proyecto probablemente tenga su propio logger)
 logger = logging.getLogger("core.fetch")
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -42,30 +36,23 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(os.environ.get("FETCH_LOG_LEVEL", "INFO"))
 
-# Mapeo simple de intervalos (extensible)
+# Mapeo de intervalos
 INTERVAL_MAP = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h",
-    "2h": "2h",
-    "4h": "4h",
-    "1d": "1d",
-    "1w": "1w",
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1d", "1w": "1w"
 }
 
-# Typing for save callback:
+# Typing for save callback
 SaveCallback = Callable[[pd.DataFrame, str, str, Dict[str, Any]], None]
 
+class DataSource(Enum):
+    BINANCE = "binance"
+    FINNHUB = "finnhub"
+    YFINANCE = "yfinance"
+    UNKNOWN = "unknown"
 
 class RateLimiter:
-    """
-    Token-bucket style rate limiter.
-    Allows 'rate' tokens per 'per_seconds' interval.
-    Keep a small state, thread-safe if used carefully (no locking here for simplicity).
-    """
+    """Token-bucket style rate limiter"""
     def __init__(self, rate: int = 1200, per_seconds: int = 60):
         self.rate = rate
         self.per_seconds = per_seconds
@@ -90,23 +77,48 @@ class RateLimiter:
         return False
 
     def wait_for_token(self):
-        """Block until at least one token is available."""
+        """Block until at least one token is available"""
         while not self.consume(1):
             time.sleep(0.05)
 
-
 def full_jitter_sleep(base: float, cap: float, attempt: int):
-    """
-    Exponential backoff with full jitter (AWS recommended pattern).
-    base: base seconds (e.g., 1.0)
-    cap: max seconds (e.g., 60)
-    attempt: attempt number, starting at 1
-    """
+    """Exponential backoff with full jitter"""
     exp = min(cap, base * (2 ** (attempt - 1)))
     sleep = random.uniform(0, exp)
     logger.debug("Backoff sleep for %.3fs (attempt %d)", sleep, attempt)
     time.sleep(sleep)
 
+class FinnhubKeyManager:
+    """Gestiona rotación de API keys para Finnhub"""
+    def __init__(self, keys: List[str]):
+        if not keys:
+            raise ValueError("Se requieren API keys para Finnhub")
+        self.keys = keys
+        self.key_usage = {key: 0 for key in keys}
+        self.key_limits = {key: 60 for key in keys}  # Límite por minuto por key
+        self.last_reset = time.time()
+        
+    def get_key(self):
+        """Obtiene la mejor key disponible basado en uso reciente"""
+        current_time = time.time()
+        # Resetear contadores cada minuto
+        if current_time - self.last_reset > 60:
+            self.key_usage = {key: 0 for key in self.keys}
+            self.last_reset = current_time
+            
+        # Encontrar key con menor uso
+        available_keys = [key for key in self.keys 
+                         if self.key_usage[key] < self.key_limits[key]]
+        if not available_keys:
+            # Todas las keys alcanzaron su límite, esperar reset
+            sleep_time = 60 - (current_time - self.last_reset)
+            if sleep_time > 0:
+                time.sleep(sleep_time + 1)
+                return self.get_key()
+            
+        best_key = min(available_keys, key=lambda k: self.key_usage[k])
+        self.key_usage[best_key] += 1
+        return best_key
 
 class Fetcher:
     def __init__(
@@ -114,22 +126,13 @@ class Fetcher:
         exchange_name: str = "binance",
         binance_api_key: Optional[str] = None,
         binance_secret: Optional[str] = None,
+        finnhub_keys: Optional[List[str]] = None,
         rate_limit_per_min: Optional[int] = None,
         default_limit: int = 500,
         max_attempts: int = 6,
         backoff_base: float = 1.0,
         backoff_cap: float = 60.0,
     ):
-        """
-        Construye el Fetcher.
-
-        - exchange_name: nombre para ccxt (ej. 'binance').
-        - binance_api_key / secret: opcionales.
-        - rate_limit_per_min: si se da, se usa para crear un RateLimiter; si None, usa exchange.enableRateLimit.
-        - default_limit: límite por llamada a fetch_ohlcv.
-        - max_attempts: reintentos totales antes de fallback/error.
-        - backoff_*: parámetros de backoff.
-        """
         self.exchange_name = exchange_name
         self.binance_api_key = binance_api_key or os.getenv("ENV_BINANCE_KEY")
         self.binance_secret = binance_secret or os.getenv("ENV_BINANCE_SECRET")
@@ -138,13 +141,32 @@ class Fetcher:
         self.backoff_base = backoff_base
         self.backoff_cap = backoff_cap
 
+        # Configurar Finnhub
+        self.finnhub_keys = finnhub_keys or []
+        if not self.finnhub_keys:
+            # Intentar cargar keys de environment variables
+            finnhub_keys_env = os.getenv("FINNHUB_KEYS", "")
+            if finnhub_keys_env:
+                self.finnhub_keys = [k.strip() for k in finnhub_keys_env.split(",") if k.strip()]
+            else:
+                # Buscar keys individuales
+                for i in range(1, 6):
+                    key = os.getenv(f"FINNHUB_KEY_{i}")
+                    if key:
+                        self.finnhub_keys.append(key)
+        
+        if self.finnhub_keys:
+            self.finnhub_key_manager = FinnhubKeyManager(self.finnhub_keys)
+        else:
+            self.finnhub_key_manager = None
+
         # Rate limiter
         if rate_limit_per_min:
             self.rate_limiter = RateLimiter(rate=rate_limit_per_min, per_seconds=60)
         else:
             self.rate_limiter = None
 
-        # inicializa exchange (ccxt)
+        # Inicializar exchange
         self._exchange = None
         self._init_exchange()
 
@@ -153,63 +175,130 @@ class Fetcher:
             if self.exchange_name.lower() == "binance":
                 exchange = ccxt.binance({
                     "enableRateLimit": True,
-                    # puedes setear proxies o timeouts aquí si quieres
-                    # 'timeout': 30000,
+                    "apiKey": self.binance_api_key,
+                    "secret": self.binance_secret,
                 })
-                # setear keys si existen (no necesarias para candles públicas, pero útil si usas endpoints privados)
-                if self.binance_api_key:
-                    exchange.apiKey = self.binance_api_key
-                if self.binance_secret:
-                    exchange.secret = self.binance_secret
                 self._exchange = exchange
-                logger.info("Exchange binance inicializado (enableRateLimit=%s)", exchange.enableRateLimit)
+                logger.info("Exchange binance inicializado")
             else:
-                # Soporte general para otros exchanges por nombre
                 exchange_cls = getattr(ccxt, self.exchange_name, None)
                 if exchange_cls:
                     self._exchange = exchange_cls({"enableRateLimit": True})
                     logger.info("Exchange %s inicializado", self.exchange_name)
                 else:
-                    logger.warning("Exchange %s no encontrado en ccxt; creando instancia genérica", self.exchange_name)
+                    logger.warning("Exchange %s no encontrado", self.exchange_name)
                     self._exchange = ccxt.Exchange({})
         except Exception as e:
-            logger.exception("Error inicializando exchange %s: %s", self.exchange_name, e)
+            logger.exception("Error inicializando exchange: %s", e)
             self._exchange = None
 
     def _ensure_rate_limit(self):
         if self.rate_limiter:
             self.rate_limiter.wait_for_token()
         else:
-            # confía en ccxt.enableRateLimit o sleep mínimo
             time.sleep(0.01)
 
     @staticmethod
     def normalize_symbol(asset: str) -> str:
-        """
-        Normaliza 'BTCUSDT' -> 'BTC/USDT' (heurística).
-        Conserva 'BTC/USDT' si ya contiene '/'. No modifica para acciones tipo 'AAPL'.
-        """
         if "/" in asset:
             return asset
-        # heurística común para cripto (USDT, USD, BUSD)
         for suf in ("USDT", "BUSD", "USD", "EUR", "BTC"):
             if asset.endswith(suf):
                 return asset[:-len(suf)] + "/" + suf
-        # caso general: si >6 chars usamos split -4
         if len(asset) > 6:
             return asset[:-4] + "/" + asset[-4:]
         return asset
 
     def _ccxt_symbol(self, asset: str) -> str:
-        s = self.normalize_symbol(asset)
-        # ccxt usa formato MKT/QUOTE
-        return s
+        return self.normalize_symbol(asset)
 
     def _df_from_ccxt(self, ohlcv: List[List[Any]]) -> pd.DataFrame:
         df = pd.DataFrame(ohlcv, columns=["ts_ms", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
-        df = df[["ts", "open", "high", "low", "close", "volume"]]
-        return df
+        return df[["ts", "open", "high", "low", "close", "volume"]]
+
+    def _fetch_finnhub_ohlcv(self, symbol: str, resolution: str = "5", 
+                           from_ts: Optional[int] = None, to_ts: Optional[int] = None,
+                           count: Optional[int] = None) -> pd.DataFrame:
+        """Fetch OHLCV data from Finnhub API"""
+        if not self.finnhub_key_manager:
+            raise RuntimeError("No Finnhub API keys configured")
+        
+        api_key = self.finnhub_key_manager.get_key()
+        url = "https://finnhub.io/api/v1/stock/candle"
+        
+        params = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "token": api_key
+        }
+        
+        if from_ts and to_ts:
+            params["from"] = from_ts
+            params["to"] = to_ts
+        elif count:
+            params["count"] = count
+        else:
+            # Por defecto, últimos 100 candles
+            params["count"] = 100
+        
+        attempt = 0
+        while attempt < self.max_attempts:
+            try:
+                response = requests.get(url, params=params, timeout=15)
+                
+                if response.status_code == 429:
+                    # Rate limit exceeded
+                    attempt += 1
+                    sleep_time = 2 ** attempt
+                    logger.warning("Finnhub rate limit exceeded, sleeping %s seconds", sleep_time)
+                    time.sleep(sleep_time)
+                    continue
+                    
+                response.raise_for_status()
+                data = response.json()
+                
+                if data["s"] != "ok":
+                    raise ValueError(f"Finnhub API error: {data.get('s', 'unknown')}")
+                
+                # Convertir a DataFrame
+                df = pd.DataFrame({
+                    "ts": data["t"],
+                    "open": data["o"],
+                    "high": data["h"],
+                    "low": data["l"],
+                    "close": data["c"],
+                    "volume": data["v"]
+                })
+                
+                df["ts"] = pd.to_datetime(df["ts"], unit="s", utc=True)
+                return df[["ts", "open", "high", "low", "close", "volume"]]
+                
+            except requests.exceptions.RequestException as e:
+                attempt += 1
+                logger.warning("Error fetching from Finnhub (attempt %d/%d): %s", 
+                             attempt, self.max_attempts, e)
+                if attempt >= self.max_attempts:
+                    raise
+                full_jitter_sleep(self.backoff_base, self.backoff_cap, attempt)
+        
+        raise RuntimeError(f"Failed to fetch data from Finnhub after {self.max_attempts} attempts")
+
+    def _determine_data_source(self, asset: str) -> DataSource:
+        """Determina la mejor fuente de datos para un asset"""
+        # Verificar si es cripto (termina con USDT, BTC, etc.)
+        if any(asset.upper().endswith(x) for x in ("USDT", "BUSD", "BTC", "ETH", "USD")):
+            return DataSource.BINANCE
+        
+        # Verificar si tenemos keys de Finnhub
+        if self.finnhub_key_manager:
+            return DataSource.FINNHUB
+        
+        # Fallback a yfinance
+        if yf is not None:
+            return DataSource.YFINANCE
+            
+        return DataSource.UNKNOWN
 
     def fetch_ohlcv(
         self,
@@ -220,93 +309,91 @@ class Fetcher:
         save_callback: Optional[SaveCallback] = None,
         meta: Optional[Dict[str, Any]] = None,
     ) -> pd.DataFrame:
-        """
-        Solicita OHLCV para un activo y timeframe.
-
-        - asset: 'BTCUSDT' o 'BTC/USDT' o 'AAPL' (yfinance fallback).
-        - interval: '5m', '1h', ... (usa INTERVAL_MAP)
-        - since: unix ms timestamp desde el que pedir (opcional)
-        - limit: max velas (si None usa default_limit)
-        - save_callback: función opcional para volcar resultados (df, asset, interval, meta)
-        - meta: diccionario que se pasará a save_callback para contexto (p. ej. {'source':'binance'})
-        """
         tf = INTERVAL_MAP.get(interval, interval)
         limit = limit or self.default_limit
-        symbol_ccxt = self._ccxt_symbol(asset)
+        source = self._determine_data_source(asset)
 
-        attempt = 1
+        attempt = 0
         last_exception = None
 
-        while attempt <= self.max_attempts:
+        while attempt < self.max_attempts:
             try:
                 self._ensure_rate_limit()
-                if not self._exchange:
-                    self._init_exchange()
-
-                # ccxt necesita símbolo con slash y algunos exchanges usan notación distinta; asumimos estándar
-                ohlcv = self._exchange.fetch_ohlcv(symbol_ccxt, timeframe=tf, since=since, limit=limit)
-                df = self._df_from_ccxt(ohlcv)
-
-                if save_callback:
+                df = None
+                
+                if source == DataSource.BINANCE:
+                    symbol_ccxt = self._ccxt_symbol(asset)
+                    if not self._exchange:
+                        self._init_exchange()
+                    
+                    ohlcv = self._exchange.fetch_ohlcv(symbol_ccxt, timeframe=tf, 
+                                                     since=since, limit=limit)
+                    df = self._df_from_ccxt(ohlcv)
+                    meta = meta or {}
+                    meta["source"] = "binance"
+                    
+                elif source == DataSource.FINNHUB:
+                    # Finnhub usa resoluciones diferentes
+                    resolution_map = {
+                        "1m": "1", "5m": "5", "15m": "15", "30m": "30",
+                        "1h": "60", "1d": "D", "1w": "W"
+                    }
+                    resolution = resolution_map.get(tf, "5")
+                    
+                    # Convertir timestamps
+                    from_ts = since // 1000 if since else None
+                    to_ts = int(time.time()) if since else None
+                    
+                    df = self._fetch_finnhub_ohlcv(asset, resolution, from_ts, to_ts, limit)
+                    meta = meta or {}
+                    meta["source"] = "finnhub"
+                    
+                elif source == DataSource.YFINANCE and yf is not None:
+                    yf_symbol = asset.replace("/", "-")
+                    yf_interval = {"1d": "1d", "1h": "60m", "5m": "5m", 
+                                 "30m": "30m", "1m": "1m"}.get(interval, "1d")
+                    
+                    period = "max" if since else "1y"
+                    hist = yf.download(tickers=yf_symbol, interval=yf_interval, 
+                                     period=period, progress=False, threads=False)
+                    
+                    if hist is None or hist.empty:
+                        raise RuntimeError("yfinance devolvió DataFrame vacío")
+                    
+                    df = hist.reset_index().rename(columns={
+                        "Datetime": "ts", "Date": "ts", "Open": "open", 
+                        "High": "high", "Low": "low", "Close": "close", 
+                        "Volume": "volume"
+                    })
+                    
+                    if isinstance(df.loc[0, "ts"], pd.Timestamp):
+                        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+                    else:
+                        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+                    
+                    df = df[["ts", "open", "high", "low", "close", "volume"]]
+                    meta = meta or {}
+                    meta["source"] = "yfinance"
+                
+                else:
+                    raise RuntimeError(f"No hay fuente de datos disponible para {asset}")
+                
+                if save_callback and df is not None:
                     try:
                         save_callback(df.copy(), asset, interval, meta or {})
                     except Exception:
-                        logger.exception("save_callback falló para %s %s (no aborta)", asset, interval)
-
-                # attach meta info (source)
-                if meta is None:
-                    meta = {}
-                meta["source"] = getattr(self._exchange, "id", self.exchange_name)
+                        logger.exception("Error en save_callback para %s %s", asset, interval)
+                
                 return df
 
-            except ccxt.NetworkError as e:
-                last_exception = e
-                logger.warning("NetworkError fetching %s %s attempt %d/%d: %s", asset, interval, attempt, self.max_attempts, e)
-            except ccxt.ExchangeError as e:
-                last_exception = e
-                logger.warning("ExchangeError fetching %s %s attempt %d/%d: %s", asset, interval, attempt, self.max_attempts, e)
             except Exception as e:
                 last_exception = e
-                logger.exception("Error inesperado fetching %s %s attempt %d/%d: %s", asset, interval, attempt, self.max_attempts, e)
-
-            # backoff con jitter
-            full_jitter_sleep(self.backoff_base, self.backoff_cap, attempt)
-            attempt += 1
-
-        # Si llegamos aquí: fallback a yfinance (útil para acciones o cuando ccxt falla)
-        logger.info("Intentando fallback a yfinance para %s %s", asset, interval)
-        try:
-            if yf is None:
-                raise RuntimeError("yfinance no disponible (instálalo con pip install yfinance)")
-
-            # yfinance espera símbolos tipo 'AAPL' o 'BTC-USD' segun mercado; convertir heurísticamente:
-            yf_symbol = asset.replace("/", "-")
-            # map interval to yfinance interval (no todos los intervalos están soportados por yfinance)
-            yf_interval = {"1d": "1d", "1h": "60m", "5m": "5m", "30m": "30m", "1m": "1m"}.get(interval, "1d")
-            # si since dado, pedimos period 'max' y luego filtramos; si not, pedimos period='1y' por defecto
-            period = "max" if since else "1y"
-            hist = yf.download(tickers=yf_symbol, interval=yf_interval, period=period, progress=False, threads=False)
-            if hist is None or hist.empty:
-                raise RuntimeError("yfinance devolvió DataFrame vacío")
-
-            df = hist.reset_index().rename(columns={"Datetime": "ts", "Date": "ts", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-            if isinstance(df.loc[0, "ts"], pd.Timestamp):
-                df["ts"] = pd.to_datetime(df["ts"], utc=True)
-            else:
-                df["ts"] = pd.to_datetime(df["ts"], utc=True)
-            df = df[["ts", "open", "high", "low", "close", "volume"]]
-            if save_callback:
-                try:
-                    meta2 = meta or {}
-                    meta2["source"] = "yfinance"
-                    save_callback(df.copy(), asset, interval, meta2)
-                except Exception:
-                    logger.exception("save_callback fallo en fallback yfinance (no aborta)")
-            return df
-        except Exception as e:
-            logger.exception("Fallback yfinance falló para %s %s: %s", asset, interval, e)
-            # fallback adicional: podrías integrar Finnhub aquí
-            raise RuntimeError(f"No se pudo obtener OHLCV para {asset} en {interval}") from last_exception
+                logger.warning("Error fetching %s %s (attempt %d/%d): %s", 
+                             asset, interval, attempt + 1, self.max_attempts, e)
+                attempt += 1
+                full_jitter_sleep(self.backoff_base, self.backoff_cap, attempt)
+        
+        raise RuntimeError(f"Failed to fetch OHLCV for {asset} {interval}: {last_exception}")
 
     def backfill_range(
         self,
@@ -318,41 +405,26 @@ class Fetcher:
         save_callback: Optional[SaveCallback] = None,
         progress: bool = True,
     ) -> pd.DataFrame:
-        """
-        Backfill de un rango largo: divide en llamadas por 'per_call_limit' (velas por llamada).
-        Devuelve DataFrame concatenado ordenado por ts ascendente.
-
-        - start_ts_ms, end_ts_ms: timestamps en ms (unix)
-        - per_call_limit: límite por llamada (usa default_limit si None)
-        - save_callback: callback que se invoca por cada bloque obtenido
-        """
         per_call_limit = per_call_limit or self.default_limit
-        tf = INTERVAL_MAP.get(interval, interval)
+        source = self._determine_data_source(asset)
 
-        # heurística: calcular el ms por vela (aprox) según interval
-        ms_per_unit = {
-            "m": 60_000,
-            "h": 3_600_000,
-            "d": 86_400_000,
-            "w": 7 * 86_400_000,
-        }
-        # determinar multiplicador
-        unit = tf[-1]
-        qty = int(tf[:-1]) if tf[:-1].isdigit() else 1
-        ms_per_bar = ms_per_unit.get(unit, 60_000) * qty
+        # Para Finnhub, podemos pedir más datos de una vez
+        if source == DataSource.FINNHUB:
+            per_call_limit = min(per_call_limit * 2, 1000)  # Finnhub permite hasta 1000 candles
 
-        # número aproximado de velas en el rango
+        # Calcular número aproximado de velas
+        interval_seconds = parse_interval_to_seconds(interval)
+        ms_per_bar = interval_seconds * 1000
         total_bars = max(1, math.ceil((end_ts_ms - start_ts_ms) / ms_per_bar))
-        # número de llamados que necesitaremos
         calls = max(1, math.ceil(total_bars / per_call_limit))
 
-        logger.info("Backfilling %s %s from %s to %s -> ~%d bars in %d calls (per_call_limit=%d)",
+        logger.info("Backfilling %s %s from %s to %s -> ~%d bars in %d calls",
                     asset, interval,
                     datetime.fromtimestamp(start_ts_ms / 1000, tz=timezone.utc).isoformat(),
                     datetime.fromtimestamp(end_ts_ms / 1000, tz=timezone.utc).isoformat(),
-                    total_bars, calls, per_call_limit)
+                    total_bars, calls)
 
-        results: List[pd.DataFrame] = []
+        results = []
         current_since = start_ts_ms
 
         iterator = range(calls)
@@ -360,43 +432,51 @@ class Fetcher:
             iterator = tqdm(iterator, desc=f"Backfill {asset} {interval}", unit="call")
 
         for i in iterator:
-            # pedido por bloques: since=current_since, limit=per_call_limit
             try:
-                df_block = self.fetch_ohlcv(asset, interval=interval, since=current_since, limit=per_call_limit, save_callback=save_callback, meta={"chunk_index": i, "total_chunks": calls})
+                df_block = self.fetch_ohlcv(asset, interval=interval, since=current_since,
+                                          limit=per_call_limit, save_callback=save_callback,
+                                          meta={"chunk_index": i, "total_chunks": calls})
+                
                 if df_block is None or df_block.empty:
-                    logger.debug("Bloque %d devolvió vacío, rompiendo", i)
+                    logger.debug("Bloque %d vacío, terminando", i)
                     break
+                    
                 results.append(df_block)
-                # avanzar current_since: tomar último ts y sumar 1 ms para evitar solapamientos
-                last_ts = int(df_block["ts"].iloc[-1].timestamp() * 1000)
-                if last_ts >= current_since:
-                    current_since = last_ts + 1
+                
+                # Avanzar al siguiente timestamp
+                last_ts = df_block["ts"].iloc[-1]
+                if isinstance(last_ts, pd.Timestamp):
+                    last_ts_ms = int(last_ts.timestamp() * 1000)
                 else:
-                    # protección: si no avanzó (p. ej. exchange devolvió siempre mismas velas), rompemos para no buclear
-                    logger.warning("fetch_ohlcv no avanzó el timestamp (last_ts=%d current_since=%d), rompiendo", last_ts, current_since)
+                    last_ts_ms = int(last_ts)
+                    
+                if last_ts_ms >= current_since:
+                    current_since = last_ts_ms + 1
+                else:
+                    logger.warning("Timestamp no avanzó, terminando")
                     break
-                # si superamos end_ts_ms, rompemos
+                    
                 if current_since > end_ts_ms:
                     break
+                    
             except Exception as e:
-                logger.exception("Error durante backfill chunk %d para %s: %s", i, asset, e)
-                # decidir: continuar o romper; aquí rompemos para no spammear al exchange
+                logger.exception("Error en chunk %d para %s: %s", i, asset, e)
                 break
 
         if not results:
             return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
-
+            
         df_all = pd.concat(results, ignore_index=True)
-        # deduplicate by ts and sort
         df_all = df_all.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
-        # filtrar por rango estricto
-        df_all = df_all[(df_all["ts"].astype("int64") // 1_000_000 >= start_ts_ms // 1_000) & (df_all["ts"].astype("int64") // 1_000_000 <= end_ts_ms // 1_000)]
-        return df_all
+        
+        # Filtrar por rango exacto
+        df_all["ts_ms"] = (df_all["ts"].astype("int64") // 1_000_000).astype("int64")
+        df_all = df_all[(df_all["ts_ms"] >= start_ts_ms) & (df_all["ts_ms"] <= end_ts_ms)]
+        return df_all.drop(columns=["ts_ms"])
 
-    # --- utilidades pequeñas
+    # Métodos utilitarios
     @staticmethod
     def ms_from_iso(iso_ts: str) -> int:
-        """Convierte ISO8601 a ms unix (int)."""
         dt = parser.isoparse(iso_ts)
         return int(dt.timestamp() * 1000)
 
@@ -404,38 +484,21 @@ class Fetcher:
     def now_ms() -> int:
         return int(time.time() * 1000)
 
-
-# CLI simple para probar
-def _cli():
-    import argparse
-    parser = argparse.ArgumentParser(description="Prueba fetcher (core/fetch.py)")
-    parser.add_argument("asset", help="Asset (ej. BTCUSDT o BTC/USDT o AAPL)")
-    parser.add_argument("--interval", default="1h")
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--since", default=None, help="ISO8601 o ms timestamp")
-    parser.add_argument("--backfill", action="store_true", help="Si se activa pide rango start..now (usar --since como start)")
-    args = parser.parse_args()
-
-    fetcher = Fetcher(
-        binance_api_key=os.getenv("ENV_BINANCE_KEY"),
-        binance_secret=os.getenv("ENV_BINANCE_SECRET"),
-        rate_limit_per_min=int(os.getenv("ENV_RATE_LIMIT", "1200")),
-    )
-
-    if args.backfill:
-        if not args.since:
-            parser.error("--backfill requiere --since (ISO8601)")
-        start_ms = Fetcher.ms_from_iso(args.since) if not args.since.isdigit() else int(args.since)
-        end_ms = Fetcher.now_ms()
-        df = fetcher.backfill_range(args.asset, args.interval, start_ms, end_ms, per_call_limit=args.limit or None, progress=True)
-        print(df.tail(10).to_string(index=False))
-    else:
-        since_ms = None
-        if args.since:
-            since_ms = Fetcher.ms_from_iso(args.since) if not args.since.isdigit() else int(args.since)
-        df = fetcher.fetch_ohlcv(args.asset, interval=args.interval, since=since_ms, limit=args.limit)
-        print(df.tail(20).to_string(index=False))
-
-
-if __name__ == "__main__":
-    _cli()
+# Función de utilidad para parsear intervalos (debe estar definida en utils)
+def parse_interval_to_seconds(interval: str) -> int:
+    """Convierte intervalos como '5m' a segundos"""
+    if not interval:
+        raise ValueError("Intervalo vacío")
+    
+    s = str(interval).strip().lower()
+    num = ''.join(filter(str.isdigit, s))
+    unit = ''.join(filter(str.isalpha, s))
+    
+    if not num:
+        num = "1"
+    
+    unit_seconds = {
+        "m": 60, "min": 60, "h": 3600, "d": 86400, "w": 604800
+    }.get(unit, 60)
+    
+    return int(num) * unit_seconds

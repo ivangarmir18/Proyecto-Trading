@@ -1,0 +1,15 @@
+{
+  "asset": "BTCUSDT",
+  "interval": "5m",
+  "timestamp": "20250101_120000",
+  "metrics": {
+    "accuracy": 0.85,
+    "roc_auc": 0.9
+  },
+  "feature_columns": [
+    "feature1",
+    "feature2"
+  ],
+  "lookback_days": 30,
+  "model_type": "lightgbm"
+}

@@ -1,12 +1,32 @@
-pandas
-numpy
-python-binance
-yfinance
-python-dotenv
-requests
-joblib
-scikit-learn
-lightgbm
-matplotlib
-streamlit
-plotly
+# Testing and quality
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-xdist>=3.5.0
+pytest-mock>=3.12.0
+pytest-asyncio>=0.21.0
+coverage>=7.0.0
+codecov>=2.0.0
+
+# Code formatting and linting
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+isort>=5.12.0
+pre-commit>=3.5.0
+
+# Documentation
+sphinx>=7.0.0
+sphinx-rtd-theme>=1.0.0
+mkdocs>=1.5.0
+mkdocs-material>=9.0.0
+
+# Development tools
+jupyter>=1.0.0
+ipython>=8.0.0
+ipdb>=0.13.0
+debugpy>=1.6.0
+
+# Monitoring and profiling
+memory-profiler>=0.60.0
+line-profiler>=4.0.0
+py-spy>=0.3.0

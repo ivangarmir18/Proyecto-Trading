@@ -1,27 +1,22 @@
-# core/score.py
 """
-Score module
-
-- compute_scores(df, weights) -> DataFrame with normalized indicator columns + 'score' (0..1)
-- compute_and_save_scores_for_asset(storage, asset, interval, cfg) -> calcula últimos scores y los guarda en la tabla `scores`
-- utilities: normalization helpers, atr, ema fallback si no existen indicadores
-
-Assumptions:
-- Input candles DataFrame has columns: ts (pd.Timestamp UTC) open high low close volume
-- If indicator columns (ema9, ema40, atr, macd, rsi, support, resistance) do NOT exist, the module computes basic versions:
-    - ema9, ema40 using pandas ewm
-    - atr simple using True Range & SMA
-    - rsi basic implementation
-- Scores are written to `scores` table in Postgres via storage.get_conn()
+core/score.py - Sistema de scoring mejorado con integración de IA
+Características:
+- Scoring híbrido (heurístico + IA)
+- Cálculo automático de stop/target optimizados
+- Integración con modelos de ML entrenados
+- Métricas de confianza para cada señal
 """
 
 from __future__ import annotations
 import logging
 import os
-from typing import Dict, Any, Optional
-
 import numpy as np
 import pandas as pd
+import joblib
+import json
+from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime
+from pathlib import Path
 
 logger = logging.getLogger("core.score")
 if not logger.handlers:
@@ -30,240 +25,418 @@ if not logger.handlers:
     logger.addHandler(ch)
 logger.setLevel(os.getenv("SCORE_LOG_LEVEL", "INFO"))
 
-# Default weights (same as tu memoria técnica, configurables en config.json)
+# Default weights (configurables desde config.json)
 DEFAULT_WEIGHTS = {
-    "ema": 0.25,
+    "trend": 0.25,
     "support": 0.20,
-    "atr": 0.15,
-    "macd": 0.15,
-    "rsi": 0.10,
-    "fibonacci": 0.15,  # if fibonacci not present it's ignored
+    "momentum": 0.15,
+    "volatility": 0.10,
+    "volume": 0.10,
+    "ai_confidence": 0.20
 }
 
-# ---------- Indicator fallback computations ----------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+DEFAULT_AI_CONFIG = {
+    "model_dir": "models",
+    "default_confidence": 0.5,
+    "min_confidence_threshold": 0.6,
+    "confidence_multiplier": 1.5
+}
 
-def compute_ema_columns(df: pd.DataFrame):
-    if "ema9" not in df.columns:
-        df["ema9"] = ema(df["close"], 9)
-    if "ema40" not in df.columns:
-        df["ema40"] = ema(df["close"], 40)
-    return df
-
-def true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    tr = true_range(df)
-    return tr.rolling(period, min_periods=1).mean()
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = ma_up / (ma_down + 1e-9)
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val
-
-def compute_basic_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = compute_ema_columns(df)
-    if "atr" not in df.columns:
-        df["atr"] = atr(df)
-    if "rsi" not in df.columns:
-        df["rsi"] = rsi(df["close"])
-    # MACD (simple): ema12 - ema26
-    if "macd" not in df.columns:
-        ema12 = ema(df["close"], 12)
-        ema26 = ema(df["close"], 26)
-        df["macd"] = ema12 - ema26
-        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    # supports/resistances: simple local min/max over window if not present
-    if "support" not in df.columns:
-        df["support"] = df["low"].rolling(window=20, min_periods=1).min()
-    if "resistance" not in df.columns:
-        df["resistance"] = df["high"].rolling(window=20, min_periods=1).max()
-
-    return df
-
-# ---------- Normalizers ----------
-def normalize_between_0_1(series: pd.Series) -> pd.Series:
-    # robust scaler to 0..1
-    minv = series.min()
-    maxv = series.max()
-    if pd.isna(minv) or pd.isna(maxv) or maxv == minv:
-        return pd.Series(0.5, index=series.index)
-    return (series - minv) / (maxv - minv)
-
-def normalize_rsi_to_01(rsi_series: pd.Series) -> pd.Series:
-    # rsi 0..100 -> 0..1
-    return rsi_series.clip(0,100) / 100.0
-
-# ---------- Score computation ----------
-def compute_scores(df: pd.DataFrame, weights: Optional[Dict[str, float]] = None) -> pd.DataFrame:
-    """
-    Returns a copy of df with new columns:
-      - score (0..1)
-      - score_components (dict-like columns optional)
-    """
-    weights = weights or DEFAULT_WEIGHTS.copy()
-    df = df.copy()
-    df = compute_basic_indicators(df)
-
-    # Component normalizations
-    # 1) Trend: price relative to ema9/ema40 (prefer price > ema40)
-    df["trend_raw"] = 0.0
-    price = df["close"]
-    ema9 = df["ema9"]
-    ema40 = df["ema40"]
-    # simple rule: if price > ema40 => 1; if price < ema9 => 0; else linear between
-    cond_up = price > ema40
-    cond_down = price < ema9
-    mid_mask = ~(cond_up | cond_down)
-    df.loc[cond_up, "trend_raw"] = 1.0
-    df.loc[cond_down, "trend_raw"] = 0.0
-    # linear interpolation between ema9 and ema40 for mid
-    denom = (ema40 - ema9).replace(0, np.nan)
-    df.loc[mid_mask, "trend_raw"] = ((price - ema9) / denom).clip(0,1).fillna(0.5)
-
-    # 2) proximity to support: distance / (3*ATR)
-    df["dist_support"] = (price - df["support"]).abs()
-    df["support_score_raw"] = (1 - (df["dist_support"] / (3 * df["atr"] + 1e-9))).clip(0,1)
-
-    # 3) atr score (less atr = more stable) -> invert normalized atr (lower atr => higher score)
-    df["atr_norm"] = normalize_between_0_1(df["atr"].fillna(0))
-    df["atr_score_raw"] = 1.0 - df["atr_norm"]
-
-    # 4) macd: normalize macd by absolute range
-    df["macd_norm"] = normalize_between_0_1(df["macd"].fillna(0))
-    df["macd_score_raw"] = df["macd_norm"]  # more macd -> stronger momentum
-
-    # 5) rsi
-    df["rsi_score_raw"] = normalize_rsi_to_01(df["rsi"].fillna(50))
-
-    # 6) fibonacci: placeholder (if you have levels column you can implement)
-    if "fibonacci" in df.columns:
-        # assume fibonacci already encoded 0..1 proximity score
-        df["fib_score_raw"] = normalize_between_0_1(df["fibonacci"].astype(float).fillna(0))
-    else:
-        df["fib_score_raw"] = 0.5
-
-    # Compose weighted score (only keys present in weights)
-    # map weights keys to component columns
-    comp_map = {
-        "ema": "trend_raw",
-        "support": "support_score_raw",
-        "atr": "atr_score_raw",
-        "macd": "macd_score_raw",
-        "rsi": "rsi_score_raw",
-        "fibonacci": "fib_score_raw",
-    }
-
-    # Sum weighted components; make sure total weight sums to 1 (normalize if not)
-    total_w = sum(weights.values()) if weights else 1.0
-    if total_w <= 0:
-        total_w = 1.0
-
-    df["score"] = 0.0
-    for k, w in weights.items():
-        comp_col = comp_map.get(k)
-        if comp_col and comp_col in df.columns:
-            df["score"] += df[comp_col].fillna(0) * (w / total_w)
+class AIScoringSystem:
+    """Sistema de scoring con integración de IA"""
+    
+    def __init__(self, storage, config: Optional[Dict[str, Any]] = None):
+        self.storage = storage
+        self.config = config or {}
+        self.ai_config = {**DEFAULT_AI_CONFIG, **self.config.get("ai", {})}
+        self.weights = {**DEFAULT_WEIGHTS, **self.config.get("weights", {})}
+        
+        # Cargar modelos de IA si existen
+        self.ai_models = {}
+        self.load_ai_models()
+    
+    def load_ai_models(self):
+        """Carga todos los modelos de IA disponibles"""
+        model_dir = Path(self.ai_config["model_dir"])
+        if not model_dir.exists():
+            logger.warning("Directorio de modelos no encontrado: %s", model_dir)
+            return
+        
+        for model_file in model_dir.glob("*.model"):
+            try:
+                asset_interval = model_file.stem.rsplit('_', 2)[0]  # formato: ASSET_INTERVAL_TIMESTAMP
+                asset, interval = asset_interval.split('_', 1)
+                
+                # Cargar modelo
+                model = joblib.load(model_file)
+                
+                # Cargar scaler
+                scaler_file = model_file.with_suffix('.scaler')
+                scaler = joblib.load(scaler_file) if scaler_file.exists() else None
+                
+                # Cargar metadata
+                meta_file = model_file.with_suffix('.meta')
+                metadata = {}
+                if meta_file.exists():
+                    with open(meta_file, 'r') as f:
+                        metadata = json.load(f)
+                
+                self.ai_models[f"{asset}_{interval}"] = {
+                    'model': model,
+                    'scaler': scaler,
+                    'metadata': metadata,
+                    'last_used': datetime.now()
+                }
+                
+                logger.info("Modelo cargado para %s %s", asset, interval)
+                
+            except Exception as e:
+                logger.error("Error cargando modelo %s: %s", model_file.name, e)
+    
+    def get_ai_model(self, asset: str, interval: str) -> Optional[Dict[str, Any]]:
+        """Obtiene el modelo de IA para un asset e intervalo específicos"""
+        model_key = f"{asset}_{interval}"
+        return self.ai_models.get(model_key)
+    
+    def calculate_ai_confidence(self, df: pd.DataFrame, asset: str, interval: str) -> pd.Series:
+        """Calcula la confianza de IA para cada fila del DataFrame"""
+        model_info = self.get_ai_model(asset, interval)
+        if not model_info:
+            return pd.Series([self.ai_config["default_confidence"]] * len(df), index=df.index)
+        
+        try:
+            # Preparar features para el modelo
+            feature_columns = model_info['metadata'].get('feature_columns', [])
+            available_features = [col for col in feature_columns if col in df.columns]
+            
+            if not available_features:
+                logger.warning("No hay features disponibles para el modelo de IA")
+                return pd.Series([self.ai_config["default_confidence"]] * len(df), index=df.index)
+            
+            X = df[available_features].copy()
+            
+            # Escalar features si hay scaler
+            if model_info['scaler']:
+                X_scaled = model_info['scaler'].transform(X)
+            else:
+                X_scaled = X.values
+            
+            # Predecir probabilidades
+            if hasattr(model_info['model'], 'predict_proba'):
+                probabilities = model_info['model'].predict_proba(X_scaled)
+                confidence = probabilities[:, 1]  # Probabilidad de clase positiva
+            else:
+                predictions = model_info['model'].predict(X_scaled)
+                confidence = predictions  # Usar predicciones directas
+            
+            # Ajustar confianza basado en el threshold mínimo
+            min_threshold = self.ai_config["min_confidence_threshold"]
+            confidence = np.where(confidence < min_threshold, 
+                                confidence * 0.5,  # Reducir confianza para predicciones débiles
+                                confidence)
+            
+            return pd.Series(confidence, index=df.index, name='ai_confidence')
+            
+        except Exception as e:
+            logger.error("Error calculando confianza de IA: %s", e)
+            return pd.Series([self.ai_config["default_confidence"]] * len(df), index=df.index)
+    
+    def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calcula indicadores técnicos para scoring"""
+        df = df.copy()
+        
+        # 1. Trend Strength (Fuerza de tendencia)
+        if 'ema9' in df.columns and 'ema40' in df.columns:
+            price = df['close']
+            ema9 = df['ema9']
+            ema40 = df['ema40']
+            
+            # Tendencia alcista si precio > EMA40
+            trend_direction = np.where(price > ema40, 1.0, 
+                                     np.where(price < ema9, 0.0, 0.5))
+            
+            # Fuerza de tendencia basada en distancia a EMAs
+            ema_distance = (price - ema40) / (ema40 + 1e-9)
+            trend_strength = np.tanh(ema_distance * 10) * 0.5 + 0.5  # Normalizar a 0-1
+            
+            df['trend_score'] = trend_direction * trend_strength
+        
+        # 2. Support/Resistance Proximity
+        if 'support' in df.columns and 'resistance' in df.columns and 'atr' in df.columns:
+            price = df['close']
+            support = df['support']
+            resistance = df['resistance']
+            atr = df['atr']
+            
+            # Proximidad a soporte (0-1, 1 = muy cerca del soporte)
+            support_distance = (price - support) / (atr + 1e-9)
+            support_proximity = np.exp(-np.abs(support_distance) / 3)
+            
+            # Proximidad a resistencia
+            resistance_distance = (resistance - price) / (atr + 1e-9)
+            resistance_proximity = np.exp(-np.abs(resistance_distance) / 3)
+            
+            # Mejor proximidad (maximizar entrada cerca de soporte)
+            df['support_proximity_score'] = support_proximity
+        
+        # 3. Momentum Indicators
+        if 'rsi' in df.columns:
+            # RSI normalizado y suavizado
+            rsi = df['rsi'].clip(20, 80)  # Evitar extremos
+            rsi_score = (rsi - 20) / 60  # Normalizar 20-80 → 0-1
+            df['momentum_score'] = rsi_score
+        
+        if 'macd_hist' in df.columns:
+            # MACD histogram strength
+            macd_strength = np.tanh(df['macd_hist'] / (df['atr'] + 1e-9) * 10) * 0.5 + 0.5
+            df['momentum_score'] = df.get('momentum_score', 0.5) * 0.5 + macd_strength * 0.5
+        
+        # 4. Volatility Analysis
+        if 'atr' in df.columns:
+            # Volatilidad normalizada (0-1, 1 = alta volatilidad)
+            volatility = df['atr'] / df['close']
+            volatility_score = 1 - np.tanh(volatility * 100)  # Invertir: menor volatilidad = mejor
+            df['volatility_score'] = volatility_score
+        
+        # 5. Volume Analysis
+        if 'volume' in df.columns:
+            # Volume relative to average
+            volume_ma = df['volume'].rolling(20).mean()
+            volume_ratio = df['volume'] / (volume_ma + 1e-9)
+            volume_score = np.tanh(volume_ratio - 1) * 0.5 + 0.5  # Normalizar
+            df['volume_score'] = volume_score
+        
+        return df
+    
+    def calculate_composite_score(self, df: pd.DataFrame, asset: str, interval: str) -> pd.DataFrame:
+        """Calcula el score compuesto (técnico + IA)"""
+        df = df.copy()
+        
+        # Calcular scores técnicos
+        df = self.calculate_technical_indicators(df)
+        
+        # Calcular confianza de IA
+        ai_confidence = self.calculate_ai_confidence(df, asset, interval)
+        df['ai_confidence'] = ai_confidence
+        
+        # Inicializar score compuesto
+        df['composite_score'] = 0.0
+        
+        # Componentes del score con pesos
+        components = {
+            'trend_score': self.weights.get('trend', 0.25),
+            'support_proximity_score': self.weights.get('support', 0.20),
+            'momentum_score': self.weights.get('momentum', 0.15),
+            'volatility_score': self.weights.get('volatility', 0.10),
+            'volume_score': self.weights.get('volume', 0.10),
+            'ai_confidence': self.weights.get('ai_confidence', 0.20)
+        }
+        
+        # Calcular score ponderado
+        total_weight = 0
+        for component, weight in components.items():
+            if component in df.columns:
+                # Rellenar valores missing con neutral (0.5)
+                component_values = df[component].fillna(0.5)
+                df['composite_score'] += component_values * weight
+                total_weight += weight
+        
+        # Normalizar si algún componente faltó
+        if total_weight > 0:
+            df['composite_score'] /= total_weight
+        
+        # Asegurar rango 0-1
+        df['composite_score'] = df['composite_score'].clip(0, 1)
+        
+        return df
+    
+    def calculate_optimal_stop_target(self, df: pd.DataFrame, asset: str, interval: str) -> pd.DataFrame:
+        """Calcula stop y target optimizados basados en score y volatilidad"""
+        df = df.copy()
+        
+        # Multiplicadores base de ATR
+        base_stop_multiplier = self.config.get('atr_multipliers', {}).get('stop', 1.3)
+        base_target_multiplier = self.config.get('atr_multipliers', {}).get('target', 2.5)
+        
+        # Ajustar multiplicadores basado en confianza de IA
+        if 'ai_confidence' in df.columns and 'atr' in df.columns:
+            confidence_multiplier = self.ai_config.get("confidence_multiplier", 1.5)
+            
+            # Ajustar target multiplier basado en confianza
+            target_multipliers = base_target_multiplier * (
+                1 + (df['ai_confidence'] - 0.5) * (confidence_multiplier - 1)
+            )
+            
+            # Ajustar stop multiplier (más conservador con alta confianza)
+            stop_multipliers = base_stop_multiplier * (
+                1 - (df['ai_confidence'] - 0.5) * 0.5  # Reducir stop con alta confianza
+            )
+            
+            # Calcular stop y target
+            df['stop'] = df['support'] - stop_multipliers * df['atr']
+            df['target'] = df['resistance'] + target_multipliers * df['atr']
+            
+            # Asegurar stop < price < target
+            df['stop'] = np.minimum(df['stop'], df['close'] * 0.99)
+            df['target'] = np.maximum(df['target'], df['close'] * 1.01)
+        
         else:
-            # missing comp: ignore but log once
-            logger.debug("Weight key %s has no corresponding component column", k)
+            # Fallback a cálculo básico
+            df['stop'] = df.get('support', df['close'] * 0.95) - base_stop_multiplier * df.get('atr', 0)
+            df['target'] = df.get('resistance', df['close'] * 1.05) + base_target_multiplier * df.get('atr', 0)
+        
+        return df
+    
+    def generate_scores(self, df: pd.DataFrame, asset: str, interval: str) -> pd.DataFrame:
+        """Genera scores completos con stop/target optimizados"""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        
+        df = df.copy()
+        
+        # Calcular score compuesto
+        df = self.calculate_composite_score(df, asset, interval)
+        
+        # Calcular stop/target optimizados
+        df = self.calculate_optimal_stop_target(df, asset, interval)
+        
+        # Rangos para visualización
+        df['range_min'] = df.get('support', df['close'] * 0.95)
+        df['range_max'] = df.get('resistance', df['close'] * 1.05)
+        
+        # Métricas de calidad de señal
+        df['signal_quality'] = self.calculate_signal_quality(df)
+        
+        return df
+    
+    def calculate_signal_quality(self, df: pd.DataFrame) -> pd.Series:
+        """Calcula métricas de calidad de señal"""
+        quality = pd.Series(0.5, index=df.index, name='signal_quality')
+        
+        # Factores de calidad
+        factors = []
+        
+        if 'ai_confidence' in df.columns:
+            factors.append(df['ai_confidence'])
+        
+        if 'trend_score' in df.columns:
+            factors.append(df['trend_score'])
+        
+        if 'atr' in df.columns and 'close' in df.columns:
+            # Baja volatilidad relativa → mejor calidad
+            volatility = df['atr'] / df['close']
+            vol_quality = 1 - np.tanh(volatility * 100)
+            factors.append(vol_quality)
+        
+        if len(factors) > 0:
+            # Promedio de factores de calidad
+            quality = sum(factors) / len(factors)
+        
+        return quality
+    
+    def save_scores_to_db(self, df_scores: pd.DataFrame, asset: str, interval: str) -> int:
+        """Guarda scores en la base de datos"""
+        if df_scores is None or df_scores.empty:
+            return 0
+        
+        required_columns = ['ts', 'composite_score', 'range_min', 'range_max', 
+                          'stop', 'target', 'ai_confidence', 'signal_quality']
+        
+        # Verificar columnas requeridas
+        for col in required_columns:
+            if col not in df_scores.columns:
+                df_scores[col] = np.nan
+        
+        # Preparar datos para inserción
+        df_db = df_scores[required_columns].copy()
+        df_db['asset'] = asset
+        df_db['interval'] = interval
+        df_db['created_at'] = int(datetime.now().timestamp() * 1000)
+        
+        # Convertir timestamp a ms
+        if pd.api.types.is_datetime64_any_dtype(df_db["ts"]):
+            df_db["ts_ms"] = (df_db["ts"].astype("int64") // 1_000_000).astype("int64")
+        else:
+            df_db["ts_ms"] = df_db["ts"].astype("int64")
+        
+        # Insertar en base de datos
+        try:
+            with self.storage.get_conn() as conn:
+                with conn.cursor() as cur:
+                    # UPSERT para scores
+                    upsert_sql = """
+                    INSERT INTO scores 
+                    (asset, interval, ts, score, range_min, range_max, stop, target, 
+                     p_ml, multiplier, created_at, signal_quality)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (asset, interval, ts) 
+                    DO UPDATE SET
+                        score = EXCLUDED.score,
+                        range_min = EXCLUDED.range_min,
+                        range_max = EXCLUDED.range_max,
+                        stop = EXCLUDED.stop,
+                        target = EXCLUDED.target,
+                        p_ml = EXCLUDED.p_ml,
+                        multiplier = EXCLUDED.multiplier,
+                        created_at = EXCLUDED.created_at,
+                        signal_quality = EXCLUDED.signal_quality
+                    """
+                    
+                    rows = []
+                    for _, row in df_db.iterrows():
+                        rows.append((
+                            asset, interval, int(row["ts_ms"]),
+                            float(row["composite_score"]),
+                            float(row["range_min"]) if not pd.isna(row["range_min"]) else None,
+                            float(row["range_max"]) if not pd.isna(row["range_max"]) else None,
+                            float(row["stop"]) if not pd.isna(row["stop"]) else None,
+                            float(row["target"]) if not pd.isna(row["target"]) else None,
+                            float(row["ai_confidence"]) if not pd.isna(row["ai_confidence"]) else None,
+                            float(row["signal_quality"]) if not pd.isna(row["signal_quality"]) else None,
+                            int(row["created_at"]),
+                            float(row["signal_quality"]) if not pd.isna(row["signal_quality"]) else None
+                        ))
+                    
+                    # Insertar en lotes
+                    batch_size = 100
+                    inserted = 0
+                    for i in range(0, len(rows), batch_size):
+                        batch = rows[i:i + batch_size]
+                        cur.executemany(upsert_sql, batch)
+                        inserted += cur.rowcount
+                    
+                    conn.commit()
+                    logger.info("Insertados %d scores para %s %s", inserted, asset, interval)
+                    return inserted
+                    
+        except Exception as e:
+            logger.exception("Error guardando scores en BD: %s", e)
+            return 0
 
-    # clip and ensure numeric
-    df["score"] = df["score"].clip(0,1).fillna(0.0)
-
-    # Optionally compute range_min, range_max, stop, target using ATR and support/resistance
-    atr_mult_stop = float(os.getenv("ATR_STOP_MULT", "1.3"))
-    atr_mult_target = float(os.getenv("ATR_TARGET_MULT", "1.3"))
-    df["stop"] = df["support"] - atr_mult_stop * df["atr"]
-    df["target"] = df["resistance"] + atr_mult_target * df["atr"]
-    # range_min = support or open; range_max = price + atr*0.5
-    df["range_min"] = df["support"]
-    df["range_max"] = df["close"] + 0.5 * df["atr"]
-
-    return df
-
-# ---------- Save scores to Postgres ----------
-
-def save_scores_to_db(storage, df_scores: pd.DataFrame, asset: str, interval: str) -> int:
+# Función de conveniencia para uso externo
+def compute_and_save_scores(storage, asset: str, interval: str, 
+                          lookback_bars: int = 500, config: Optional[Dict[str, Any]] = None) -> int:
     """
-    Guarda las filas relevantes de df_scores en la tabla `scores`.
-    df_scores debe contener columnas: ts (pd.Timestamp), score, range_min, range_max, stop, target
-    Devuelve número de filas insertadas/upserted.
+    Función principal para calcular y guardar scores
     """
-    if df_scores is None or df_scores.empty:
-        logger.debug("save_scores_to_db: vacío, nada que guardar")
-        return 0
-
-    df = df_scores.copy()
-    # ensure ts_ms int
-    if pd.api.types.is_datetime64_any_dtype(df["ts"]):
-        df["ts_ms"] = (df["ts"].astype("int64") // 1_000_000).astype("int64")
-    else:
-        df["ts_ms"] = df["ts"].astype("int64")
-    rows = []
-    now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
-    for _, r in df.iterrows():
-        rows.append((
-            asset,
-            interval,
-            int(r["ts_ms"]),
-            float(r.get("score", 0.0)),
-            float(r.get("range_min")) if not pd.isna(r.get("range_min")) else None,
-            float(r.get("range_max")) if not pd.isna(r.get("range_max")) else None,
-            float(r.get("stop")) if not pd.isna(r.get("stop")) else None,
-            float(r.get("target")) if not pd.isna(r.get("target")) else None,
-            int(now_ms),
-        ))
-
-    upsert_sql = """
-    INSERT INTO scores (asset, interval, ts, score, range_min, range_max, stop, target, created_at)
-    VALUES %s
-    ON CONFLICT (asset, interval, ts) DO UPDATE
-      SET score = EXCLUDED.score,
-          range_min = EXCLUDED.range_min,
-          range_max = EXCLUDED.range_max,
-          stop = EXCLUDED.stop,
-          target = EXCLUDED.target,
-          created_at = EXCLUDED.created_at;
-    """
-
-    inserted = 0
-    try:
-        with storage.get_conn() as conn:
-            with conn.cursor() as cur:
-                import psycopg2.extras as pe
-                pe.execute_values(cur, upsert_sql, rows, template=None, page_size=200)
-                inserted = cur.rowcount if cur.rowcount is not None else len(rows)
-        logger.info("save_scores_to_db: insertadas %d filas para %s %s", inserted, asset, interval)
-    except Exception:
-        logger.exception("Error guardando scores para %s %s", asset, interval)
-    return inserted
-
-# ---------- High-level helper -----------
-def compute_and_save_scores_for_asset(storage, asset: str, interval: str, lookback_bars: int = 500, weights: Optional[Dict[str,float]] = None):
-    """
-    High level: obtiene candles desde storage, calcula indicadores y score, guarda en DB.
-    - lookback_bars: cuántas velas leer para calcular indicadores y scores
-    """
-    # obtener datos
-    # End using storage.get_ohlcv (returns ts pd.Timestamp)
+    # Obtener datos
     df = storage.get_ohlcv(asset, interval, limit=lookback_bars)
     if df is None or df.empty:
-        logger.warning("No hay velas para %s %s", asset, interval)
+        logger.warning("No hay datos para %s %s", asset, interval)
         return 0
-    df_scored = compute_scores(df, weights=weights)
-    # guardamos solo las últimas N filas que contienen score calculado
-    inserted = save_scores_to_db(storage, df_scored[["ts", "score", "range_min", "range_max", "stop", "target"]], asset, interval)
+    
+    # Obtener indicadores si no están en los datos
+    if 'ema9' not in df.columns or 'atr' not in df.columns:
+        try:
+            from core.score import compute_basic_indicators
+            df = compute_basic_indicators(df)
+        except Exception as e:
+            logger.warning("Error calculando indicadores básicos: %s", e)
+    
+    # Calcular scores
+    scoring_system = AIScoringSystem(storage, config)
+    df_scores = scoring_system.generate_scores(df, asset, interval)
+    
+    # Guardar en BD
+    inserted = scoring_system.save_scores_to_db(df_scores, asset, interval)
     return inserted

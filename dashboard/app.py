@@ -1,335 +1,476 @@
-# dashboard/app.py
 """
-Streamlit dashboard for Proyecto Trading
-- Requisitos: streamlit, plotly, pandas
-- Run: streamlit run dashboard/app.py
+dashboard/app.py - Dashboard Streamlit completo con visualizaciones interactivas
+Características:
+- Visualización en tiempo real de velas y scores
+- Señales de trading con stop/target
+- Métricas de performance
+- Configuración interactiva
+- Actualización automática
 """
-import os
-import json
-import time
-import logging
-from typing import Optional, List, Dict
 
 import streamlit as st
 import pandas as pd
-import plotly.graph_objs as go
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import time
+from datetime import datetime, timedelta
+import json
+from pathlib import Path
+import sqlite3
+import os
 
-# Import your core modules (asegúrate de que el path PYTHONPATH incluye repo root)
-from core.storage_postgres import make_storage_from_env, PostgresStorage
-from core.fetch import Fetcher
-from core.score import compute_and_save_scores_for_asset
-# ai_train optional import later when needed
+# Configuración de la página
+st.set_page_config(
+    page_title="Trading Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-logger = logging.getLogger("dashboard")
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
-    logger.addHandler(ch)
-logger.setLevel(os.getenv("DASHBOARD_LOG_LEVEL", "INFO"))
+# Título y descripción
+st.title("📊 Sistema de Trading Inteligente")
+st.markdown("""
+Dashboard en tiempo real con señales de trading, análisis técnico y predicciones de IA.
+""")
 
-# Config
-PROJECT_CONFIG_PATH = os.getenv("PROJECT_CONFIG_PATH", "config.json")
-DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")  # set in env for basic protection
+# Sidebar para configuración
+with st.sidebar:
+    st.header("⚙️ Configuración")
+    
+    # Selección de asset e intervalo
+    assets = ["BTCUSDT", "ETHUSDT", "AAPL", "TSLA", "MSFT"]
+    intervals = ["5m", "15m", "1h", "4h", "1d"]
+    
+    selected_asset = st.selectbox("Asset", assets, index=0)
+    selected_interval = st.selectbox("Intervalo", intervals, index=2)
+    
+    # Configuración de visualización
+    lookback_days = st.slider("Días a mostrar", 1, 365, 30)
+    show_signals = st.checkbox("Mostrar señales", value=True)
+    show_indicators = st.checkbox("Mostrar indicadores", value=True)
+    
+    # Configuración de IA
+    ai_enabled = st.checkbox("Habilitar IA", value=True)
+    confidence_threshold = st.slider("Umbral de confianza", 0.0, 1.0, 0.6)
+    
+    # Botones de control
+    col1, col2 = st.columns(2)
+    with col1:
+        refresh_btn = st.button("🔄 Actualizar")
+    with col2:
+        auto_refresh = st.checkbox("Auto-actualizar", value=True)
 
-st.set_page_config(page_title="Proyecto Trading — Dashboard", layout="wide")
+# Estilos CSS personalizados
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1f77b4;
+        margin-bottom: 1rem;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #1f77b4;
+        margin-bottom: 1rem;
+    }
+    .signal-buy {
+        background-color: #d4edda !important;
+        border-left: 4px solid #28a745 !important;
+    }
+    .signal-sell {
+        background-color: #f8d7da !important;
+        border-left: 4px solid #dc3545 !important;
+    }
+    .plot-container {
+        background-color: white;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# ---------- Helpers ----------
-@st.cache_resource
-def get_storage():
-    return make_storage_from_env()
-
-@st.cache_resource
-def get_fetcher():
-    # Fetcher will read ENV keys if not provided
-    return Fetcher(binance_api_key=os.getenv("ENV_BINANCE_KEY"), binance_secret=os.getenv("ENV_BINANCE_SECRET"), rate_limit_per_min=int(os.getenv("ENV_RATE_LIMIT","1200")))
-
-def load_config():
-    try:
-        with open(PROJECT_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        st.error(f"No pude leer config.json ({PROJECT_CONFIG_PATH}): {e}")
-        return {}
-
-def save_config(cfg: dict):
-    with open(PROJECT_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-def add_symbol_to_config(symbol: str, kind: str):
-    cfg = load_config()
-    assets = cfg.setdefault("assets", {})
-    key = "cripto" if kind == "crypto" else "acciones"
-    lst = assets.setdefault(key, [])
-    if symbol in lst:
-        return False
-    lst.append(symbol)
-    save_config(cfg)
-    return True
-
-def query_latest_scores(storage: PostgresStorage, limit: Optional[int] = 1000) -> pd.DataFrame:
-    """
-    Select latest score per asset+interval using DISTINCT ON.
-    """
-    q = """
-    SELECT DISTINCT ON (asset, interval) asset, interval, score, range_min, range_max, stop, target, created_at, ts
-    FROM scores
-    ORDER BY asset, interval, created_at DESC
-    LIMIT %s
-    """
-    with storage.get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(q, (limit,))
-            rows = cur.fetchall()
-            cols = ["asset", "interval", "score", "range_min", "range_max", "stop", "target", "created_at", "ts"]
-            df = pd.DataFrame(rows, columns=cols)
-            if not df.empty:
-                df["created_at"] = pd.to_datetime(df["created_at"], unit="ms", utc=True)
-                df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    return df
-
-def query_latest_candle(storage: PostgresStorage, asset: str, interval: str) -> Optional[pd.Series]:
-    df = storage.get_ohlcv(asset, interval, limit=1)
-    if df is None or df.empty:
+class TradingDashboard:
+    def __init__(self):
+        self.db_path = self.get_db_path()
+        self.last_update = None
+        
+    def get_db_path(self):
+        """Obtiene la ruta de la base de datos"""
+        env_db_path = os.getenv("DB_PATH")
+        if env_db_path and Path(env_db_path).exists():
+            return env_db_path
+        
+        default_paths = [
+            "data/db/data.db",
+            "data/db/watchlist.db",
+            "../data/db/data.db"
+        ]
+        
+        for path in default_paths:
+            if Path(path).exists():
+                return path
+        
         return None
-    return df.iloc[-1]
-
-def fetch_and_score(storage: PostgresStorage, fetcher: Fetcher, asset: str, interval: str):
-    """Quick fetch latest and recompute score for asset/interval"""
-    save_cb = storage.make_save_callback()
-    df = fetcher.fetch_ohlcv(asset, interval=interval, since=None, limit=500, save_callback=save_cb, meta={"ui_refresh": True})
-    # compute and save score (last lookback maybe 500)
-    compute_and_save_scores_for_asset(storage, asset, interval, lookback_bars=500)
-    return df
-
-# ---------- Authentication ----------
-def check_password():
-    if not DASHBOARD_PASSWORD:
-        return True  # open but warn
-    pwd = st.session_state.get("pwd", "")
-    if pwd == DASHBOARD_PASSWORD:
-        st.session_state["authed"] = True
-        return True
-    return False
-
-# ---------- UI ----------
-st.title("Proyecto Trading — Dashboard")
-
-if DASHBOARD_PASSWORD:
-    if "pwd" not in st.session_state:
-        st.session_state["pwd"] = ""
-    if "authed" not in st.session_state:
-        st.session_state["authed"] = False
-
-    with st.sidebar:
-        st.header("Acceso")
-        if not st.session_state.get("authed", False):
-            st.text_input("Password", type="password", key="pwd")
-            if st.button("Entrar"):
-                if check_password():
-                    st.rerun()
-                else:
-                    st.error("Password incorrecto")
-        else:
-            st.success("Autenticado")
-
-else:
-    st.sidebar.info("Dashboard sin password (setea DASHBOARD_PASSWORD en entorno para protegerlo)")
-
-storage = get_storage()
-fetcher = get_fetcher()
-
-st.sidebar.header("Acciones rápidas")
-cfg = load_config()
-assets_cfg = cfg.get("assets", {})
-total_assets = len((assets_cfg.get("cripto") or []) + (assets_cfg.get("acciones") or []))
-st.sidebar.markdown(f"**Activos configurados:** {total_assets}")
-
-# Add symbol form
-with st.sidebar.expander("Añadir símbolo"):
-    kind = st.selectbox("Tipo", ("crypto", "action"))
-    symbol_input = st.text_input("Símbolo (ej. BTCUSDT o AAPL)", key="add_symbol")
-    add_backfill = st.checkbox("Hacer backfill al añadir (rango por defecto)", value=False)
-    if st.button("Añadir símbolo"):
-        if not symbol_input:
-            st.sidebar.error("Introduce símbolo válido")
-        else:
-            added = add_symbol_to_config(symbol_input.strip().upper(), kind)
-            if added:
-                st.sidebar.success(f"{symbol_input.upper()} añadido a config ({'crypto' if kind=='crypto' else 'acciones'})")
-                if add_backfill:
-                    st.sidebar.info("Iniciando backfill... (esto puede tardar)")
-                    # trigger backfill via fetcher.backfill_range; conservative default: last 30 days
-                    try:
-                        end_ms = int(time.time() * 1000)
-                        start_ms = end_ms - 30 * 24 * 3600 * 1000
-                        df_back = fetcher.backfill_range(symbol_input.strip().upper(), "5m" if kind == "crypto" else "1h", start_ms, end_ms, save_callback=storage.make_save_callback(), progress=False)
-                        st.sidebar.success(f"Backfill completado: {len(df_back)} velas")
-                    except Exception as e:
-                        st.sidebar.error(f"Backfill fallo: {e}")
-            else:
-                st.sidebar.warning("Símbolo ya presente en config.json")
-
-# Top legend / quick metrics
-st.markdown("---")
-st.header("Resumen")
-col1, col2, col3, col4 = st.columns([2,2,2,4])
-with col1:
-    st.metric("Activos totales", total_assets)
-with col2:
-    df_scores = query_latest_scores(storage, limit=2000)
-    avg_score = float(df_scores["score"].mean()) if not df_scores.empty else 0.0
-    st.metric("Score medio", f"{avg_score:.3f}")
-with col3:
-    last_update = df_scores["created_at"].max() if not df_scores.empty else None
-    st.metric("Última actualización", last_update.strftime("%Y-%m-%d %H:%M:%S") if last_update is not None else "n/a")
-with col4:
-    st.write("**Leyenda / Orden**: Puedes filtrar y ordenar la tabla abajo. Selecciona filas para ver vela y ejecutar acciones (Refresh, Backfill, Train).")
-
-st.markdown("---")
-
-# Filters and controls
-st.sidebar.header("Filtros tabla")
-asset_type = st.sidebar.selectbox("Tipo de activo", ("All", "Crypto", "Actions"))
-search = st.sidebar.text_input("Buscar (asset)", "")
-score_min, score_max = st.sidebar.slider("Rango score", 0.0, 1.0, (0.0, 1.0), step=0.01)
-date_from = st.sidebar.date_input("Desde", value=None)
-date_to = st.sidebar.date_input("Hasta", value=None)
-sort_by = st.sidebar.selectbox("Ordenar por", ("score", "asset", "created_at", "ts"))
-sort_desc = st.sidebar.checkbox("Descendente", value=True)
-
-# Refresh / batch actions
-st.sidebar.header("Acciones")
-if st.sidebar.button("Refresh tabla (releer scores)"):
-    st.rerun()
-
-# Main table
-st.subheader("Listado de activos y scores")
-df = df_scores.copy() if not df_scores.empty else pd.DataFrame(columns=["asset","interval","score","range_min","range_max","stop","target","created_at","ts"])
-
-# Filter by asset type using config
-if asset_type != "All":
-    cfg = load_config()
-    if asset_type == "Crypto":
-        allowed = set([s.upper() for s in (cfg.get("assets",{}).get("cripto") or [])])
-    else:
-        allowed = set([s.upper() for s in (cfg.get("assets",{}).get("acciones") or [])])
-    df = df[df["asset"].str.upper().isin(allowed)]
-
-if search:
-    df = df[df["asset"].str.contains(search.strip(), case=False)]
-
-df = df[(df["score"] >= float(score_min)) & (df["score"] <= float(score_max))]
-
-# date filters if set
-if date_from:
-    df = df[df["created_at"] >= pd.to_datetime(pd.to_datetime(date_from).tz_localize("UTC"))]
-if date_to:
-    df = df[df["created_at"] <= pd.to_datetime(pd.to_datetime(date_to).tz_localize("UTC") + pd.Timedelta(days=1))]
-
-if not df.empty:
-    df_display = df.sort_values(by=sort_by, ascending=not sort_desc)
-else:
-    df_display = df
-
-st.write(f"Mostrando {len(df_display)} filas")
-# selectable table
-selected = st.experimental_data_editor(df_display, num_rows="dynamic", use_container_width=True)
-
-# If a single row is selected (or table clicked), show details
-if selected is not None and len(selected) > 0:
-    # We'll take the first selected row for detailed view
-    sel = selected.iloc[0]
-    sel_asset = sel["asset"]
-    sel_interval = sel["interval"]
-    st.markdown("---")
-    st.subheader(f"Detalle: {sel_asset} — {sel_interval}")
-    colA, colB, colC = st.columns([3,1,1])
-    with colA:
-        st.write(f"Score: **{sel['score']:.3f}**")
-        st.write(f"Range: {sel['range_min']} — {sel['range_max']}")
-        st.write(f"Stop: {sel['stop']} / Target: {sel['target']}")
-        st.write(f"Última vela ts: {sel['ts']} — last update: {sel['created_at']}")
-    with colB:
-        if st.button("Refresh símbolo"):
-            with st.spinner("Actualizando..."):
-                try:
-                    fetch_and_score(storage, fetcher, sel_asset, sel_interval)
-                    st.success("Símbolo actualizado y score recalculado.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error update: {e}")
-    with colC:
-        if st.button("Backfill símbolo (30d)"):
-            with st.spinner("Haciendo backfill 30d..."):
-                try:
-                    end_ms = int(time.time() * 1000)
-                    start_ms = end_ms - 30 * 24 * 3600 * 1000
-                    df_back = fetcher.backfill_range(sel_asset, sel_interval, start_ms, end_ms, save_callback=storage.make_save_callback(), progress=False)
-                    st.success(f"Backfill completado: {len(df_back)} velas")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Backfill error: {e}")
-
-    # Price chart
-    df_candles = storage.get_ohlcv(sel_asset, sel_interval, limit=400)
-    if df_candles is not None and not df_candles.empty:
-        fig = go.Figure(data=[go.Candlestick(x=df_candles["ts"],
-                                             open=df_candles["open"], high=df_candles["high"],
-                                             low=df_candles["low"], close=df_candles["close"], name=sel_asset)])
-        # overlay ema if present in indicators table by trying to get indicators via storage (join omitted for speed)
+    
+    def load_data(self, asset: str, interval: str, lookback_days: int = 30):
+        """Carga datos desde la base de datos"""
+        if not self.db_path:
+            st.error("No se encontró la base de datos")
+            return None, None
+        
         try:
-            # attempt to read indicators from indicators table via SQL
-            with storage.get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT ts, ema9, ema40 FROM indicators WHERE asset=%s AND interval=%s ORDER BY ts ASC", (sel_asset, sel_interval))
-                    rows = cur.fetchall()
-                    if rows:
-                        inds = pd.DataFrame(rows, columns=["ts", "ema9", "ema40"])
-                        inds["ts"] = pd.to_datetime(inds["ts"], unit="ms", utc=True)
-                        fig.add_trace(go.Scatter(x=inds["ts"], y=inds["ema9"], mode="lines", name="EMA9"))
-                        fig.add_trace(go.Scatter(x=inds["ts"], y=inds["ema40"], mode="lines", name="EMA40"))
+            end_dt = datetime.now()
+            start_dt = end_dt - timedelta(days=lookback_days)
+            start_ts = int(start_dt.timestamp() * 1000)
+            end_ts = int(end_dt.timestamp() * 1000)
+            
+            # Conectar a la base de datos
+            conn = sqlite3.connect(self.db_path)
+            
+            # Cargar velas
+            candles_query = """
+            SELECT ts, open, high, low, close, volume 
+            FROM candles 
+            WHERE asset = ? AND interval = ? AND ts BETWEEN ? AND ?
+            ORDER BY ts
+            """
+            df_candles = pd.read_sql_query(candles_query, conn, 
+                                         params=(asset, interval, start_ts, end_ts))
+            
+            if not df_candles.empty:
+                df_candles['ts'] = pd.to_datetime(df_candles['ts'], unit='ms', utc=True)
+                df_candles.set_index('ts', inplace=True)
+            
+            # Cargar scores
+            scores_query = """
+            SELECT ts, score, range_min, range_max, stop, target, p_ml, signal_quality
+            FROM scores 
+            WHERE asset = ? AND interval = ? AND ts BETWEEN ? AND ?
+            ORDER BY ts
+            """
+            df_scores = pd.read_sql_query(scores_query, conn,
+                                        params=(asset, interval, start_ts, end_ts))
+            
+            if not df_scores.empty:
+                df_scores['ts'] = pd.to_datetime(df_scores['ts'], unit='ms', utc=True)
+                df_scores.set_index('ts', inplace=True)
+            
+            conn.close()
+            
+            return df_candles, df_scores
+            
         except Exception as e:
-            logger.debug("No pude leer indicators: %s", e)
-        fig.update_layout(height=400, margin=dict(t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No hay velas para mostrar.")
+            st.error(f"Error cargando datos: {e}")
+            return None, None
+    
+    def create_candlestick_chart(self, df_candles: pd.DataFrame, df_scores: pd.DataFrame = None):
+        """Crea gráfico de velas con señales"""
+        if df_candles is None or df_candles.empty:
+            return None
+        
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=('Precio y Señales', 'Volumen'),
+            row_width=[0.7, 0.3]
+        )
+        
+        # Gráfico de velas
+        fig.add_trace(
+            go.Candlestick(
+                x=df_candles.index,
+                open=df_candles['open'],
+                high=df_candles['high'],
+                low=df_candles['low'],
+                close=df_candles['close'],
+                name='Precio'
+            ),
+            row=1, col=1
+        )
+        
+        # Añadir señales si existen
+        if df_scores is not None and not df_scores.empty:
+            # Merge scores con candles
+            df_merged = df_candles.join(df_scores, how='left')
+            
+            # Señales de compra (score alto)
+            buy_signals = df_merged[df_merged['score'] > 0.7]
+            if not buy_signals.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=buy_signals.index,
+                        y=buy_signals['close'],
+                        mode='markers',
+                        marker=dict(
+                            symbol='triangle-up',
+                            size=12,
+                            color='green',
+                            line=dict(width=2, color='darkgreen')
+                        ),
+                        name='Señal Compra',
+                        hovertemplate='<b>Compra</b><br>Precio: %{y:.2f}<br>Score: %{customdata[0]:.2f}<extra></extra>',
+                        customdata=buy_signals[['score']].values
+                    ),
+                    row=1, col=1
+                )
+            
+            # Stop y target levels
+            if 'stop' in df_merged.columns and 'target' in df_merged.columns:
+                valid_signals = df_merged.dropna(subset=['stop', 'target'])
+                for idx, row in valid_signals.iterrows():
+                    # Línea de stop
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[idx, idx + timedelta(hours=24)],
+                            y=[row['stop'], row['stop']],
+                            mode='lines',
+                            line=dict(color='red', width=2, dash='dash'),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    # Línea de target
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[idx, idx + timedelta(hours=24)],
+                            y=[row['target'], row['target']],
+                            mode='lines',
+                            line=dict(color='green', width=2, dash='dash'),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ),
+                        row=1, col=1
+                    )
+        
+        # Gráfico de volumen
+        fig.add_trace(
+            go.Bar(
+                x=df_candles.index,
+                y=df_candles['volume'],
+                name='Volumen',
+                marker_color='rgba(100, 100, 100, 0.5)'
+            ),
+            row=2, col=1
+        )
+        
+        # Actualizar layout
+        fig.update_layout(
+            height=800,
+            showlegend=True,
+            xaxis_rangeslider_visible=False,
+            template='plotly_white',
+            hovermode='x unified'
+        )
+        
+        fig.update_yaxes(title_text="Precio", row=1, col=1)
+        fig.update_yaxes(title_text="Volumen", row=2, col=1)
+        fig.update_xaxes(title_text="Fecha", row=2, col=1)
+        
+        return fig
+    
+    def create_metrics_panel(self, df_candles: pd.DataFrame, df_scores: pd.DataFrame):
+        """Panel de métricas y KPIs"""
+        if df_candles is None or df_candles.empty:
+            return
+        
+        # Calcular métricas básicas
+        current_price = df_candles['close'].iloc[-1]
+        price_change = current_price - df_candles['close'].iloc[-2] if len(df_candles) > 1 else 0
+        price_change_pct = (price_change / df_candles['close'].iloc[-2] * 100) if len(df_candles) > 1 else 0
+        
+        # Métricas de volatilidad
+        returns = df_candles['close'].pct_change().dropna()
+        volatility = returns.std() * np.sqrt(252) * 100  # Volatilidad anualizada
+        
+        # Métricas de volumen
+        avg_volume = df_candles['volume'].mean()
+        current_volume = df_candles['volume'].iloc[-1]
+        
+        # Métricas de scores si disponibles
+        if df_scores is not None and not df_scores.empty:
+            current_score = df_scores['score'].iloc[-1] if 'score' in df_scores.columns else 0
+            avg_score = df_scores['score'].mean() if 'score' in df_scores.columns else 0
+            signal_quality = df_scores['signal_quality'].iloc[-1] if 'signal_quality' in df_scores.columns else 0
+        else:
+            current_score = avg_score = signal_quality = 0
+        
+        # Mostrar métricas
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(
+                "Precio Actual",
+                f"${current_price:.2f}",
+                f"{price_change_pct:+.2f}%"
+            )
+        
+        with col2:
+            st.metric(
+                "Volatilidad Anual",
+                f"{volatility:.1f}%"
+            )
+        
+        with col3:
+            st.metric(
+                "Score Actual",
+                f"{current_score:.2f}",
+                f"Avg: {avg_score:.2f}"
+            )
+        
+        with col4:
+            st.metric(
+                "Calidad Señal",
+                f"{signal_quality:.2f}"
+            )
+    
+    def create_signal_details(self, df_scores: pd.DataFrame):
+        """Detalles de las señales actuales"""
+        if df_scores is None or df_scores.empty:
+            st.info("No hay señales disponibles")
+            return
+        
+        latest_signal = df_scores.iloc[-1]
+        
+        # Determinar tipo de señal
+        score = latest_signal.get('score', 0)
+        if score >= 0.7:
+            signal_type = "🟢 COMPRA"
+            signal_class = "signal-buy"
+        elif score >= 0.5:
+            signal_type = "🟡 NEUTRAL"
+            signal_class = ""
+        else:
+            signal_type = "🔻 EVITAR"
+            signal_class = "signal-sell"
+        
+        # Mostrar detalles de la señal
+        st.markdown(f"""
+        <div class="metric-card {signal_class}">
+            <h3>Última Señal: {signal_type}</h3>
+            <p><strong>Score:</strong> {score:.2f}</p>
+            <p><strong>Confianza IA:</strong> {latest_signal.get('p_ml', 0):.2f}</p>
+            <p><strong>Stop:</strong> ${latest_signal.get('stop', 0):.2f}</p>
+            <p><strong>Target:</strong> ${latest_signal.get('target', 0):.2f}</p>
+            <p><strong>Calidad:</strong> {latest_signal.get('signal_quality', 0):.2f}</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    def create_performance_chart(self, df_candles: pd.DataFrame, df_scores: pd.DataFrame):
+        """Gráfico de performance y scores"""
+        if df_candles is None or df_candles.empty:
+            return None
+        
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.1,
+            subplot_titles=('Performance', 'Scores'),
+            row_width=[0.6, 0.4]
+        )
+        
+        # Precio normalizado
+        base_price = df_candles['close'].iloc[0]
+        normalized_price = (df_candles['close'] / base_price - 1) * 100
+        
+        fig.add_trace(
+            go.Scatter(
+                x=df_candles.index,
+                y=normalized_price,
+                name='Performance',
+                line=dict(color='blue', width=2)
+            ),
+            row=1, col=1
+        )
+        
+        # Scores si disponibles
+        if df_scores is not None and not df_scores.empty:
+            # Merge para alinear timestamps
+            df_merged = df_candles.join(df_scores[['score']], how='left')
+            df_merged['score'] = df_merged['score'].fillna(0.5)
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df_merged.index,
+                    y=df_merged['score'] * 100,  # Escalar a 0-100
+                    name='Score',
+                    line=dict(color='orange', width=2)
+                ),
+                row=2, col=1
+            )
+        
+        fig.update_layout(
+            height=600,
+            showlegend=True,
+            template='plotly_white'
+        )
+        
+        fig.update_yaxes(title_text="Performance (%)", row=1, col=1)
+        fig.update_yaxes(title_text="Score (%)", row=2, col=1)
+        fig.update_xaxes(title_text="Fecha", row=2, col=1)
+        
+        return fig
+    
+    def run(self):
+        """Ejecutar el dashboard"""
+        dashboard = TradingDashboard()
+        
+        # Cargar datos iniciales
+        df_candles, df_scores = dashboard.load_data(
+            selected_asset, selected_interval, lookback_days
+        )
+        
+        if df_candles is None:
+            st.error("No se pudieron cargar los datos")
+            return
+        
+        # Panel de métricas
+        dashboard.create_metrics_panel(df_candles, df_scores)
+        
+        # Layout principal
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.subheader("📈 Gráfico de Precio y Señales")
+            fig = dashboard.create_candlestick_chart(df_candles, df_scores)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            st.subheader("📊 Detalles de Señal")
+            dashboard.create_signal_details(df_scores)
+            
+            st.subheader("⚡ Acciones Rápidas")
+            if st.button("🔄 Forzar Actualización", type="primary"):
+                st.rerun()
+            
+            if st.button("📊 Ver Métricas Detalladas"):
+                st.session_state.show_metrics = True
+            
+            if st.button("🤖 Entrenar Modelo IA"):
+                # Aquí iría la llamada al entrenamiento de IA
+                st.info("Función de entrenamiento en desarrollo")
+        
+        # Gráfico de performance
+        st.subheader("📊 Performance y Scores")
+        perf_fig = dashboard.create_performance_chart(df_candles, df_scores)
+        if perf_fig:
+            st.plotly_chart(perf_fig, use_container_width=True)
+        
+        # Auto-refresh
+        if auto_refresh:
+            refresh_interval = 300  # 5 minutos
+            if dashboard.last_update is None or time.time() - dashboard.last_update > refresh_interval:
+                time.sleep(2)
+                st.rerun()
 
-# Footer actions: CSV, train model
-st.markdown("---")
-col1, col2, col3 = st.columns([1,1,1])
-with col1:
-    if st.button("Descargar CSV listado"):
-        tmp = df_display.copy()
-        tmp["created_at"] = tmp["created_at"].astype(str)
-        csv = tmp.to_csv(index=False)
-        st.download_button("Descargar CSV", csv, file_name="scores_list.csv", mime="text/csv")
-
-with col2:
-    if st.button("Recalcular scores para todo (puede tardar)"):
-        with st.spinner("Recalculando scores para todos..."):
-            assets_all = (cfg.get("assets",{}).get("cripto",[]) or []) + (cfg.get("assets",{}).get("acciones",[]) or [])
-            for a in assets_all:
-                try:
-                    interval = "5m" if a in (cfg.get("assets",{}).get("cripto",[]) or []) else "1h"
-                    compute_and_save_scores_for_asset(storage, a, interval, lookback_bars=500)
-                except Exception as e:
-                    logger.exception("Score fail for %s: %s", a, e)
-            st.success("Scores recalculados.")
-            st.rerun()
-
-with col3:
-    if st.button("Entrenar IA (últimos assets seleccionados)"):
-        st.warning("Entrenamiento IA lanzado desde UI. Revisa logs. Puede tardar.")
-        # optional: call ai_train.train_model for selected asset(s)
-        try:
-            from core.ai_train import train_model
-            if "sel_asset" in locals():
-                res = train_model(storage, sel_asset, sel_interval, lookback=2000)
-                st.success(f"Modelo entrenado: {res}")
-            else:
-                st.warning("Selecciona un símbolo antes de entrenar.")
-        except Exception as e:
-            st.error(f"Error entrenando IA: {e}")
-
-st.write("Dashboard versión — integrado con storage_postgres, fetcher, score y ai_train")
+# Ejecutar el dashboard
+if __name__ == "__main__":
+    dashboard = TradingDashboard()
+    dashboard.run()
