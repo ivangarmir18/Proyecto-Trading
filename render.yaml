@@ -1,10 +1,13 @@
-pip install --upgrade pip
+
 services:
   - type: web
     name: watchlist-dashboard
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
+    buildCommand: |
+    pip install --upgrade pip
+    pip install --no-cache-dir --default-timeout=100 -r requeriments_prod.txt
+
     startCommand: "streamlit run dashboard/app.py --server.port 10000 --server.address 0.0.0.0"
     envVars:
       - key: DATABASE_URL
