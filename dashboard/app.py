@@ -281,6 +281,9 @@ def main():
 
     # Cargar watchlist (DB > config > env)
     assets, wl_source = load_watchlist(storage)
+    # Iniciar el thread que se actualiza en background (no bloquear la UI)
+    start_background_incremental(storage, assets, interval="1h")
+
     if not assets:
         st.warning("Watchlist deshabilitada (configuración requerida)")
         st.info("""
