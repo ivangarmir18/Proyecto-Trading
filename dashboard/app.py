@@ -46,15 +46,90 @@ Dashboard en tiempo real con señales de trading, análisis técnico y prediccio
 """)
 
 # Sidebar para configuración
+# Sidebar para configuración
 with st.sidebar:
     st.header("⚙️ Configuración")
-    
-    # Selección de asset e intervalo
-    assets = ["BTCUSDT", "ETHUSDT", "AAPL", "TSLA", "MSFT"]
-    intervals = ["5m", "15m", "1h", "4h", "1d"]
-    
-    selected_asset = st.selectbox("Asset", assets, index=0)
-    selected_interval = st.selectbox("Intervalo", intervals, index=2)
+
+    # --- Intentamos usar PostgresStorage si está configurado ---
+    storage = None
+    try:
+        if os.getenv("DATABASE_URL"):
+            from core.storage_postgres import PostgresStorage
+            try:
+                storage = PostgresStorage()
+            except Exception as e:
+                st.warning(f"No se pudo conectar a Postgres: {e}. Intentando SQLite/local.")
+                storage = None
+    except Exception:
+        storage = None
+
+    # --- Cargar assets dinámicamente ---
+    assets = []
+    # 1) desde storage si tiene list_assets
+    try:
+        if storage and hasattr(storage, "list_assets"):
+            assets = storage.list_assets() or []
+            # storage.list_assets puede devolver dicts; acomodamos
+            normalized = []
+            for a in assets:
+                if isinstance(a, dict):
+                    normalized.append((a.get("asset") or a.get("symbol") or "").upper())
+                else:
+                    normalized.append(str(a).upper())
+            assets = [s for s in normalized if s]
+    except Exception:
+        assets = []
+
+    # 2) si no hay assets, intentar leer CSVs (data/config)
+    if not assets:
+        try:
+            cfg_dir = Path(__file__).resolve().parents[1] / "data" / "config"
+            cryptos_csv = cfg_dir / "cryptos.csv"
+            actions_csv = cfg_dir / "actions.csv"
+            if cryptos_csv.exists():
+                dfc = pd.read_csv(cryptos_csv)
+                if "symbol" in dfc.columns:
+                    assets = [str(x).upper() for x in dfc["symbol"].dropna().astype(str).tolist()]
+                else:
+                    assets = [str(x).upper() for x in dfc.iloc[:,0].dropna().astype(str).tolist()]
+            if not assets and actions_csv.exists():
+                dfa = pd.read_csv(actions_csv)
+                if "symbol" in dfa.columns:
+                    assets = [str(x).upper() for x in dfa["symbol"].dropna().astype(str).tolist()]
+                else:
+                    assets = [str(x).upper() for x in dfa.iloc[:,0].dropna().astype(str).tolist()]
+        except Exception:
+            assets = []
+
+    # 3) fallback hardcoded minimal
+    if not assets:
+        assets = ["BTCUSDT", "ETHUSDT", "AAPL"]
+
+    # --- Cargar intervals dinámicamente ---
+    intervals = []
+    try:
+        # prefer storage-provided intervals if available (list_intervals_for_asset)
+        if storage and hasattr(storage, "list_intervals_for_asset"):
+            # use first asset to fetch available intervals (if none, fallback)
+            try:
+                candidate = assets[0] if assets else None
+                if candidate:
+                    intervals = storage.list_intervals_for_asset(candidate) or []
+                    # normalize strings
+                    intervals = [str(i) for i in intervals if i]
+            except Exception:
+                intervals = []
+    except Exception:
+        intervals = []
+
+    # fallback sensible intervals if still empty
+    if not intervals:
+        intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1w"]
+
+    # --- UI selects ---
+    selected_asset = st.selectbox("Asset", assets, index=0 if assets else 0)
+    selected_interval = st.selectbox("Intervalo", intervals, index=min(2, max(0, len(intervals)-1)))
+
     
     # Configuración de visualización
     lookback_days = st.slider("Días a mostrar", 1, 365, 30)
@@ -128,56 +203,51 @@ class TradingDashboard:
         return None
     
     def load_data(self, asset: str, interval: str, lookback_days: int = 30):
-        """Carga datos desde la base de datos"""
-        if not self.db_path:
-            st.error("No se encontró la base de datos")
-            return None, None
-        
+        """Carga datos desde Postgres (si storage) o desde sqlite (db_path)."""
+        from datetime import datetime, timedelta
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=lookback_days)
+        start_ts = int(start_dt.timestamp() * 1000)
+        end_ts = int(end_dt.timestamp() * 1000)
+    
+        # If the module-level storage variable (from sidebar init) is present, prefer it
+        # Note: 'storage' was created in the sidebar scope; ensure it's visible here:
+        global storage  # ensure access to the same storage instance
         try:
-            end_dt = datetime.now()
-            start_dt = end_dt - timedelta(days=lookback_days)
-            start_ts = int(start_dt.timestamp() * 1000)
-            end_ts = int(end_dt.timestamp() * 1000)
-            
-            # Conectar a la base de datos
-            conn = sqlite3.connect(self.db_path)
-            
-            # Cargar velas
-            candles_query = """
-            SELECT ts, open, high, low, close, volume 
-            FROM candles 
-            WHERE asset = ? AND interval = ? AND ts BETWEEN ? AND ?
-            ORDER BY ts
-            """
-            df_candles = pd.read_sql_query(candles_query, conn, 
-                                         params=(asset, interval, start_ts, end_ts))
-            
-            if not df_candles.empty:
-                df_candles['ts'] = pd.to_datetime(df_candles['ts'], unit='ms', utc=True)
-                df_candles.set_index('ts', inplace=True)
-            
-            # Cargar scores
-            scores_query = """
-            SELECT ts, score, range_min, range_max, stop, target, p_ml, signal_quality
-            FROM scores 
-            WHERE asset = ? AND interval = ? AND ts BETWEEN ? AND ?
-            ORDER BY ts
-            """
-            df_scores = pd.read_sql_query(scores_query, conn,
-                                        params=(asset, interval, start_ts, end_ts))
-            
-            if not df_scores.empty:
-                df_scores['ts'] = pd.to_datetime(df_scores['ts'], unit='ms', utc=True)
-                df_scores.set_index('ts', inplace=True)
-            
-            conn.close()
-            
-            return df_candles, df_scores
-            
+            if 'storage' in globals() and globals().get('storage'):
+                st.info("Cargando datos desde Postgres...")
+                try:
+                    df_candles = globals()['storage'].load_candles(asset, interval, start_ts=start_ts, end_ts=end_ts)
+                    df_scores = globals()['storage'].load_scores(asset, interval, start_ts=start_ts, end_ts=end_ts)
+                except Exception as e:
+                    st.error(f"No se pudieron cargar los datos desde Postgres: {e}")
+                    return None, None
+            else:
+                # Fallback SQLite behavior (mantener compatibilidad local)
+                if not self.db_path:
+                    st.error("No se encontró la base de datos")
+                    return None, None
+                import sqlite3, pandas as pd
+                try:
+                    conn = sqlite3.connect(self.db_path)
+                    q = ("SELECT * FROM candles WHERE asset=:asset AND interval=:interval "
+                         "AND ts BETWEEN :start_ts AND :end_ts ORDER BY ts ASC;")
+                    df_candles = pd.read_sql_query(q, conn, params={"asset": asset, "interval": interval,
+                                                                   "start_ts": start_ts, "end_ts": end_ts})
+                    q2 = ("SELECT * FROM scores WHERE asset=:asset AND interval=:interval "
+                          "AND ts BETWEEN :start_ts AND :end_ts ORDER BY ts ASC;")
+                    df_scores = pd.read_sql_query(q2, conn, params={"asset": asset, "interval": interval,
+                                                                   "start_ts": start_ts, "end_ts": end_ts})
+                    conn.close()
+                except Exception as e:
+                    st.error(f"No se pudieron cargar los datos: {e}")
+                    return None, None
         except Exception as e:
-            st.error(f"Error cargando datos: {e}")
+            st.error(f"Error inesperado cargando datos: {e}")
             return None, None
     
+        return df_candles, df_scores
+
     def create_candlestick_chart(self, df_candles: pd.DataFrame, df_scores: pd.DataFrame = None):
         """Crea gráfico de velas con señales"""
         if df_candles is None or df_candles.empty:
