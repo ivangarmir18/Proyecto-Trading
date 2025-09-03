@@ -74,6 +74,91 @@ def require_postgres_storage() -> PostgresStorage:
         logger.exception("No se pudo conectar a Postgres: %s", e)
         raise RuntimeError(f"No se pudo conectar a Postgres: {e}")
 
+# ---- START: background incremental updater (paste after storage init) ----
+import threading
+import time
+import pandas as pd
+import logging
+import sqlalchemy as sa
+
+logger = logging.getLogger(__name__)
+
+# PARAMETERS - ajustalos según tolerancia
+MAX_HOURS_PER_ASSET_PER_RUN = 24    # máximo que traerá por asset en cada pasada
+RUN_INTERVAL_SECONDS = 60 * 30     # cada cuánto corre la pasada completa (30 min)
+SLEEP_BETWEEN_ASSETS = 1.0          # segundos entre assets para suavizar peticiones
+EMPTY_CHUNK_BREAK = 3              # si 3 chunks vacíos seguidos, asumimos no hay más histórico
+
+def get_last_ts_for(asset: str, interval: str, engine) -> int | None:
+    q = "SELECT MAX(ts) AS last_ts FROM candles WHERE asset = :asset AND interval = :interval"
+    try:
+        with engine.connect() as conn:
+            r = conn.execute(sa.text(q), {"asset": asset, "interval": interval}).fetchone()
+        return int(r["last_ts"]) if r and r["last_ts"] is not None else None
+    except Exception as e:
+        logger.exception("get_last_ts_for error: %s", e)
+        return None
+
+def background_incremental_loop(storage, assets, interval="1h"):
+    """
+    Loop que corre indefinidamente cada RUN_INTERVAL_SECONDS y pide solo los datos faltantes,
+    limitado a MAX_HOURS_PER_ASSET_PER_RUN por asset para cada pasada.
+    """
+    engine = getattr(storage, "engine", None)
+    if engine is None:
+        logger.error("Storage no expone engine. Cancelando background_incremental_loop")
+        return
+    fetcher = None
+    while True:
+        try:
+            if not assets:
+                logger.info("No assets en watchlist, saltando esta pasada")
+                time.sleep(RUN_INTERVAL_SECONDS)
+                continue
+
+            # Instanciar fetcher cada pasada para evitar recursos colgados
+            fetcher = Fetcher(storage=storage)
+
+            now = pd.Timestamp.utcnow().tz_convert("UTC")
+            for asset in assets:
+                try:
+                    last_ts = get_last_ts_for(asset, interval, engine)
+                    if last_ts:
+                        since = pd.to_datetime(last_ts, unit='s', utc=True) + pd.Timedelta(seconds=1)
+                    else:
+                        # si no hay datos, traemos solo MAX_HOURS_PER_ASSET_PER_RUN retroactivo
+                        since = now - pd.Timedelta(hours=MAX_HOURS_PER_ASSET_PER_RUN)
+
+                    # no pedir más de MAX_HOURS_PER_ASSET_PER_RUN
+                    earliest = now - pd.Timedelta(hours=MAX_HOURS_PER_ASSET_PER_RUN)
+                    if since < earliest:
+                        since = earliest
+
+                    logger.info("Background update: asset=%s interval=%s since=%s", asset, interval, since)
+
+                    # Ejecutar backfill_range; tu fetcher debe manejar chunks vacíos y save_callback
+                    fetcher.backfill_range(asset=asset, interval=interval, since=since, progress=False)
+
+                except Exception:
+                    logger.exception("Error en background update para %s", asset)
+
+                time.sleep(SLEEP_BETWEEN_ASSETS)
+
+        except Exception:
+            logger.exception("Excepción inesperada en background incremental loop")
+        # Esperar antes de la siguiente pasada completa
+        time.sleep(RUN_INTERVAL_SECONDS)
+
+def start_background_incremental(storage, assets, interval="1h"):
+    t = threading.Thread(target=background_incremental_loop, args=(storage, assets, interval), daemon=True)
+    t.start()
+    logger.info("Background incremental thread started (daemon)")
+
+# Example of starting it (put after you resolved 'assets' from watchlist)
+# start_background_incremental(storage, assets, interval="1h")
+
+# ---- END: background incremental updater ----
+
 # -----------------------------
 # Watchlist: DB -> config.yml -> ENV
 # -----------------------------
