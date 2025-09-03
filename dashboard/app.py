@@ -10,7 +10,18 @@ Características:
 - Mostrar últimos candles de un asset (si storage ofrece load_candles)
 - No usa SQLite en ningún caso
 """
+# --- BEGIN: ensure project root is in sys.path so `import core...` works ---
+import os
+import sys
 
+# Path to this file's directory
+HERE = os.path.dirname(os.path.abspath(__file__))
+# Assume project root is parent dir of dashboard/
+PROJECT_ROOT = os.path.abspath(os.path.join(HERE, ".."))
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+# --- END: PYTHONPATH fix ---
 import os
 import logging
 import threading

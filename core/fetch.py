@@ -526,11 +526,12 @@ class Fetcher:
                 df_block = self.fetch_ohlcv(asset, interval=interval, since=current_since,
                                           limit=per_call_limit, save_callback=save_callback,
                                           meta={"chunk_index": i, "total_chunks": calls})
-                
                 if df_block is None or df_block.empty:
-                    logger.debug("Bloque %d vacío, terminando", i)
-                    break
-                    
+                    logger.info(f"backfill_range: skipping empty block for {asset} {interval} (chunk {i})")
+                    # avanzar el since según tu lógica de chunk (si ya lo haces en el loop no hace falta)
+                    continue
+
+
                 results.append(df_block)
                 
                 # Avanzar al siguiente timestamp
@@ -557,6 +558,10 @@ class Fetcher:
             return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
             
         df_all = pd.concat(results, ignore_index=True)
+        if df_all is None or df_all.empty:
+            logger.warning(f"backfill_range: no data collected for {asset} {interval} in all chunks, skipping further processing")
+            return pd.DataFrame()
+
         df_all = df_all.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
         
         # Filtrar por rango exacto
