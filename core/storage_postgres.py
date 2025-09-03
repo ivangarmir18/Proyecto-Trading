@@ -32,6 +32,7 @@ class PostgresStorage:
         self._maxconn = maxconn
         # Prefer DATABASE_URL if present (works with Supabase)
         database_url = os.getenv("DATABASE_URL")
+        print("🔍 DEBUG: DATABASE_URL =", repr(database_url))
         if database_url:
             # Use DSN string
             try:
