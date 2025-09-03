@@ -130,6 +130,27 @@ def main():
             storage.close()
     except Exception:
         pass
+    
+import sqlalchemy as sa
+import pandas as pd
+from core.fetch import Fetcher
+from core.storage_postgres import PostgresStorage
+
+def get_last_ts_for(asset, interval, engine):
+    q = "SELECT MAX(ts) as last_ts FROM candles WHERE asset = %s AND interval = %s"
+    with engine.connect() as conn:
+        res = conn.execute(sa.text(q), (asset, interval)).fetchone()
+        return int(res[0]) if res and res[0] is not None else None
+
+def incremental_backfill_for(asset, interval):
+    storage = PostgresStorage()   # usa DATABASE_URL desde env
+    engine = storage.engine      # si tu clase expone engine; si no, crea engine con DATABASE_URL
+    last_ts = get_last_ts_for(asset, interval, engine)
+    # si last_ts es None -> backfill desde inicio (o desde config)
+    since = pd.to_datetime(last_ts, unit='s', utc=True) if last_ts else None
+    fetcher = Fetcher(storage=storage)
+    fetcher.backfill_range(asset=asset, interval=interval, since=since, progress=True)
+
 
 
 if __name__ == "__main__":

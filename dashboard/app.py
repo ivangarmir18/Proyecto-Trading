@@ -1,557 +1,284 @@
 """
-dashboard/app.py - Dashboard Streamlit completo con visualizaciones interactivas
+dashboard/app.py
+Dashboard Postgres-first para Portfa
+
 Características:
-- Visualización en tiempo real de velas y scores
-- Señales de trading con stop/target
-- Métricas de performance
-- Configuración interactiva
-- Actualización automática
+- Forzar conexión a Postgres (si no hay DATABASE_URL o falla la conexión -> error claro)
+- Diagnóstico en sidebar (host/port/db sin exponer contraseña)
+- Watchlist: carga desde tabla `watchlist` en Postgres, o desde config.yml, o desde env WATCHLIST
+- Botón para lanzar backfill incremental en background (por asset o global)
+- Mostrar últimos candles de un asset (si storage ofrece load_candles)
+- No usa SQLite en ningún caso
 """
+
+import os
+import logging
+import threading
+import time
+from typing import Tuple, List
+from urllib.parse import urlparse
 
 import streamlit as st
 import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import time
-from datetime import datetime, timedelta
-import json
-from pathlib import Path
-import sqlite3
-import os
+import sqlalchemy as sa
+import yaml
 
-# Configuración de la página
-st.set_page_config(
-    page_title="Trading Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Ajusta según tu estructura de proyecto
+from core.storage_postgres import PostgresStorage
+from core.fetch import Fetcher
 
-# Título y descripción
-st.title("📊 Sistema de Trading Inteligente")
+logger = logging.getLogger(__name__)
 
-# integración no destructiva del widget de watchlist
-try:
-    from core.storage_postgres import PostgresStorage
-    storage = PostgresStorage()  # usa DATABASE_URL si está definido
-    from dashboard.watchlist_ui import render_watchlist_ui
-    render_watchlist_ui(storage)
-except Exception as _e:
-    # Si por alguna razón no conecta, seguimos sin romper el dashboard principal.
-    st.sidebar.info("Watchlist deshabilitada (configuración requerida).")
-
-st.markdown("""
-Dashboard en tiempo real con señales de trading, análisis técnico y predicciones de IA.
-""")
-
-# Sidebar para configuración
-# Sidebar para configuración
-with st.sidebar:
-    st.header("⚙️ Configuración")
-
-    # --- Intentamos usar PostgresStorage si está configurado ---
-    storage = None
+# -----------------------------
+# Utilidades DB / diagnostico
+# -----------------------------
+def parse_db_url_short(db_url: str):
+    """Parsea la URL para mostrar host/port/db/user sin exponer contraseña"""
     try:
-        if os.getenv("DATABASE_URL"):
-            from core.storage_postgres import PostgresStorage
-            try:
-                storage = PostgresStorage()
-            except Exception as e:
-                st.warning(f"No se pudo conectar a Postgres: {e}. Intentando SQLite/local.")
-                storage = None
+        p = urlparse(db_url)
+        return {
+            "host": p.hostname,
+            "port": p.port,
+            "db": p.path.lstrip("/") if p.path else "",
+            "user": p.username,
+        }
     except Exception:
-        storage = None
-
-    # --- Cargar assets dinámicamente ---
-    assets = []
-    # 1) desde storage si tiene list_assets
-    try:
-        if storage and hasattr(storage, "list_assets"):
-            assets = storage.list_assets() or []
-            # storage.list_assets puede devolver dicts; acomodamos
-            normalized = []
-            for a in assets:
-                if isinstance(a, dict):
-                    normalized.append((a.get("asset") or a.get("symbol") or "").upper())
-                else:
-                    normalized.append(str(a).upper())
-            assets = [s for s in normalized if s]
-    except Exception:
-        assets = []
-
-    # 2) si no hay assets, intentar leer CSVs (data/config)
-    if not assets:
-        try:
-            cfg_dir = Path(__file__).resolve().parents[1] / "data" / "config"
-            cryptos_csv = cfg_dir / "cryptos.csv"
-            actions_csv = cfg_dir / "actions.csv"
-            if cryptos_csv.exists():
-                dfc = pd.read_csv(cryptos_csv)
-                if "symbol" in dfc.columns:
-                    assets = [str(x).upper() for x in dfc["symbol"].dropna().astype(str).tolist()]
-                else:
-                    assets = [str(x).upper() for x in dfc.iloc[:,0].dropna().astype(str).tolist()]
-            if not assets and actions_csv.exists():
-                dfa = pd.read_csv(actions_csv)
-                if "symbol" in dfa.columns:
-                    assets = [str(x).upper() for x in dfa["symbol"].dropna().astype(str).tolist()]
-                else:
-                    assets = [str(x).upper() for x in dfa.iloc[:,0].dropna().astype(str).tolist()]
-        except Exception:
-            assets = []
-
-    # 3) fallback hardcoded minimal
-    if not assets:
-        assets = ["BTCUSDT", "ETHUSDT", "AAPL"]
-
-    # --- Cargar intervals dinámicamente ---
-    intervals = []
-    try:
-        # prefer storage-provided intervals if available (list_intervals_for_asset)
-        if storage and hasattr(storage, "list_intervals_for_asset"):
-            # use first asset to fetch available intervals (if none, fallback)
-            try:
-                candidate = assets[0] if assets else None
-                if candidate:
-                    intervals = storage.list_intervals_for_asset(candidate) or []
-                    # normalize strings
-                    intervals = [str(i) for i in intervals if i]
-            except Exception:
-                intervals = []
-    except Exception:
-        intervals = []
-
-    # fallback sensible intervals if still empty
-    if not intervals:
-        intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1w"]
-
-    # --- UI selects ---
-    selected_asset = st.selectbox("Asset", assets, index=0 if assets else 0)
-    selected_interval = st.selectbox("Intervalo", intervals, index=min(2, max(0, len(intervals)-1)))
-
-    
-    # Configuración de visualización
-    lookback_days = st.slider("Días a mostrar", 1, 365, 30)
-    show_signals = st.checkbox("Mostrar señales", value=True)
-    show_indicators = st.checkbox("Mostrar indicadores", value=True)
-    
-    # Configuración de IA
-    ai_enabled = st.checkbox("Habilitar IA", value=True)
-    confidence_threshold = st.slider("Umbral de confianza", 0.0, 1.0, 0.6)
-    
-    # Botones de control
-    col1, col2 = st.columns(2)
-    with col1:
-        refresh_btn = st.button("🔄 Actualizar")
-    with col2:
-        auto_refresh = st.checkbox("Auto-actualizar", value=True)
-
-# Estilos CSS personalizados
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1f77b4;
-        margin-bottom: 1rem;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #1f77b4;
-        margin-bottom: 1rem;
-    }
-    .signal-buy {
-        background-color: #d4edda !important;
-        border-left: 4px solid #28a745 !important;
-    }
-    .signal-sell {
-        background-color: #f8d7da !important;
-        border-left: 4px solid #dc3545 !important;
-    }
-    .plot-container {
-        background-color: white;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-</style>
-""", unsafe_allow_html=True)
-
-class TradingDashboard:
-    def __init__(self):
-        self.db_path = self.get_db_path()
-        self.last_update = None
-        
-    def get_db_path(self):
-        """Obtiene la ruta de la base de datos"""
-        env_db_path = os.getenv("DB_PATH")
-        if env_db_path and Path(env_db_path).exists():
-            return env_db_path
-        
-        default_paths = [
-            "data/db/data.db",
-            "data/db/watchlist.db",
-            "../data/db/data.db"
-        ]
-        
-        for path in default_paths:
-            if Path(path).exists():
-                return path
-        
         return None
-    
-    def load_data(self, asset: str, interval: str, lookback_days: int = 30):
-        """Carga datos desde Postgres (si storage) o desde sqlite (db_path)."""
-        from datetime import datetime, timedelta
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=lookback_days)
-        start_ts = int(start_dt.timestamp() * 1000)
-        end_ts = int(end_dt.timestamp() * 1000)
-    
-        # If the module-level storage variable (from sidebar init) is present, prefer it
-        # Note: 'storage' was created in the sidebar scope; ensure it's visible here:
-        global storage  # ensure access to the same storage instance
+
+def require_postgres_storage() -> PostgresStorage:
+    """
+    Intenta instanciar PostgresStorage y hace un chequeo rápido (SELECT 1).
+    Si falla, lanza RuntimeError — la app no continuará sin Postgres.
+    """
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL no definida. La aplicación requiere Postgres (no se permite SQLite).")
+
+    parsed = parse_db_url_short(db_url)
+    if parsed:
+        st.sidebar.info(f"DB: host={parsed['host']} port={parsed['port']} db={parsed['db']}")
+    else:
+        st.sidebar.warning("DATABASE_URL definida pero no se pudo parsear para mostrar diagnóstico")
+
+    try:
+        storage = PostgresStorage()
+        engine = getattr(storage, "engine", None)
+        if engine is None:
+            raise RuntimeError("PostgresStorage no expone 'engine'")
+        # chequeo rápido de aliveness
+        with engine.connect() as conn:
+            conn.execute(sa.text("SELECT 1"))
+        st.sidebar.success("Conectado a Postgres")
+        return storage
+    except Exception as e:
+        logger.exception("No se pudo conectar a Postgres: %s", e)
+        raise RuntimeError(f"No se pudo conectar a Postgres: {e}")
+
+# -----------------------------
+# Watchlist: DB -> config.yml -> ENV
+# -----------------------------
+def load_watchlist(storage: PostgresStorage | None, config_path: str = "config.yml") -> Tuple[List[str], str | None]:
+    """
+    Intenta cargar la watchlist en este orden:
+     1) DB: tabla `watchlist` (campo asset)
+     2) config.yml clave `watchlist`
+     3) ENV WATCHLIST (comma-separated)
+    Devuelve: (assets_list, source) donde source es 'db'|'config'|'env'|'manual' o None
+    """
+    # 1) DB
+    if storage is not None:
         try:
-            if 'storage' in globals() and globals().get('storage'):
-                st.info("Cargando datos desde Postgres...")
-                try:
-                    df_candles = globals()['storage'].load_candles(asset, interval, start_ts=start_ts, end_ts=end_ts)
-                    df_scores = globals()['storage'].load_scores(asset, interval, start_ts=start_ts, end_ts=end_ts)
-                except Exception as e:
-                    st.error(f"No se pudieron cargar los datos desde Postgres: {e}")
-                    return None, None
-            else:
-                # Fallback SQLite behavior (mantener compatibilidad local)
-                if not self.db_path:
-                    st.error("No se encontró la base de datos")
-                    return None, None
-                import sqlite3, pandas as pd
-                try:
-                    conn = sqlite3.connect(self.db_path)
-                    q = ("SELECT * FROM candles WHERE asset=:asset AND interval=:interval "
-                         "AND ts BETWEEN :start_ts AND :end_ts ORDER BY ts ASC;")
-                    df_candles = pd.read_sql_query(q, conn, params={"asset": asset, "interval": interval,
-                                                                   "start_ts": start_ts, "end_ts": end_ts})
-                    q2 = ("SELECT * FROM scores WHERE asset=:asset AND interval=:interval "
-                          "AND ts BETWEEN :start_ts AND :end_ts ORDER BY ts ASC;")
-                    df_scores = pd.read_sql_query(q2, conn, params={"asset": asset, "interval": interval,
-                                                                   "start_ts": start_ts, "end_ts": end_ts})
-                    conn.close()
-                except Exception as e:
-                    st.error(f"No se pudieron cargar los datos: {e}")
-                    return None, None
+            engine = getattr(storage, "engine", None)
+            if engine is not None:
+                q = "SELECT asset FROM watchlist ORDER BY id"
+                with engine.connect() as conn:
+                    rows = conn.execute(sa.text(q)).fetchall()
+                if rows:
+                    assets = [r["asset"] if "asset" in r.keys() else r[0] for r in rows]
+                    return assets, "db"
         except Exception as e:
-            st.error(f"Error inesperado cargando datos: {e}")
-            return None, None
-    
-        return df_candles, df_scores
+            logger.debug("No se pudo leer watchlist desde DB (seguir intentando): %s", e)
 
-    def create_candlestick_chart(self, df_candles: pd.DataFrame, df_scores: pd.DataFrame = None):
-        """Crea gráfico de velas con señales"""
-        if df_candles is None or df_candles.empty:
-            return None
-        
-        fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            subplot_titles=('Precio y Señales', 'Volumen'),
-            row_width=[0.7, 0.3]
-        )
-        
-        # Gráfico de velas
-        fig.add_trace(
-            go.Candlestick(
-                x=df_candles.index,
-                open=df_candles['open'],
-                high=df_candles['high'],
-                low=df_candles['low'],
-                close=df_candles['close'],
-                name='Precio'
-            ),
-            row=1, col=1
-        )
-        
-        # Añadir señales si existen
-        if df_scores is not None and not df_scores.empty:
-            # Merge scores con candles
-            df_merged = df_candles.join(df_scores, how='left')
-            
-            # Señales de compra (score alto)
-            buy_signals = df_merged[df_merged['score'] > 0.7]
-            if not buy_signals.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=buy_signals.index,
-                        y=buy_signals['close'],
-                        mode='markers',
-                        marker=dict(
-                            symbol='triangle-up',
-                            size=12,
-                            color='green',
-                            line=dict(width=2, color='darkgreen')
-                        ),
-                        name='Señal Compra',
-                        hovertemplate='<b>Compra</b><br>Precio: %{y:.2f}<br>Score: %{customdata[0]:.2f}<extra></extra>',
-                        customdata=buy_signals[['score']].values
-                    ),
-                    row=1, col=1
-                )
-            
-            # Stop y target levels
-            if 'stop' in df_merged.columns and 'target' in df_merged.columns:
-                valid_signals = df_merged.dropna(subset=['stop', 'target'])
-                for idx, row in valid_signals.iterrows():
-                    # Línea de stop
-                    fig.add_trace(
-                        go.Scatter(
-                            x=[idx, idx + timedelta(hours=24)],
-                            y=[row['stop'], row['stop']],
-                            mode='lines',
-                            line=dict(color='red', width=2, dash='dash'),
-                            showlegend=False,
-                            hoverinfo='skip'
-                        ),
-                        row=1, col=1
-                    )
-                    
-                    # Línea de target
-                    fig.add_trace(
-                        go.Scatter(
-                            x=[idx, idx + timedelta(hours=24)],
-                            y=[row['target'], row['target']],
-                            mode='lines',
-                            line=dict(color='green', width=2, dash='dash'),
-                            showlegend=False,
-                            hoverinfo='skip'
-                        ),
-                        row=1, col=1
-                    )
-        
-        # Gráfico de volumen
-        fig.add_trace(
-            go.Bar(
-                x=df_candles.index,
-                y=df_candles['volume'],
-                name='Volumen',
-                marker_color='rgba(100, 100, 100, 0.5)'
-            ),
-            row=2, col=1
-        )
-        
-        # Actualizar layout
-        fig.update_layout(
-            height=800,
-            showlegend=True,
-            xaxis_rangeslider_visible=False,
-            template='plotly_white',
-            hovermode='x unified'
-        )
-        
-        fig.update_yaxes(title_text="Precio", row=1, col=1)
-        fig.update_yaxes(title_text="Volumen", row=2, col=1)
-        fig.update_xaxes(title_text="Fecha", row=2, col=1)
-        
-        return fig
-    
-    def create_metrics_panel(self, df_candles: pd.DataFrame, df_scores: pd.DataFrame):
-        """Panel de métricas y KPIs"""
-        if df_candles is None or df_candles.empty:
-            return
-        
-        # Calcular métricas básicas
-        current_price = df_candles['close'].iloc[-1]
-        price_change = current_price - df_candles['close'].iloc[-2] if len(df_candles) > 1 else 0
-        price_change_pct = (price_change / df_candles['close'].iloc[-2] * 100) if len(df_candles) > 1 else 0
-        
-        # Métricas de volatilidad
-        returns = df_candles['close'].pct_change().dropna()
-        volatility = returns.std() * np.sqrt(252) * 100  # Volatilidad anualizada
-        
-        # Métricas de volumen
-        avg_volume = df_candles['volume'].mean()
-        current_volume = df_candles['volume'].iloc[-1]
-        
-        # Métricas de scores si disponibles
-        if df_scores is not None and not df_scores.empty:
-            current_score = df_scores['score'].iloc[-1] if 'score' in df_scores.columns else 0
-            avg_score = df_scores['score'].mean() if 'score' in df_scores.columns else 0
-            signal_quality = df_scores['signal_quality'].iloc[-1] if 'signal_quality' in df_scores.columns else 0
-        else:
-            current_score = avg_score = signal_quality = 0
-        
-        # Mostrar métricas
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric(
-                "Precio Actual",
-                f"${current_price:.2f}",
-                f"{price_change_pct:+.2f}%"
-            )
-        
-        with col2:
-            st.metric(
-                "Volatilidad Anual",
-                f"{volatility:.1f}%"
-            )
-        
-        with col3:
-            st.metric(
-                "Score Actual",
-                f"{current_score:.2f}",
-                f"Avg: {avg_score:.2f}"
-            )
-        
-        with col4:
-            st.metric(
-                "Calidad Señal",
-                f"{signal_quality:.2f}"
-            )
-    
-    def create_signal_details(self, df_scores: pd.DataFrame):
-        """Detalles de las señales actuales"""
-        if df_scores is None or df_scores.empty:
-            st.info("No hay señales disponibles")
-            return
-        
-        latest_signal = df_scores.iloc[-1]
-        
-        # Determinar tipo de señal
-        score = latest_signal.get('score', 0)
-        if score >= 0.7:
-            signal_type = "🟢 COMPRA"
-            signal_class = "signal-buy"
-        elif score >= 0.5:
-            signal_type = "🟡 NEUTRAL"
-            signal_class = ""
-        else:
-            signal_type = "🔻 EVITAR"
-            signal_class = "signal-sell"
-        
-        # Mostrar detalles de la señal
-        st.markdown(f"""
-        <div class="metric-card {signal_class}">
-            <h3>Última Señal: {signal_type}</h3>
-            <p><strong>Score:</strong> {score:.2f}</p>
-            <p><strong>Confianza IA:</strong> {latest_signal.get('p_ml', 0):.2f}</p>
-            <p><strong>Stop:</strong> ${latest_signal.get('stop', 0):.2f}</p>
-            <p><strong>Target:</strong> ${latest_signal.get('target', 0):.2f}</p>
-            <p><strong>Calidad:</strong> {latest_signal.get('signal_quality', 0):.2f}</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    def create_performance_chart(self, df_candles: pd.DataFrame, df_scores: pd.DataFrame):
-        """Gráfico de performance y scores"""
-        if df_candles is None or df_candles.empty:
-            return None
-        
-        fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.1,
-            subplot_titles=('Performance', 'Scores'),
-            row_width=[0.6, 0.4]
-        )
-        
-        # Precio normalizado
-        base_price = df_candles['close'].iloc[0]
-        normalized_price = (df_candles['close'] / base_price - 1) * 100
-        
-        fig.add_trace(
-            go.Scatter(
-                x=df_candles.index,
-                y=normalized_price,
-                name='Performance',
-                line=dict(color='blue', width=2)
-            ),
-            row=1, col=1
-        )
-        
-        # Scores si disponibles
-        if df_scores is not None and not df_scores.empty:
-            # Merge para alinear timestamps
-            df_merged = df_candles.join(df_scores[['score']], how='left')
-            df_merged['score'] = df_merged['score'].fillna(0.5)
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=df_merged.index,
-                    y=df_merged['score'] * 100,  # Escalar a 0-100
-                    name='Score',
-                    line=dict(color='orange', width=2)
-                ),
-                row=2, col=1
-            )
-        
-        fig.update_layout(
-            height=600,
-            showlegend=True,
-            template='plotly_white'
-        )
-        
-        fig.update_yaxes(title_text="Performance (%)", row=1, col=1)
-        fig.update_yaxes(title_text="Score (%)", row=2, col=1)
-        fig.update_xaxes(title_text="Fecha", row=2, col=1)
-        
-        return fig
-    
-    def run(self):
-        """Ejecutar el dashboard"""
-        dashboard = TradingDashboard()
-        
-        # Cargar datos iniciales
-        df_candles, df_scores = dashboard.load_data(
-            selected_asset, selected_interval, lookback_days
-        )
-        
-        if df_candles is None:
-            st.error("No se pudieron cargar los datos")
-            return
-        
-        # Panel de métricas
-        dashboard.create_metrics_panel(df_candles, df_scores)
-        
-        # Layout principal
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.subheader("📈 Gráfico de Precio y Señales")
-            fig = dashboard.create_candlestick_chart(df_candles, df_scores)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            st.subheader("📊 Detalles de Señal")
-            dashboard.create_signal_details(df_scores)
-            
-            st.subheader("⚡ Acciones Rápidas")
-            if st.button("🔄 Forzar Actualización", type="primary"):
-                st.rerun()
-            
-            if st.button("📊 Ver Métricas Detalladas"):
-                st.session_state.show_metrics = True
-            
-            if st.button("🤖 Entrenar Modelo IA"):
-                # Aquí iría la llamada al entrenamiento de IA
-                st.info("Función de entrenamiento en desarrollo")
-        
-        # Gráfico de performance
-        st.subheader("📊 Performance y Scores")
-        perf_fig = dashboard.create_performance_chart(df_candles, df_scores)
-        if perf_fig:
-            st.plotly_chart(perf_fig, use_container_width=True)
-        
-        # Auto-refresh
-        if auto_refresh:
-            refresh_interval = 300  # 5 minutos
-            if dashboard.last_update is None or time.time() - dashboard.last_update > refresh_interval:
-                time.sleep(2)
-                st.rerun()
+    # 2) config.yml
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            wl = cfg.get("watchlist")
+            if isinstance(wl, str):
+                assets = [x.strip() for x in wl.split(",") if x.strip()]
+            elif isinstance(wl, list):
+                assets = wl
+            else:
+                assets = []
+            if assets:
+                return assets, "config"
+        except Exception as e:
+            logger.debug("Error leyendo config.yml: %s", e)
 
-# Ejecutar el dashboard
+    # 3) ENV
+    env_wl = os.getenv("WATCHLIST")
+    if env_wl:
+        assets = [x.strip() for x in env_wl.split(",") if x.strip()]
+        if assets:
+            return assets, "env"
+
+    return [], None
+
+# -----------------------------
+# Backfill incremental en background
+# -----------------------------
+def run_incremental_backfill_assets(storage: PostgresStorage, assets: List[str],
+                                   interval: str = "1h", max_hours: int = 24, sleep_between: float = 1.0):
+    """
+    Lanza un job en background que para cada asset consulta MAX(ts) y pide solo lo que falta
+    (hasta max_hours de ventana).
+    """
+    def _job():
+        logger.info("Iniciando backfill incremental background para %s", assets)
+        fetcher = Fetcher(storage=storage)
+        engine = getattr(storage, "engine", None)
+        now = pd.Timestamp.utcnow().tz_convert("UTC")
+        for asset in assets:
+            try:
+                q = "SELECT MAX(ts) AS last_ts FROM candles WHERE asset = :asset AND interval = :interval"
+                with engine.connect() as conn:
+                    r = conn.execute(sa.text(q), {"asset": asset, "interval": interval}).fetchone()
+                last_ts = int(r["last_ts"]) if r and r["last_ts"] is not None else None
+                if last_ts:
+                    since = pd.to_datetime(last_ts, unit="s", utc=True) + pd.Timedelta(seconds=1)
+                else:
+                    since = now - pd.Timedelta(hours=max_hours)
+                earliest = now - pd.Timedelta(hours=max_hours)
+                if since < earliest:
+                    since = earliest
+                logger.info("Backfilling %s desde %s (cap %sh)", asset, since, max_hours)
+                fetcher.backfill_range(asset=asset, interval=interval, since=since, progress=False)
+            except Exception:
+                logger.exception("Error backfilling %s", asset)
+            time.sleep(sleep_between)
+        logger.info("Backfill incremental acabado")
+    threading.Thread(target=_job, daemon=True).start()
+
+# -----------------------------
+# Helpers UI / DB info
+# -----------------------------
+def get_asset_last_ts(storage: PostgresStorage, asset: str, interval: str = "1h"):
+    engine = getattr(storage, "engine", None)
+    if engine is None:
+        return None
+    try:
+        q = "SELECT MAX(ts) as last_ts FROM candles WHERE asset = :asset AND interval = :interval"
+        with engine.connect() as conn:
+            r = conn.execute(sa.text(q), {"asset": asset, "interval": interval}).fetchone()
+        return int(r["last_ts"]) if r and r["last_ts"] is not None else None
+    except Exception:
+        return None
+
+# -----------------------------
+# Main UI
+# -----------------------------
+def main():
+    st.set_page_config(page_title="Portfa — Dashboard", layout="wide")
+    st.title("Portfa — Dashboard")
+
+    # Sidebar - estado
+    st.sidebar.markdown("## Estado y acciones")
+    # Forzar Postgres: si no conecta, mostramos error y no continuamos
+    try:
+        storage = require_postgres_storage()
+    except Exception as e:
+        st.sidebar.error(f"Fallo inicializando Postgres: {e}")
+        st.error("La aplicación requiere PostgreSQL para funcionar. Define DATABASE_URL correctamente y recarga.")
+        # mostrar hint para el usuario (no exponer contraseña)
+        st.info("Formato esperado: postgres://<user>:<pass>@<host>:<port>/<db>?sslmode=require")
+        return
+
+    # Cargar watchlist (DB > config > env)
+    assets, wl_source = load_watchlist(storage)
+    if not assets:
+        st.warning("Watchlist deshabilitada (configuración requerida)")
+        st.info("""
+        Activa la watchlist con una de las siguientes opciones:
+        - Crear tabla `watchlist` en Postgres e insertar filas (columna `asset`)
+        - Añadir `watchlist` en config.yml
+        - Definir variable de entorno WATCHLIST con valores separados por comas
+        """)
+        manual = st.text_input("Introducir watchlist temporal (comma-separated)", value="")
+        if manual:
+            assets = [x.strip() for x in manual.split(",") if x.strip()]
+            wl_source = "manual"
+    else:
+        st.sidebar.success(f"Watchlist cargada desde: {wl_source} ({len(assets)} assets)")
+
+    # Sidebar actions
+    with st.sidebar.expander("Acciones"):
+        st.markdown("### Actualizaciones")
+        hours = st.number_input("Horas a traer (max por asset)", min_value=1, max_value=168, value=24)
+        interval = st.selectbox("Intervalo", ["1h", "1d"], index=0)
+        sleep_between = st.number_input("Segundos entre assets", min_value=0.0, max_value=10.0, value=1.0, step=0.5)
+        if st.button("Actualizar ahora (background)"):
+            if not assets:
+                st.error("No hay assets en la watchlist para actualizar")
+            else:
+                run_incremental_backfill_assets(storage, assets, interval=interval, max_hours=int(hours), sleep_between=float(sleep_between))
+                st.success("Backfill lanzado en background para la watchlist")
+
+    # Sección principal: ver/watchlist y detalles
+    st.subheader("Watchlist")
+    if not assets:
+        st.write("_No hay assets configurados en la watchlist._")
+    else:
+        # Mostrar mini tabla con asset + última ts humana
+        info_rows = []
+        for a in assets:
+            last_ts = get_asset_last_ts(storage, a, interval=interval)
+            last_dt = pd.to_datetime(last_ts, unit="s", utc=True) if last_ts else None
+            info_rows.append({"asset": a, "last_ts": last_ts or "-", "last_datetime_utc": last_dt or "-"})
+        info_df = pd.DataFrame(info_rows)
+        st.dataframe(info_df)
+
+        cols = st.columns([2, 1, 1, 1])
+        with cols[0]:
+            selected = st.selectbox("Selecciona un asset", options=assets)
+        with cols[1]:
+            show_last = st.button("Ver últimos datos")
+        with cols[2]:
+            if st.button("Forzar backfill 6h (background)"):
+                run_incremental_backfill_assets(storage, [selected], interval=interval, max_hours=6, sleep_between=0.5)
+                st.success(f"Backfill 6h lanzado para {selected}")
+        with cols[3]:
+            if st.button("Mostrar stats"):
+                try:
+                    engine = getattr(storage, "engine")
+                    q = "SELECT COUNT(1) as cnt, MIN(ts) as first_ts, MAX(ts) as last_ts FROM candles WHERE asset = :asset AND interval = :interval"
+                    with engine.connect() as conn:
+                        r = conn.execute(sa.text(q), {"asset": selected, "interval": interval}).fetchone()
+                    st.write({
+                        "count": int(r["cnt"]),
+                        "first_ts": pd.to_datetime(r["first_ts"], unit="s", utc=True) if r["first_ts"] else None,
+                        "last_ts": pd.to_datetime(r["last_ts"], unit="s", utc=True) if r["last_ts"] else None
+                    })
+                except Exception as e:
+                    logger.exception("Error obteniendo stats: %s", e)
+                    st.error(f"Error obteniendo stats: {e}")
+
+        # Mostrar candles si se solicita
+        if show_last:
+            try:
+                df = storage.load_candles(selected, interval, start_ts=None, end_ts=None)
+                if df is None or getattr(df, "empty", True):
+                    st.warning("No hay datos históricos disponibles para este asset")
+                else:
+                    st.write(df.tail(200))
+            except Exception as e:
+                logger.exception("Error mostrando candles: %s", e)
+                st.error(f"Error cargando datos: {e}")
+
+    st.markdown("---")
+    st.caption("Portfa Dashboard — Postgres-only. Si hay problemas con la conexión revisa DATABASE_URL en el entorno y los logs.")
+    st.sidebar.markdown("---")
+    st.sidebar.caption("Si la app no conecta a Postgres, revisa la variable de entorno DATABASE_URL y que tu DB acepte conexiones externas.")
+
 if __name__ == "__main__":
-    dashboard = TradingDashboard()
-    dashboard.run()
+    main()
