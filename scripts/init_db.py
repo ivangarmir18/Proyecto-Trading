@@ -1,50 +1,81 @@
-#init db
 # scripts/init_db.py
-import sqlite3
-from pathlib import Path
 
-DB_PATH = Path('data/db/watchlist.db')
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+import os
+import sys
+import psycopg2
 
-DDL = """
-PRAGMA foreign_keys = ON;
+def init_db():
+    """
+    Inicializa la base de datos de Supabase.
+    Requiere que la variable de entorno DATABASE_URL esté definida.
+    """
+    try:
+        # Obtener la URL de conexión desde el entorno
+        db_url = os.getenv("DATABASE_URL")
+        if not db_url:
+            raise ValueError("DATABASE_URL no está definida en las variables de entorno.")
 
-CREATE TABLE IF NOT EXISTS candles (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  asset TEXT NOT NULL,
-  interval TEXT NOT NULL,
-  ts INTEGER NOT NULL,
-  open REAL NOT NULL,
-  high REAL NOT NULL,
-  low REAL NOT NULL,
-  close REAL NOT NULL,
-  volume REAL,
-  UNIQUE(asset, interval, ts)
-);
+        # Conectar a la base de datos
+        print("Intentando conectar a la base de datos...")
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        print("Conexión exitosa. Inicializando la base de datos...")
 
-CREATE INDEX IF NOT EXISTS idx_candles_asset_interval_ts ON candles (asset, interval, ts);
+        # SQL para crear las tablas
+        ddl = """
+        -- Eliminar tablas si ya existen para un inicio limpio
+        DROP TABLE IF EXISTS scores CASCADE;
+        DROP TABLE IF EXISTS candles CASCADE;
 
-CREATE TABLE IF NOT EXISTS scores (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  asset TEXT NOT NULL,
-  interval TEXT NOT NULL,
-  ts INTEGER NOT NULL,
-  score REAL NOT NULL,
-  range_min REAL,
-  range_max REAL,
-  stop REAL,
-  target REAL,
-  p_ml REAL,
-  signal_quality REAL, 
-  multiplier REAL,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_scores_asset_time ON scores (asset, interval, ts);
-"""
+        -- Crear tabla de velas (candles)
+        CREATE TABLE candles (
+            id SERIAL PRIMARY KEY,
+            asset TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            ts BIGINT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL,
+            UNIQUE(asset, interval, ts)
+        );
+        
+        -- Crear índice para la tabla de velas
+        CREATE INDEX idx_candles_asset_interval_ts ON candles (asset, interval, ts);
 
-conn = sqlite3.connect(DB_PATH)
-cur = conn.cursor()
-cur.executescript(DDL)
-conn.commit()
-conn.close()
-print("DB inicializada en:", DB_PATH)
+        -- Crear tabla de puntuaciones (scores)
+        CREATE TABLE scores (
+            id SERIAL PRIMARY KEY,
+            asset TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            ts BIGINT NOT NULL,
+            score REAL NOT NULL,
+            range_min REAL,
+            range_max REAL,
+            stop REAL,
+            target REAL,
+            p_ml REAL,
+            signal_quality REAL,
+            multiplier REAL,
+            created_at BIGINT NOT NULL
+        );
+        
+        -- Crear índice para la tabla de puntuaciones
+        CREATE INDEX idx_scores_asset_time ON scores (asset, interval, ts);
+        """
+
+        # Ejecutar el script SQL
+        cur.execute(ddl)
+        conn.commit()
+
+        print("Base de datos inicializada correctamente.")
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        print(f"Error al inicializar la base de datos: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    init_db()
