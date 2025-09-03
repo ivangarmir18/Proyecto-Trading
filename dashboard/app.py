@@ -180,7 +180,7 @@ if PASSWORD:
         if st.button("Entrar"):
             if pwd == PASSWORD:
                 st.session_state.auth_ok = True
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Contraseña incorrecta")
         st.stop()
@@ -207,7 +207,7 @@ with st.sidebar:
     st.markdown("---")
     st.write("Acciones globales")
     if st.button("Forzar refresco (UI)"):
-        st.experimental_rerun()
+        st.rerun()
     if OPENAI_AVAILABLE:
         st.info("AI disponible: OpenAI API key detectada.")
     else:
@@ -248,7 +248,7 @@ def page_watchlist(storage):
                             st.error("Storage no implementa add_watchlist_symbol() o falló. Revisa logs.")
                         else:
                             st.success(f"{asset} añadido/actualizado en watchlist.")
-                            st.experimental_rerun()
+                            st.rerun()
                     except Exception as e:
                         st.exception(e)
 
@@ -373,7 +373,7 @@ def page_watchlist(storage):
                         if ok:
                             deleted += 1
                     st.success(f"Eliminados: {deleted}")
-                    st.experimental_rerun()
+                    st.rerun()
         with a2:
             if st.button("Pedir backfill (seleccionados)"):
                 if not selected:
@@ -516,7 +516,7 @@ def page_backfill_requests(storage):
                         if ok:
                             updated += 1
                     st.success(f"Actualizadas: {updated}")
-                    st.experimental_rerun()
+                    st.rerun()
         with col2:
             if st.button("Reintentar seleccionadas (recrear request)"):
                 recreated = 0
