@@ -27,34 +27,39 @@ def main():
     except Exception:
         logger.info("make_save_callback no disponible, usando fallback que llama a storage.save_candles")
 
-        def save_callback(df: pd.DataFrame, asset: str, interval: str, meta: dict):
+        def save_callback(df):
             """
-            Fallback wrapper que adapta el DataFrame y llama a storage.save_candles.
-            Trata de cubrir firmas distintas de save_candles.
+            Callback seguro para guardar candles en storage.
+            Ignora DataFrames vacíos o malformados y registra excepciones.
             """
             try:
-                df2 = df.copy()
-                if "asset" not in df2.columns:
-                    df2["asset"] = asset
-                if "interval" not in df2.columns:
-                    df2["interval"] = interval
-
-                # Try common signatures
-                try:
-                    # firma: save_candles(df)
-                    storage.save_candles(df2)
-                except TypeError:
-                    try:
-                        # firma: save_candles(df, batch=500)
-                        storage.save_candles(df2, batch=500)
-                    except TypeError:
-                        # firma: save_candles(df, asset, interval) (por si acaso)
-                        try:
-                            storage.save_candles(df2, asset, interval)
-                        except Exception as ee:
-                            logger.exception("save_candles: llamada fallback final fallida: %s", ee)
-            except Exception as exc:
-                logger.exception("Error en save_callback para %s %s: %s", asset, interval, exc)
+                if df is None:
+                    logger.info("save_callback: recibido None, skip")
+                    return
+        
+                if getattr(df, "empty", False):
+                    logger.info("save_callback: recibido DataFrame vacío, skip")
+                    return
+        
+                required = {'high', 'close', 'asset', 'interval', 'volume', 'low', 'timestamp', 'open', 'ts'}
+                missing = required.difference(set(df.columns))
+                if missing:
+                    logger.warning(f"save_callback: DataFrame missing required columns {missing}; skipping save. Columns present: {list(df.columns)}")
+                    return
+        
+                # normalizar tipos
+                df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+                df['ts'] = df['ts'].astype('int64')
+        
+                # opcional: eliminar duplicados por ts antes de guardar
+                df = df.drop_duplicates(subset=['ts'])
+        
+                # Guardar usando la clase storage (asumiendo storage ya instanciado en el scope)
+                storage.save_candles(df)
+                logger.info(f"save_callback: guardadas {len(df)} filas para {df['asset'].iat[0]} {df['interval'].iat[0]}")
+            except Exception as e:
+                logger.exception(f"Error en save_callback al guardar datos: {e}")
+        
 
     # 3) Inicializar fetcher
     fetcher = Fetcher()
@@ -129,5 +134,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# %%
 

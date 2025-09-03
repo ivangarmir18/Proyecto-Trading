@@ -29,6 +29,83 @@ try:
 except Exception:
     yf = None
 
+import logging
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+def process_yf_hist(hist, asset, interval):
+    """
+    Normaliza y valida el DataFrame devuelto por yfinance (hist).
+    Devuelve el DataFrame con columnas:
+    ['timestamp','open','high','low','close','volume','ts','asset','interval']
+    o None si hist está vacío o no es válido.
+    """
+    try:
+        if hist is None:
+            logger.warning(f"process_yf_hist: hist is None for {asset} {interval}")
+            return None
+        if getattr(hist, "empty", False):
+            logger.warning(f"process_yf_hist: empty dataframe for {asset} {interval}")
+            return None
+
+        # yfinance devuelve multiindex (si varios tickers) o columnas con mayúsculas
+        # normalizar columnas mínimas
+        cols_lower = {c.lower(): c for c in hist.columns}
+        needed = {"open", "high", "low", "close", "volume"}
+        if not needed.issubset(set(cols_lower.keys())):
+            logger.warning(f"process_yf_hist: missing OHLCV columns for {asset} {interval} -> {list(hist.columns)}")
+            return None
+
+        # reset index (timestamp estará en el índice)
+        df = hist.reset_index()
+
+        # normaliza nombres posibles de la columna de fecha
+        if "Date" in df.columns:
+            df = df.rename(columns={"Date": "timestamp"})
+        elif "Datetime" in df.columns:
+            df = df.rename(columns={"Datetime": "timestamp"})
+        elif "index" in df.columns:
+            df = df.rename(columns={"index": "timestamp"})
+        elif "timestamp" not in df.columns and df.columns[0].dtype == "datetime64[ns]":
+            # improbable, pero por si acaso
+            df = df.rename(columns={df.columns[0]: "timestamp"})
+
+        # renombrar OHLCV a minúsculas estándar
+        rename_map = {}
+        for std in ["open", "high", "low", "close", "volume"]:
+            if std in df.columns:
+                rename_map[std] = std
+            else:
+                # buscar mayúsculas
+                for c in df.columns:
+                    if c.lower() == std:
+                        rename_map[c] = std
+                        break
+        df = df.rename(columns=rename_map)
+
+        # asegurar timestamp datetime UTC
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+
+        # crear ts epoch segundos (int64)
+        df['ts'] = (df['timestamp'].astype('int64') // 10**9).astype('int64')
+
+        # añadir columnas necesarias
+        df['asset'] = asset
+        df['interval'] = interval
+
+        # seleccionar columnas en orden esperado
+        out_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'ts', 'asset', 'interval']
+        # verificar de nuevo que tenemos las columnas requeridas
+        if not set(out_cols).issubset(set(df.columns)):
+            logger.warning(f"process_yf_hist: after normalization missing cols for {asset} {interval}: {list(df.columns)}")
+            return None
+
+        return df[out_cols]
+    except Exception as e:
+        logger.exception(f"process_yf_hist: exception processing hist for {asset} {interval}: {e}")
+        return None
+    
 logger = logging.getLogger("core.fetch")
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -356,6 +433,19 @@ class Fetcher:
                     period = "max" if since else "1y"
                     hist = yf.download(tickers=yf_symbol, interval=yf_interval, 
                                      period=period, progress=False, threads=False)
+                    # --- después de la llamada a yf.download(...) ---
+
+                    processed = process_yf_hist(hist, asset, interval)
+                    if processed is None or processed.empty:
+                        logger.info(f"fetch_ohlcv: no valid data from yfinance for {asset} {interval}, skipping this chunk")
+                        # En la función fetch_ohlcv, devuelve DataFrame vacío para que el caller lo trate
+                        return pd.DataFrame()
+                    
+                    # Si llegamos aquí, 'processed' tiene las columnas normalizadas esperadas
+                    # continua con la lógica original del código usando 'processed' en lugar de 'hist'
+                    # por ejemplo, si antes hacías más transformaciones sobre 'hist', ahora hazlas sobre 'processed'
+                    hist = processed
+
                     
                     if hist is None or hist.empty:
                         raise RuntimeError("yfinance devolvió DataFrame vacío")
