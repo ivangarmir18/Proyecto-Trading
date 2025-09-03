@@ -1,25 +1,80 @@
 {
-  "weights": {
-    "ema": 0.25,
-    "support": 0.20, 
-    "atr": 0.15,
-    "macd": 0.15,
-    "rsi": 0.10,
-    "fibonacci": 0.15
+  "app": {
+    "name": "Trading Intelligence System",
+    "version": "2.0.0",
+    "default_limit": 500,
+    "log_level": "INFO"
   },
-  "atr_multipliers": {
-    "stop": 1.3,
-    "target": 2.5
+  "api": {
+    "binance": {
+      "api_key": "pWToeNJhpx6FAnqhn7EiidQefEgmpkfY7A5VVdKLFqvds11umHmAleqfqschYSUu",
+      "api_secret": "oMaJr0riPq908VX5dxpGJSVOlcCdLvUlkHM4WET8rW72mCBVOTTlUMHHk3vNoFjR",
+      "rate_limit_per_min": 1200,
+      "timeout": 30
+    },
+    "finnhub": {
+      "keys": [
+        "d2qnmshr01qn21mkb99gd2qnmshr01qn21mkb9a0",
+        "d2raic1r01qlk22sfbq0d2raic1r01qlk22sfbqg",
+        "d2rail1r01qlk22sfd30d2rail1r01qlk22sfd3g",
+        "d2raitpr01qlk22sfeb0d2raitpr01qlk22sfebg"
+      ],
+      "requests_per_min": 60
+    }
   },
-  "atr_norm_scale": 0.02,
-  "fibonacci_lookback": 144,
-  "fibonacci_lookback_higher": 288,
+  "database": {
+    "postgres": {
+      "host": "localhost",
+      "port": 5432,
+      "dbname": "trading",
+      "user": "trading_user",
+      "password": "",
+      "pool_min": 2,
+      "pool_max": 10,
+      "connect_timeout": 10
+    },
+    "retention_policy": {
+      "1m": 7,
+      "5m": 70,
+      "15m": 90,
+      "30m": 120,
+      "1h": 180,
+      "4h": 365,
+      "1d": 730,
+      "1w": 1825
+    },
+    "maintenance": {
+      "vacuum_interval_hours": 24,
+      "analyze_interval_hours": 12,
+      "retention_check_interval_hours": 6
+    }
+  },
+  "scoring": {
+    "weights": {
+      "ema": 0.25,
+      "support": 0.20, 
+      "atr": 0.20,
+      "macd": 0.15,
+      "rsi": 0.10,
+      "fibonacci": 0.10
+    },
+    "atr_multipliers": {
+      "stop": 1.3,
+      "target": 2.5
+    },
+    "atr_norm_scale": 0.02,
+    "fibonacci": {
+      "lookback": 144,
+      "lookback_higher": 288
+    }
+  },
   "ai": {
     "enabled": true,
     "model_path": "models/ai_score_model.pkl",
-    "multiplier_min": 0.85,
-    "multiplier_max": 1.0,
+    "multiplier_min": 0.8,
+    "multiplier_max": 1.1,
     "retrain_days": 7,
+    "horizon_hours": 86,
     "features": [
       "EMA9_EMA40_gap",
       "RSI", 
@@ -28,36 +83,39 @@
       "vol_over_ma5",
       "ret_1",
       "ret_3"
-    ],
-    "horizon_hours": 24
+    ]
   },
   "asset_files": {
     "cryptos": "data/config/cryptos.csv",
     "stocks": "data/config/actions.csv"
   },
-  
-  // AÑADIR ESTAS NUEVAS SECCIONES para el orchestrator
-  "app": {
-    "default_limit": 500
-  },
-  "api": {
-    "binance": {
-      "api_key": "pWToeNJhpx6FAnqhn7EiidQefEgmpkfY7A5VVdKLFqvds11umHmAleqfqschYSUu",
-      "api_secret": "oMaJr0riPq908VX5dxpGJSVOlcCdLvUlkHM4WET8rW72mCBVOTTlUMHHk3vNoFjR",
-      "rate_limit_per_min": 1200
-    },
-    "finnhub": {
-      "keys": ["d2qnmshr01qn21mkb99gd2qnmshr01qn21mkb9a0", "d2raic1r01qlk22sfbq0d2raic1r01qlk22sfbqg", "d2rail1r01qlk22sfd30d2rail1r01qlk22sfd3g", "d2raitpr01qlk22sfeb0d2raitpr01qlk22sfebg"]
-    }
-  },
   "scheduler": {
     "processing_interval_minutes": 15,
     "crypto_cycle_minutes": 5,
-    "stocks_cycle_minutes": 60
+    "stocks_cycle_minutes": 60,
+    "maintenance_hour": 2,
+    "retention_check_hour": 3
   },
-  "retention_days": {
-    "5m": 30,
-    "1h": 90,
-    "1d": 365
+  "backtesting": {
+    "default_threshold": 0.6,
+    "max_holding_candles": 24,
+    "commission_rate": 0.001,
+    "slippage_rate": 0.0005
+  },
+  "dashboard": {
+    "port": 8501,
+    "host": "0.0.0.0",
+    "refresh_interval": 300,
+    "max_display_points": 1000
+  },
+  "monitoring": {
+    "health_check_interval": 300,
+    "performance_metrics": true,
+    "error_tracking": true,
+    "telegram": {
+      "enabled": false,
+      "bot_token": "",
+      "chat_id": ""
+    }
   }
 }
