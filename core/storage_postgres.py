@@ -136,6 +136,52 @@ class PostgresStorage:
             cur.close()
         logger.info("Database schema ensured.")
 
+# al final de core/storage_postgres.py
+from urllib.parse import urlparse
+
+def make_storage_from_env() -> PostgresStorage:
+    """
+    Factory helper: crea y devuelve PostgresStorage leyendo DATABASE_URL
+    o las variables POSTGRES_* individuales.
+    """
+    url = os.getenv("DATABASE_URL")
+    if url:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port
+        dbname = parsed.path.lstrip("/") if parsed.path else None
+        user = parsed.username
+        password = parsed.password
+        return PostgresStorage(
+            host=host,
+            port=int(port) if port else None,
+            dbname=dbname,
+            user=user,
+            password=password,
+        )
+
+    # Fallback a POSTGRES_HOST / POSTGRES_PORT / POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD
+    host = os.getenv("POSTGRES_HOST")
+    port = os.getenv("POSTGRES_PORT")
+    dbname = os.getenv("POSTGRES_DB")
+    user = os.getenv("POSTGRES_USER")
+    password = os.getenv("POSTGRES_PASSWORD")
+
+    if not (host and dbname and user):
+        raise RuntimeError(
+            "DATABASE_URL no está configurada y variables POSTGRES_* incompletas. "
+            "Define DATABASE_URL o POSTGRES_HOST/POSTGRES_DB/POSTGRES_USER."
+        )
+
+    return PostgresStorage(
+        host=host,
+        port=int(port) if port else None,
+        dbname=dbname,
+        user=user,
+        password=password,
+    )
+
+
     # ---------------------
     # Candles IO
     # ---------------------
