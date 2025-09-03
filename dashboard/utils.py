@@ -43,12 +43,13 @@ _POSTGRES_STORAGE_AVAILABLE = False
 PostgresStorage = None
 try:
     from core.storage_postgres import PostgresStorage as _PS
-nexcept Exception:
+except Exception:
     try:
         # intenta import relativo si estructura de paquetes distinta
         from .core.storage_postgres import PostgresStorage as _PS  # type: ignore
     except Exception:
         _PS = None
+
 
 if _PS is not None:
     PostgresStorage = _PS
