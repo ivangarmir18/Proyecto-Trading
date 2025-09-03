@@ -30,6 +30,17 @@ st.set_page_config(
 
 # Título y descripción
 st.title("📊 Sistema de Trading Inteligente")
+
+# integración no destructiva del widget de watchlist
+try:
+    from core.storage_postgres import PostgresStorage
+    storage = PostgresStorage()  # usa DATABASE_URL si está definido
+    from dashboard.watchlist_ui import render_watchlist_ui
+    render_watchlist_ui(storage)
+except Exception as _e:
+    # Si por alguna razón no conecta, seguimos sin romper el dashboard principal.
+    st.sidebar.info("Watchlist deshabilitada (configuración requerida).")
+
 st.markdown("""
 Dashboard en tiempo real con señales de trading, análisis técnico y predicciones de IA.
 """)

@@ -1,508 +1,358 @@
 # core/storage_postgres.py
-"""
-Postgres storage backend mejorado con:
-- Soporte completo para Render.com
-- Políticas de retención configurables por intervalo
-- Bulk upserts optimizados
-- Pool de conexiones eficiente
-- Métricas de rendimiento
-- Manejo robusto de errores
-"""
-
-from __future__ import annotations
 import os
-import time
-import math
-import logging
+import json
 import threading
-import urllib.parse
-from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
-from datetime import datetime, timedelta
-
+from typing import Optional, Dict, Any, List
 import pandas as pd
 import psycopg2
-import psycopg2.extras
-from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import pool
+import logging
+from datetime import datetime, timezone
 
-logger = logging.getLogger("core.storage_postgres")
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-# Configuración de retención por defecto (días)
-DEFAULT_RETENTION_POLICY = {
-    "1m": 7,    # 1 semana para 1m
-    "5m": 70,   # 70 días para 5m
-    "15m": 90,  # 3 meses para 15m
-    "30m": 120, # 4 meses para 30m
-    "1h": 180,  # 6 meses para 1h
-    "4h": 365,  # 1 año para 4h
-    "1d": 730,  # 2 años para 1d
-    "1w": 1825  # 5 años para 1w
-}
 
 class PostgresStorage:
-    def __init__(
-        self,
-        dsn: Optional[str] = None,
-        minconn: int = 1,
-        maxconn: int = 10,
-        retention_policy: Optional[Dict[str, int]] = None
-    ):
-        # Obtener configuración de environment variables
-        self.host = os.getenv("POSTGRES_HOST")
-        self.port = os.getenv("POSTGRES_PORT", "5432")
-        self.dbname = os.getenv("POSTGRES_DB", "trading")
-        self.user = os.getenv("POSTGRES_USER", "postgres")
-        self.password = os.getenv("POSTGRES_PASSWORD", "")
-        
-        # Prioridad: parámetros individuales > DATABASE_URL > parámetro dsn
-        if all([self.host, self.dbname, self.user]):
-            # Construir DSN desde parámetros individuales
-            self.dsn = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
-            logger.info("Using individual PostgreSQL parameters")
-        else:
-            # Usar DATABASE_URL de Render
-            self.dsn = os.getenv("DATABASE_URL") or dsn
-            if self.dsn:
-                # Asegurar formato correcto para psycopg2
-                if self.dsn.startswith("postgresql://"):
-                    self.dsn = self.dsn.replace("postgresql://", "postgres://")
-                logger.info("Using DATABASE_URL from environment")
-            else:
-                raise ValueError("Se requiere configuración de PostgreSQL (DATABASE_URL o parámetros individuales)")
-        
-        if not self.dsn:
-            raise ValueError("No se pudo determinar la configuración de PostgreSQL")
-        
-        self.minconn = minconn
-        self.maxconn = maxconn
-        self.retention_policy = retention_policy or DEFAULT_RETENTION_POLICY
-        
-        # Configuración de operaciones
-        self._batch_size = 500
-        self._metrics = {
-            "writes": 0,
-            "reads": 0,
-            "deletes": 0,
-            "errors": 0
-        }
-        self._lock = threading.RLock()
-        self._pool = None
-        
-        # Inicializar pool de conexiones
-        self._ensure_pool()
-        
-        logger.info(f"PostgresStorage inicializado para {self.dbname}")
+    """
+    Postgres-backed storage (supports DATABASE_URL or separate env vars).
+    Env vars: DATABASE_URL OR POSTGRES_HOST/POSTGRES_PORT/POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD
+    """
 
-    def _ensure_pool(self):
-        """Crea el pool de conexiones si no existe"""
-        if self._pool:
-            return
-            
+    def __init__(self,
+                 host: Optional[str] = None,
+                 port: Optional[int] = None,
+                 dbname: Optional[str] = None,
+                 user: Optional[str] = None,
+                 password: Optional[str] = None,
+                 minconn: int = 1,
+                 maxconn: int = 5):
+        self._minconn = minconn
+        self._maxconn = maxconn
+        # Prefer DATABASE_URL if present (works with Supabase)
+        database_url = os.getenv("DATABASE_URL")
+        if database_url:
+            # Use DSN string
+            try:
+                self._pool = pool.SimpleConnectionPool(self._minconn, self._maxconn, dsn=database_url)
+                logger.info("PostgresStorage initialized via DATABASE_URL.")
+                return
+            except Exception as e:
+                logger.exception("Fallo al crear pool con DATABASE_URL: %s", e)
+                # fallback to separate vars
+
+        # Fallback: individual env vars (or provided args)
+        self.host = host or os.getenv("POSTGRES_HOST", "localhost")
+        self.port = port or int(os.getenv("POSTGRES_PORT", "5432"))
+        self.dbname = dbname or os.getenv("POSTGRES_DB", "trading")
+        self.user = user or os.getenv("POSTGRES_USER", "postgres")
+        self.password = password or os.getenv("POSTGRES_PASSWORD", "")
+
         try:
-            self._pool = ThreadedConnectionPool(
-                self.minconn, self.maxconn, self.dsn,
-                application_name="trading-storage"
+            self._pool = pool.SimpleConnectionPool(
+                self._minconn,
+                self._maxconn,
+                host=self.host,
+                port=self.port,
+                dbname=self.dbname,
+                user=self.user,
+                password=self.password
             )
-            logger.info(f"Pool de conexiones creado (min={self.minconn}, max={self.maxconn})")
+            logger.info("PostgresStorage initialized (host=%s db=%s user=%s)", self.host, self.dbname, self.user)
         except Exception as e:
-            logger.error(f"Error creando pool de conexiones: {e}")
-            # Intentar conexión directa para diagnóstico
-            self._test_connection()
+            logger.exception("Error inicializando Postgres connection pool: %s", e)
             raise
 
-    def _test_connection(self):
-        """Prueba de conexión simple para diagnóstico"""
-        try:
-            import psycopg2
-            conn = psycopg2.connect(self.dsn)
-            cur = conn.cursor()
-            cur.execute("SELECT version();")
-            version = cur.fetchone()
-            logger.info(f"PostgreSQL version: {version[0]}")
-            conn.close()
-            return True
-        except Exception as e:
-            logger.error(f"Prueba de conexión fallida: {e}")
-            return False
+        self._lock = threading.Lock()
 
     @contextmanager
-    def get_conn(self):
-        """Context manager para obtener conexiones del pool"""
-        if not self._pool:
-            self._ensure_pool()
-            
+    def _get_conn(self):
         conn = None
         try:
             conn = self._pool.getconn()
             yield conn
-            conn.commit()
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            with self._lock:
-                self._metrics["errors"] += 1
-            logger.error(f"Error en conexión: {e}")
-            raise
         finally:
             if conn:
-                self._pool.putconn(conn)
+                try:
+                    self._pool.putconn(conn)
+                except Exception:
+                    pass
 
     def init_db(self):
-        """Inicializa tablas con particionamiento por intervalo"""
-        with self.get_conn() as conn:
-            with conn.cursor() as cur:
-                # Tabla principal
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS candles (
-                        id BIGSERIAL,
-                        asset TEXT NOT NULL,
-                        interval TEXT NOT NULL,
-                        ts BIGINT NOT NULL,
-                        open DOUBLE PRECISION NOT NULL,
-                        high DOUBLE PRECISION NOT NULL,
-                        low DOUBLE PRECISION NOT NULL,
-                        close DOUBLE PRECISION NOT NULL,
-                        volume DOUBLE PRECISION,
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        PRIMARY KEY (asset, interval, ts)
-                    );
-                """)
-                
-                # Tabla de scores
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS scores (
-                        id BIGSERIAL PRIMARY KEY,
-                        asset TEXT NOT NULL,
-                        interval TEXT NOT NULL,
-                        ts BIGINT NOT NULL,
-                        score DOUBLE PRECISION NOT NULL,
-                        range_min DOUBLE PRECISION,
-                        range_max DOUBLE PRECISION,
-                        stop DOUBLE PRECISION,
-                        target DOUBLE PRECISION,
-                        p_ml DOUBLE PRECISION,
-                        multiplier DOUBLE PRECISION,
-                        signal_quality DOUBLE PRECISION,
-                        created_at BIGINT NOT NULL,
-                        UNIQUE (asset, interval, ts)
-                    );
-                """)
-                
-                # Tabla de indicadores
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS indicators (
-                        id BIGSERIAL PRIMARY KEY,
-                        asset TEXT NOT NULL,
-                        interval TEXT NOT NULL,
-                        ts BIGINT NOT NULL,
-                        ema9 DOUBLE PRECISION,
-                        ema40 DOUBLE PRECISION,
-                        atr DOUBLE PRECISION,
-                        macd_line DOUBLE PRECISION,
-                        macd_signal DOUBLE PRECISION,
-                        macd_hist DOUBLE PRECISION,
-                        rsi DOUBLE PRECISION,
-                        support DOUBLE PRECISION,
-                        resistance DOUBLE PRECISION,
-                        fibonacci_levels JSONB,
-                        UNIQUE (asset, interval, ts)
-                    );
-                """)
-                
-                # Índices para mejorar rendimiento
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_candles_asset_interval_ts 
-                    ON candles (asset, interval, ts DESC);
-                    
-                    CREATE INDEX IF NOT EXISTS idx_scores_asset_interval_ts 
-                    ON scores (asset, interval, ts DESC);
-                    
-                    CREATE INDEX IF NOT EXISTS idx_indicators_asset_interval_ts 
-                    ON indicators (asset, interval, ts DESC);
-                """)
-                
-                logger.info("Tablas de PostgreSQL inicializadas correctamente")
+        """Create minimal schema if not exists."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS candles (
+              ts BIGINT NOT NULL,
+              timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+              open DOUBLE PRECISION,
+              high DOUBLE PRECISION,
+              low DOUBLE PRECISION,
+              close DOUBLE PRECISION,
+              volume DOUBLE PRECISION,
+              asset TEXT NOT NULL,
+              interval TEXT NOT NULL,
+              PRIMARY KEY (ts, asset, interval)
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS indicators (
+              id SERIAL PRIMARY KEY,
+              ts BIGINT NOT NULL,
+              asset TEXT NOT NULL,
+              interval TEXT NOT NULL,
+              indicators JSONB,
+              created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS scores (
+              id SERIAL PRIMARY KEY,
+              ts BIGINT NOT NULL,
+              asset TEXT NOT NULL,
+              interval TEXT NOT NULL,
+              model_id INTEGER,
+              score JSONB,
+              created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS models (
+              id SERIAL PRIMARY KEY,
+              asset TEXT NOT NULL,
+              interval TEXT NOT NULL,
+              supabase_path TEXT NOT NULL,
+              filename TEXT,
+              meta JSONB,
+              created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_candles_asset_interval ON candles(asset, interval);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_models_asset_interval ON models(asset, interval);")
+            conn.commit()
+            cur.close()
+        logger.info("Database schema ensured.")
 
-    def save_candles(self, df: pd.DataFrame, asset: str, interval: str, meta: Optional[Dict[str, Any]] = None) -> int:
-        """Inserta velas usando execute_values para máximo rendimiento"""
-        if df is None or df.empty:
-            return 0
+    # ---------------------
+    # Candles IO
+    # ---------------------
+    def save_candles(self, df: pd.DataFrame, batch: int = 500):
+        required_cols = {"ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"}
+        if not required_cols.issubset(set(df.columns)):
+            raise ValueError(f"DataFrame must contain columns {required_cols}")
 
-        # Preparar datos
-        records = []
-        for _, row in df.iterrows():
-            # Convertir timestamp a ms
-            if hasattr(row['ts'], 'timestamp'):
-                ts_ms = int(row['ts'].timestamp() * 1000)
-            else:
-                ts_ms = int(row['ts'])
-                
-            records.append((
-                asset,
-                interval,
-                ts_ms,
-                float(row['open']),
-                float(row['high']),
-                float(row['low']),
-                float(row['close']),
-                float(row['volume']) if 'volume' in row and not pd.isna(row['volume']) else None
-            ))
+        rows = [
+            (
+                int(row["ts"]),
+                pd.to_datetime(row["timestamp"]).to_pydatetime(),
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+                float(row.get("volume", 0.0)),
+                str(row["asset"]),
+                str(row["interval"])
+            )
+            for _, row in df.iterrows()
+        ]
 
-        # Insertar en lotes
-        inserted = 0
-        with self.get_conn() as conn:
-            with conn.cursor() as cur:
-                for i in range(0, len(records), self._batch_size):
-                    batch = records[i:i + self._batch_size]
-                    try:
-                        psycopg2.extras.execute_values(
-                            cur,
-                            """
-                            INSERT INTO candles (asset, interval, ts, open, high, low, close, volume)
-                            VALUES %s
-                            ON CONFLICT (asset, interval, ts) DO UPDATE SET
-                                open = EXCLUDED.open,
-                                high = EXCLUDED.high,
-                                low = EXCLUDED.low,
-                                close = EXCLUDED.close,
-                                volume = EXCLUDED.volume
-                            """,
-                            batch,
-                            page_size=len(batch)
-                        )
-                        inserted += cur.rowcount
-                    except Exception as e:
-                        logger.error(f"Error insertando lote {i}: {e}")
-                        with self._lock:
-                            self._metrics["errors"] += 1
-        
-        with self._lock:
-            self._metrics["writes"] += inserted
-            
-        logger.info(f"Insertadas {inserted} velas para {asset} {interval}")
-        return inserted
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            sql_insert = """
+            INSERT INTO candles (ts, timestamp, open, high, low, close, volume, asset, interval)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (ts, asset, interval) DO UPDATE
+              SET open = EXCLUDED.open,
+                  high = EXCLUDED.high,
+                  low = EXCLUDED.low,
+                  close = EXCLUDED.close,
+                  volume = EXCLUDED.volume,
+                  timestamp = EXCLUDED.timestamp;
+            """
+            for i in range(0, len(rows), batch):
+                batch_rows = rows[i:i+batch]
+                cur.executemany(sql_insert, batch_rows)
+                conn.commit()
+            cur.close()
+        logger.info("Saved %d candle rows", len(rows))
 
-    # --- INICIO: NUEVA FUNCIÓN AÑADIDA ---
-    def has_data(self, asset: str, interval: str) -> bool:
-        """Chequea si existe alguna vela para un activo/intervalo."""
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT 1 FROM candles WHERE asset = %s AND interval = %s LIMIT 1;",
-                        (asset, interval)
-                    )
-                    return cur.fetchone() is not None
-        except Exception as e:
-            logger.exception("Error checking for data: %s", e)
-            return False
-    # --- FIN: NUEVA FUNCIÓN AÑADIDA ---
-    
-    def get_ohlcv(self, asset: str, interval: str, start_ms: Optional[int] = None, 
-                 end_ms: Optional[int] = None, limit: Optional[int] = None) -> pd.DataFrame:
-        """Recupera velas desde PostgreSQL"""
-        query = """
-            SELECT ts, open, high, low, close, volume 
-            FROM candles 
-            WHERE asset = %s AND interval = %s
-        """
-        params = [asset, interval]
-        
-        if start_ms is not None:
-            query += " AND ts >= %s"
-            params.append(start_ms)
-        if end_ms is not None:
-            query += " AND ts <= %s"
-            params.append(end_ms)
-            
-        query += " ORDER BY ts ASC"
-        
-        if limit is not None:
-            query += " LIMIT %s"
-            params.append(limit)
-        
-        try:
-            with self.get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(query, params)
-                    rows = cur.fetchall()
-                    
-                    if not rows:
-                        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
-                    
-                    # Convertir a DataFrame
-                    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
-                    
-                    # Convertir timestamp a datetime
-                    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                    
-                    with self._lock:
-                        self._metrics["reads"] += len(df)
-                        
-                    return df
-                    
-        except Exception as e:
-            logger.error(f"Error obteniendo OHLCV: {e}")
-            with self._lock:
-                self._metrics["errors"] += 1
-            return pd.DataFrame()
+    def load_candles(self, asset: str, interval: str, start_ts: Optional[int] = None, end_ts: Optional[int] = None, limit: Optional[int] = None) -> pd.DataFrame:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            base_q = "SELECT ts, timestamp, open, high, low, close, volume, asset, interval FROM candles WHERE asset=%s AND interval=%s"
+            params = [asset, interval]
+            if start_ts is not None:
+                base_q += " AND ts >= %s"
+                params.append(int(start_ts))
+            if end_ts is not None:
+                base_q += " AND ts <= %s"
+                params.append(int(end_ts))
+            base_q += " ORDER BY ts ASC"
+            if limit:
+                base_q += f" LIMIT {int(limit)}"
+            cur.execute(base_q, params)
+            rows = cur.fetchall()
+            cur.close()
 
-    def apply_retention_policy(self):
-        """Aplica políticas de retención automáticamente"""
-        deleted_total = 0
-        try:
-            with self.get_conn() as conn:
-                with conn.cursor() as cur:
-                    for interval, days in self.retention_policy.items():
-                        cutoff_ts = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-                        
-                        cur.execute("""
-                            DELETE FROM candles 
-                            WHERE interval = %s AND ts < %s
-                        """, (interval, cutoff_ts))
-                        
-                        deleted = cur.rowcount
-                        deleted_total += deleted
-                        
-                        with self._lock:
-                            self._metrics["deletes"] += deleted
-                            
-                        logger.info(f"Retención {interval}: eliminadas {deleted} velas")
-            
-            return deleted_total
-            
-        except Exception as e:
-            logger.error(f"Error aplicando retención: {e}")
-            with self._lock:
-                self._metrics["errors"] += 1
-            return 0
+        if not rows:
+            return pd.DataFrame(columns=["ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"])
 
-    def save_scores(self, df_scores: pd.DataFrame, asset: str, interval: str) -> int:
-        """Guarda scores en la base de datos"""
-        if df_scores is None or df_scores.empty:
-            return 0
-            
-        records = []
+        df = pd.DataFrame(rows, columns=["ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"])
+        df["ts"] = df["ts"].astype(int)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        return df
+
+    # ---------------------
+    # Scores IO
+    # ---------------------
+    def save_scores(self, df_scores: pd.DataFrame, batch: int = 500):
+        required_cols = {"ts", "asset", "interval", "score"}
+        if not required_cols.issubset(set(df_scores.columns)):
+            raise ValueError(f"df_scores must contain {required_cols}")
+
+        rows = []
         for _, row in df_scores.iterrows():
-            # Convertir timestamp a ms
-            if hasattr(row['ts'], 'timestamp'):
-                ts_ms = int(row['ts'].timestamp() * 1000)
-            else:
-                ts_ms = int(row['ts'])
-                
-            records.append((
-                asset,
-                interval,
-                ts_ms,
-                float(row['score']) if 'score' in row else 0.0,
-                float(row['range_min']) if 'range_min' in row and not pd.isna(row['range_min']) else None,
-                float(row['range_max']) if 'range_max' in row and not pd.isna(row['range_max']) else None,
-                float(row['stop']) if 'stop' in row and not pd.isna(row['stop']) else None,
-                float(row['target']) if 'target' in row and not pd.isna(row['target']) else None,
-                float(row['p_ml']) if 'p_ml' in row and not pd.isna(row['p_ml']) else None,
-                float(row['multiplier']) if 'multiplier' in row and not pd.isna(row['multiplier']) else None,
-                float(row['signal_quality']) if 'signal_quality' in row and not pd.isna(row['signal_quality']) else None,
-                int(time.time() * 1000)  # created_at
-            ))
-        
-        # Insertar en lotes
-        inserted = 0
-        with self.get_conn() as conn:
-            with conn.cursor() as cur:
-                for i in range(0, len(records), self._batch_size):
-                    batch = records[i:i + self._batch_size]
-                    try:
-                        psycopg2.extras.execute_values(
-                            cur,
-                            """
-                            INSERT INTO scores (asset, interval, ts, score, range_min, range_max, 
-                                              stop, target, p_ml, multiplier, signal_quality, created_at)
-                            VALUES %s
-                            ON CONFLICT (asset, interval, ts) DO UPDATE SET
-                                score = EXCLUDED.score,
-                                range_min = EXCLUDED.range_min,
-                                range_max = EXCLUDED.range_max,
-                                stop = EXCLUDED.stop,
-                                target = EXCLUDED.target,
-                                p_ml = EXCLUDED.p_ml,
-                                multiplier = EXCLUDED.multiplier,
-                                signal_quality = EXCLUDED.signal_quality,
-                                created_at = EXCLUDED.created_at
-                            """,
-                            batch,
-                            page_size=len(batch)
-                        )
-                        inserted += cur.rowcount
-                    except Exception as e:
-                        logger.error(f"Error insertando scores lote {i}: {e}")
-                        with self._lock:
-                            self._metrics["errors"] += 1
-        
-        with self._lock:
-            self._metrics["writes"] += inserted
-            
-        logger.info(f"Insertados {inserted} scores para {asset} {interval}")
-        return inserted
+            rows.append((int(row["ts"]), str(row["asset"]), str(row["interval"]), row.get("model_id"), json.dumps(row["score"])))
 
-    def get_metrics(self) -> Dict[str, Any]:
-        """Devuelve métricas de rendimiento"""
-        with self._lock:
-            return self._metrics.copy()
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            sql_insert = """
+            INSERT INTO scores (ts, asset, interval, model_id, score)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT DO NOTHING;
+            """
+            for i in range(0, len(rows), batch):
+                cur.executemany(sql_insert, rows[i:i+batch])
+                conn.commit()
+            cur.close()
+        logger.info("Saved %d score rows", len(rows))
 
-    def close(self):
-        """Cierra el pool de conexiones"""
-        if self._pool:
-            try:
-                self._pool.closeall()
-                logger.info("Pool de conexiones cerrado")
-            except Exception as e:
-                logger.error(f"Error cerrando pool: {e}")
-            finally:
-                self._pool = None
+    def load_scores(self, asset: str, interval: str, start_ts: Optional[int] = None, end_ts: Optional[int] = None, model_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            base_q = "SELECT ts, asset, interval, model_id, score, created_at FROM scores WHERE asset=%s AND interval=%s"
+            params = [asset, interval]
+            if start_ts is not None:
+                base_q += " AND ts >= %s"
+                params.append(int(start_ts))
+            if end_ts is not None:
+                base_q += " AND ts <= %s"
+                params.append(int(end_ts))
+            if model_id:
+                base_q += " AND model_id = %s"
+                params.append(int(model_id))
+            base_q += " ORDER BY ts ASC"
+            cur.execute(base_q, params)
+            rows = cur.fetchall()
+            cur.close()
+        results = []
+        for r in rows:
+            results.append({
+                "ts": int(r[0]),
+                "asset": r[1],
+                "interval": r[2],
+                "model_id": r[3],
+                "score": r[4],
+                "created_at": r[5].astimezone(timezone.utc).isoformat() if r[5] else None
+            })
+        return results
 
-    def make_save_callback(self):
-        """Crea un callback para guardar datos"""
-        def save_callback(df, asset, interval, meta=None):
-            return self.save_candles(df, asset, interval, meta)
-        return save_callback
+    # ---------------------
+    # Model metadata
+    # ---------------------
+    def save_model_record(self, asset: str, interval: str, supabase_path: str, filename: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            sql_q = """
+            INSERT INTO models (asset, interval, supabase_path, filename, meta)
+            VALUES (%s,%s,%s,%s,%s)
+            RETURNING id, created_at
+            """
+            cur.execute(sql_q, (asset, interval, supabase_path, filename, json.dumps(meta)))
+            row = cur.fetchone()
+            conn.commit()
+            cur.close()
+        if row:
+            return {"id": row[0], "created_at": row[1].isoformat()}
+        return {}
 
-# Función de conveniencia para crear storage desde environment variables
-def make_storage_from_env() -> PostgresStorage:
-    """Crea una instancia de PostgresStorage desde variables de entorno"""
-    return PostgresStorage(
-        minconn=int(os.getenv("POSTGRES_POOL_MIN", "1")),
-        maxconn=int(os.getenv("POSTGRES_POOL_MAX", "10")),
-        retention_policy=DEFAULT_RETENTION_POLICY
-    )
+    def get_latest_model_record(self, asset: str, interval: str) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+            SELECT id, asset, interval, supabase_path, filename, meta, created_at
+            FROM models
+            WHERE asset=%s AND interval=%s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """, (asset, interval))
+            row = cur.fetchone()
+            cur.close()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "asset": row[1],
+            "interval": row[2],
+            "supabase_path": row[3],
+            "filename": row[4],
+            "meta": row[5],
+            "created_at": row[6].isoformat() if row[6] else None
+        }
 
-# Ejemplo de uso
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    
-    # Prueba de conexión
-    storage = make_storage_from_env()
-    
-    try:
-        storage.init_db()
-        print("Base de datos inicializada correctamente")
-        
-        # Prueba de inserción
-        test_df = pd.DataFrame([{
-            "ts": datetime.now(),
-            "open": 100.0,
-            "high": 101.0,
-            "low": 99.5,
-            "close": 100.5,
-            "volume": 1000.0
-        }])
-        
-        inserted = storage.save_candles(test_df, "TEST", "1m")
-        print(f"Insertadas {inserted} filas de prueba")
-        
-        # Prueba de lectura
-        df = storage.get_ohlcv("TEST", "1m")
-        print(f"Leídas {len(df)} filas")
-        print(df)
-        
-    finally:
-        storage.close()
+    # ---------------------
+    # Helpers for dashboard
+    # ---------------------
+    def list_assets(self) -> List[str]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT asset FROM candles ORDER BY asset;")
+            rows = cur.fetchall()
+            cur.close()
+        return [r[0] for r in rows] if rows else []
+
+    def list_intervals_for_asset(self, asset: str) -> List[str]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT interval FROM candles WHERE asset=%s ORDER BY interval;", (asset,))
+            rows = cur.fetchall()
+            cur.close()
+        return [r[0] for r in rows] if rows else []
+
+    def list_models_for_asset_interval(self, asset: str, interval: str, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+            SELECT id, filename, meta, created_at FROM models
+            WHERE asset=%s AND interval=%s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """, (asset, interval, limit))
+            rows = cur.fetchall()
+            cur.close()
+        res = []
+        for r in rows:
+            res.append({
+                "id": r[0],
+                "filename": r[1],
+                "meta": r[2],
+                "created_at": r[3].isoformat() if r[3] else None
+            })
+        return res
+
+    # ---------------------
+    # Health
+    # ---------------------
+    def health(self) -> Dict[str, Any]:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT now();")
+                _ = cur.fetchone()
+                cur.close()
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("DB health check failed: %s", e)
+            return {"ok": False, "error": str(e)}
