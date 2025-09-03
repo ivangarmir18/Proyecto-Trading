@@ -282,6 +282,22 @@ class PostgresStorage:
         logger.info(f"Insertadas {inserted} velas para {asset} {interval}")
         return inserted
 
+    # --- INICIO: NUEVA FUNCIÓN AÑADIDA ---
+    def has_data(self, asset: str, interval: str) -> bool:
+        """Chequea si existe alguna vela para un activo/intervalo."""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM candles WHERE asset = %s AND interval = %s LIMIT 1;",
+                        (asset, interval)
+                    )
+                    return cur.fetchone() is not None
+        except Exception as e:
+            logger.exception("Error checking for data: %s", e)
+            return False
+    # --- FIN: NUEVA FUNCIÓN AÑADIDA ---
+    
     def get_ohlcv(self, asset: str, interval: str, start_ms: Optional[int] = None, 
                  end_ms: Optional[int] = None, limit: Optional[int] = None) -> pd.DataFrame:
         """Recupera velas desde PostgreSQL"""

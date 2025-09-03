@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS scores (
   stop REAL,
   target REAL,
   p_ml REAL,
+  signal_quality REAL, 
   multiplier REAL,
   created_at INTEGER NOT NULL
 );

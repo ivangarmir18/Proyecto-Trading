@@ -12,7 +12,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("watchlist-service")
 
 # importa tu orquestador (main.run_pipeline)
-from main import run_pipeline, load_assets_from_config, load_json
+from main import run_pipeline, load_assets_from_config, load_json, run_cmd_backfill
+from core.storage_postgres import make_storage_from_env
 
 def send_telegram(message: str):
     # usa core.utils si ya existe; fallback básico
@@ -29,6 +30,7 @@ def main_loop(config_path: str = "config.json", sleep_seconds: int = 300):
     config = load_json(config_path)
     assets = load_assets_from_config(config)
     intervals = config.get("intervals", ["1h"])
+    storage = make_storage_from_env()
     db_path = os.getenv("DB_PATH", config.get("app", {}).get("db_path", "data/db/data.db"))
 
     logger.info("Service started: assets=%d intervals=%s db=%s", len(assets), intervals, db_path)
@@ -44,6 +46,24 @@ def main_loop(config_path: str = "config.json", sleep_seconds: int = 300):
             logger.exception(msg)
             send_telegram(f"⚠️ Watchlist service error:\n{e}")
         time.sleep(sleep_seconds)
+        # --- INICIO: LÓGICA DE BACKFILL AUTOMÁTICO ---
+    # Verificar si la base de datos ya tiene datos.
+    # Usamos el primer activo y primer intervalo como chequeo.
+    if assets: # Agregamos una verificación para evitar errores si la lista de activos está vacía
+        first_asset = assets[0]['symbol']
+        first_interval = intervals[0]
+        
+        # Llama al nuevo método del objeto 'storage'
+        if not storage.has_data(first_asset, first_interval):
+            logger.info("Base de datos vacía. Iniciando backfill inicial...")
+            run_cmd_backfill(config)
+            logger.info("Backfill inicial completado.")
+        else:
+            logger.info("Datos históricos encontrados. Saltando backfill inicial.")
+    else:
+        logger.warning("No se encontraron activos en la configuración. No se realizará el backfill.")
+    # --- FIN: LÓGICA DE BACKFILL AUTOMÁTICO ---
+    
 
 if __name__ == "__main__":
     # sleep_seconds configurable via env

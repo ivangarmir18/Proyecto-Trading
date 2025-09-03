@@ -27,8 +27,8 @@ logger = get_logger("main")
 CONFIG_PATH = os.getenv("PROJECT_CONFIG_PATH", "config.json")
 
 def build_storage_and_fetcher(cfg):
-    # Storage
-    storage = make_storage_from_env()
+    storage = PostgresStorage(
+        retention_policy=cfg.get("storage", {}).get("retention_policy"))
     # Fetcher: leer rate limit del config/api
     bin_cfg = cfg.get("api", {}).get("binance", {})
     rate_limit = bin_cfg.get("rate_limit_per_min") if isinstance(bin_cfg, dict) else None
