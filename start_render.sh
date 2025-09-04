@@ -39,7 +39,7 @@ try:
 except Exception:
     traceback.print_exc()
 PY
-
+chmod +x scripts/ensure_db_on_start.py
 exec streamlit run dashboard/app.py --server.port "${PORT}" --server.address "0.0.0.0" --server.enableCORS false
 
 
