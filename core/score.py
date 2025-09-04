@@ -352,3 +352,132 @@ def compute_latest_score(
         except Exception as e:
             logger.exception("Error guardando último score (asset=%s ts=%s): %s", asset, out["ts"], e)
     return out
+# ----------------------------
+# Stop / Target helpers (ATR-based)
+# Pegar al final de core/score.py
+# ----------------------------
+import math
+from typing import Dict, Optional
+import numpy as np
+
+# Nota: 'logger' ya existe en este módulo; si no, definimos uno suave
+try:
+    logger
+except NameError:
+    import logging
+    logger = logging.getLogger("score")
+
+def compute_atr(df, window: int = 14, high_col="high", low_col="low", close_col="close") -> Optional[float]:
+    """
+    Calcula ATR simple (Wilder) sobre df ordenado ascendentemente por tiempo.
+    Devuelve el último ATR (float) o None si no hay datos suficientes.
+    """
+    if df is None or len(df) < max(2, window):
+        return None
+    if not all(c in df.columns for c in (high_col, low_col, close_col)):
+        logger.debug("compute_atr: columnas OHLC faltan en df")
+        return None
+    high = df[high_col].astype(float)
+    low = df[low_col].astype(float)
+    close = df[close_col].astype(float)
+
+    prev_close = close.shift(1)
+    tr1 = (high - low).abs()
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    # Wilder smoothing: ATR_t = (ATR_{t-1} * (n-1) + TR_t) / n
+    # Implementado con .ewm(adjust=False) aproximado o con rolling mean for warmup
+    try:
+        atr = tr.rolling(window=window, min_periods=window).mean()
+        # For more Wilder exact: use ewm on full TR with alpha=1/window after warmup; keep simple for now
+        atr = atr.fillna(method="ffill")
+        last_atr = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else None
+        return last_atr
+    except Exception as e:
+        logger.exception("compute_atr error: %s", e)
+        return None
+
+def infer_direction_by_ema(df, short_span: int = 9, long_span: int = 40, close_col="close") -> str:
+    """
+    Heurística sencilla para inferir si la tendencia actual es 'long' o 'short'
+    usando dos EMAs sobre el close. Devuelve 'long' si EMA_short > EMA_long, sino 'short'.
+    """
+    if df is None or close_col not in df.columns or len(df) < max(short_span, long_span):
+        return "long"  # fallback neutro
+    close = df[close_col].astype(float)
+    ema_short = close.ewm(span=short_span, adjust=False).mean()
+    ema_long = close.ewm(span=long_span, adjust=False).mean()
+    return "long" if ema_short.iloc[-1] > ema_long.iloc[-1] else "short"
+
+def compute_entry_stop_target(
+    df,
+    atr_window: int = 14,
+    stop_mult: float = 1.3,
+    target_mult: float = 2.6,
+    entry_price: Optional[float] = None,
+    direction: Optional[str] = None,
+    close_col="close"
+) -> Dict:
+    """
+    Dado un DataFrame de velas (orden asc), calcula:
+      - atr (último)
+      - entry_price (último close si no se pasa)
+      - stop (entry ± 1.3 * atr)
+      - target (entry ± 2.6 * atr)
+      - direction: 'long' o 'short' (si no se pasa, se infiere por EMA)
+    Devuelve dict con keys: atr, entry, stop, target, direction, pct_stop, pct_target
+    """
+    out = {"atr": None, "entry": None, "stop": None, "target": None, "direction": None,
+           "pct_stop": None, "pct_target": None}
+    if df is None or len(df) == 0:
+        return out
+
+    try:
+        atr = compute_atr(df, window=atr_window, close_col=close_col)
+        out["atr"] = atr
+        entry = float(entry_price) if entry_price is not None else float(df[close_col].iloc[-1])
+        out["entry"] = entry
+
+        if direction is None:
+            direction = infer_direction_by_ema(df, close_col=close_col)
+        out["direction"] = direction
+
+        if atr is None or atr <= 0:
+            # No ATR available -> no stop/target
+            return out
+
+        if direction == "long":
+            stop = entry - stop_mult * atr
+            target = entry + target_mult * atr
+        else:
+            # short
+            stop = entry + stop_mult * atr
+            target = entry - target_mult * atr
+
+        out.update({
+            "stop": float(stop),
+            "target": float(target),
+            "pct_stop": (stop - entry) / entry if entry != 0 else None,
+            "pct_target": (target - entry) / entry if entry != 0 else None
+        })
+        return out
+    except Exception as e:
+        logger.exception("compute_entry_stop_target error: %s", e)
+        return out
+
+# Convenience helper that uses the project adapter to load candles for an asset
+def compute_stop_target_for_asset(adapter_obj, asset: str, interval: str = "1h", lookback: int = 200,
+                                  atr_window: int = 14, stop_mult: float = 1.3, target_mult: float = 2.6) -> Dict:
+    """
+    Usa `adapter_obj.load_candles(asset, limit=lookback)` y calcula stop/target.
+    adapter_obj es el singleton `core.adapter.adapter` o equivalente.
+    """
+    try:
+        df = adapter_obj.load_candles(asset, limit=lookback)
+        # adapter retorna DataFrame o None
+        return compute_entry_stop_target(df, atr_window=atr_window, stop_mult=stop_mult,
+                                         target_mult=target_mult, entry_price=None)
+    except Exception as e:
+        logger.exception("compute_stop_target_for_asset failed for %s %s: %s", asset, interval, e)
+        return {"error": str(e)}

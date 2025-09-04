@@ -37,6 +37,40 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# ----------------------------
+# Setup logging (pegado al inicio, junto a imports)
+# ----------------------------
+import logging
+from logging.handlers import RotatingFileHandler
+from collections import deque
+
+LOG_PATH = "logs/app.log"
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+
+# deque en memoria para mostrar logs in-process
+INMEM_LOG = deque(maxlen=1000)
+
+class StreamlitMemoryHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            INMEM_LOG.append(msg)
+        except Exception:
+            pass
+
+# configure root logger once (evita duplicados)
+root_logger = logging.getLogger()
+if not any(isinstance(h, RotatingFileHandler) for h in root_logger.handlers):
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    fh = RotatingFileHandler(LOG_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
+    fh.setFormatter(fmt)
+    root_logger.addHandler(fh)
+    memh = StreamlitMemoryHandler()
+    memh.setFormatter(fmt)
+    root_logger.addHandler(memh)
+    root_logger.setLevel(logging.INFO)
+
 # -------------------------
 # Basic paths & env
 # -------------------------
@@ -937,5 +971,70 @@ with tab_system:
 # -------------------------
 # End
 # -------------------------
+# ----------------------------
+# Snippet Streamlit: mostrar Stop/Target y Visualizador de logs
+# Pega dentro de dashboard/app.py en la zona de detalle de activo
+# ----------------------------
+import streamlit as st
+from core.adapter import adapter as core_adapter  # singleton adapter
+from core.score import compute_stop_target_for_asset
+
+st.markdown("### Stop / Target (ATR-based)")
+
+col1, col2, col3 = st.columns(3)
+asset_sel = st.session_state.get("selected_asset", None)  # ajusta según la variable que uses
+interval_sel = st.session_state.get("selected_interval", "1h")
+
+if asset_sel:
+    if st.button("Calcular stop/target (ATR)"):
+        with st.spinner("Calculando..."):
+            res = compute_stop_target_for_asset(core_adapter, asset_sel, interval_sel, lookback=200)
+            if res.get("error"):
+                st.error(f"Error: {res['error']}")
+            else:
+                col1.metric("Entry", f"{res.get('entry', 'n/a'):.6f}" if res.get("entry") else "n/a")
+                col2.metric("Stop", f"{res.get('stop', 'n/a'):.6f}" if res.get("stop") else "n/a")
+                col3.metric("Target", f"{res.get('target', 'n/a'):.6f}" if res.get("target") else "n/a")
+                st.write(f"ATR (window 14): {res.get('atr')}")
+                st.write(f"Dirección inferida: {res.get('direction')}")
+else:
+    st.info("Selecciona un activo para calcular stop/target")
+
+# Simple visualizador de tail de logs (comandos y errores)
+st.markdown("### Visualizador de Logs (últimas líneas)")
+LOG_PATH = "logs/app.log"  # ajusta si tu app usa otro log
+try:
+    with open(LOG_PATH, "r", errors="ignore") as fh:
+        lines = fh.readlines()[-300:]  # últimas 300 líneas
+    st.code("".join(lines[-200:]))  # muestra las últimas 200 líneas
+except FileNotFoundError:
+    st.write("No se encontró el fichero de logs en", LOG_PATH)
+
+# ----------------------------
+# Mostrar logs en memoria + fichero
+# Pegar antes de st.markdown("---")
+# ----------------------------
+import streamlit as st
+from collections import deque
+
+st.markdown("### Logs en memoria (lo que produce este proceso)")
+show_mem = list(INMEM_LOG)[-200:]
+if show_mem:
+    st.code("\n".join(show_mem))
+else:
+    st.write("No hay logs en memoria todavía para este proceso")
+
+st.markdown("### Logs desde fichero (workers / procesos externos)")
+# Reusar la función tail_file del snippet A (cópiala arriba si no existe)
+log_choice = "logs/app.log"
+nlines = st.sidebar.slider("Líneas fichero", 50, 500, 300)
+if st.button("Refresh fichero"):
+    lines = tail_file(log_choice, nlines)
+    st.code("\n".join(lines[-nlines:]))
+else:
+    lines = tail_file(log_choice, 200)
+    st.code("\n".join(lines[-nlines:]))
+
 st.markdown("---")
+
 st.write("Dashboard listo. Si algo no funciona, pega aquí el primer traceback del terminal y lo soluciono. Voy a mantener esto compacto y compatible con tu repo existente.")
