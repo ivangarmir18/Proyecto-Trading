@@ -1,569 +1,439 @@
 # core/score.py
 """
-Módulo de Scoring / IA para Proyecto-Trading
+Módulo de scoring / features / entrenamiento / inferencia.
 
-Objetivo:
-- Calcular indicadores (EMA, ATR, RSI, Fibonacci, momentum, vol)
-- Generar features para ML
-- Entrenar modelos (sklearn / LightGBM opcional) para predecir retornos futuros o señales
-- Hacer inferencia (scores) en tiempo real / batch y persistir en DB
-- Guardar metadatos del modelo en la tabla `models` (via PostgresStorage.save_model_record)
-- Evaluación y backtest helpers
+Funciones principales exportadas:
+ - features_from_candles(df) -> DataFrame (features, indexed by ts)
+ - make_target(df, horizon=1) -> Series (target aligned with features)
+ - train_and_persist(storage, asset, interval, model_name, X, y, model_type='rf', model_params=None)
+       -> dict (metadata)
+ - infer_and_persist(storage, asset, interval, model_name=None, model_path=None, lookback=None)
+       -> DataFrame (predictions persisted)
 
 Diseño:
-- Clase principal: ScoreEngine(storage)
-- Métodos relevantes:
-    - compute_indicators(df)
-    - features_from_candles(df, lookback,...)
-    - make_target(df, horizon, method='future_return')
-    - train_model(asset, interval, df, features, target, params)
-    - predict_scores(df, model)
-    - save_model_to_storage(...)
-    - evaluate_model(...) (cross-val / walk-forward)
-    - backtest_signals(...) (usa core.backtest runner)
-
-Dependencias sugeridas:
-- pandas, numpy, scikit-learn, joblib, lightgbm (opcional), shap (opcional para explainability)
-
-Ejemplo rápido de uso:
-    from core.score import ScoreEngine
-    s = ScoreEngine()
-    s.train_and_persist(asset='BTCUSDT', interval='1m', horizon=60, model_type='lgbm')
-
+ - Las funciones son defensivas: validan inputs y lanzan excepciones claras.
+ - El módulo intenta usar LightGBM si está instalado; si no, usa RandomForestRegressor de sklearn.
+ - Modelos se guardan con joblib en data/models/{asset}_{interval}_{timestamp}_{model_name}.pkl
+ - Registro de modelos: llama storage.save_model_record(asset, interval, model_name, metadata, path)
+ - Inferencia: carga el último modelo si model_path no dado (storage.get_latest_model_record) y guarda resultados
+   con storage.save_scores(df_scores, asset, interval). El DataFrame pasado a save_scores debe tener columnas:
+   'ts' (ms int) y 'score' (dict JSON-serializable) -- storage se encargará de la persistencia.
 """
 
-import logging
+from __future__ import annotations
+
 import os
 import time
-import math
-from typing import Dict, Any, Optional, List, Tuple, Sequence
+import json
+import logging
+from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
 
-# try optional deps
+# ML libs
 try:
-    import lightgbm as lgb  # type: ignore
-    HAS_LGB = True
+    import lightgbm as lgb
 except Exception:
-    HAS_LGB = False
+    lgb = None
 
 try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.linear_model import LinearRegression
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import mean_squared_error, r2_score
     import joblib
 except Exception:
+    # si sklearn no está instalado, fallamos temprano en funciones de entrenamiento
+    RandomForestRegressor = None
+    LinearRegression = None
+    train_test_split = None
+    mean_squared_error = None
+    r2_score = None
     joblib = None
 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_squared_error, r2_score
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
-# Storage integration
-from core.storage_postgres import PostgresStorage
-
-logger = logging.getLogger("core.score")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-    logger.addHandler(ch)
+MODELS_DIR = os.getenv("MODELS_DIR", "data/models")
 
 
-# --------------------
-# Utilities
-# --------------------
-def _ensure_numeric_series(s) -> pd.Series:
-    s = s.copy()
-    s = pd.to_numeric(s, errors="coerce")
-    return s
+# ---------------------------
+# Utilities / features
+# ---------------------------
+def _ensure_ts_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Asegura que df tenga columna 'ts' en ms y la convierte a índice datetime UTC."""
+    if "ts" not in df.columns:
+        raise ValueError("DataFrame de candles debe contener la columna 'ts' (ms desde epoch).")
+    df2 = df.copy()
+    # normalizar ts a int ms
+    if np.issubdtype(df2["ts"].dtype, np.datetime64):
+        df2["ts"] = (df2["ts"].astype("datetime64[ms]").astype("int64"))
+    else:
+        df2["ts"] = df2["ts"].astype("int64")
+    df2 = df2.sort_values("ts")
+    df2["ts_dt"] = pd.to_datetime(df2["ts"], unit="ms", utc=True)
+    df2 = df2.set_index("ts_dt", drop=False)
+    return df2
 
 
-def _safe_div(a, b):
-    try:
-        return a / b
-    except Exception:
-        return np.nan
+def _rolling_apply(df: pd.Series, window: int, fn):
+    """Helper seguro para rolling apply que maneja ventanas cortas."""
+    if window <= 0:
+        raise ValueError("window must be > 0")
+    if len(df) < window:
+        return pd.Series([np.nan] * len(df), index=df.index)
+    return df.rolling(window=window, min_periods=1).apply(fn, raw=False)
 
 
-# --------------------
-# Indicators
-# --------------------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window=window, min_periods=1).mean()
-
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.rolling(period, min_periods=1).mean()
-    ma_down = down.rolling(period, min_periods=1).mean()
-    rs = ma_up / (ma_down.replace(0, np.nan))
-    rsi_series = 100 - (100 / (1 + rs))
-    return rsi_series.fillna(50)
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    # df must have high, low, close
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(period, min_periods=1).mean()
-
-
-def momentum(series: pd.Series, window: int = 10) -> pd.Series:
-    return series.pct_change(periods=window)
-
-
-def volatility(series: pd.Series, window: int = 20) -> pd.Series:
-    return series.pct_change().rolling(window=window, min_periods=1).std()
-
-
-def fibonacci_levels(df: pd.DataFrame, lookback: int = 100) -> Dict[str, float]:
+def features_from_candles(df: pd.DataFrame, include: Optional[list] = None) -> pd.DataFrame:
     """
-    Compute simple Fibonacci levels (0%, 23.6, 38.2, 50, 61.8, 100%) on last lookback bars.
-    Returns a dict of levels based on min/max in window.
+    Calcula un set de features estándar a partir de candles OHLCV.
+    Input: df con columnas ts (ms), open, high, low, close, volume
+    Output: DataFrame indexado por ts_dt con columnas de features; mantiene columna 'ts' (ms int).
+    Features incluidas (por defecto):
+      - close, open, high, low, volume (passthrough)
+      - returns_1: log return 1 bar
+      - ma_5, ma_10, ma_20
+      - ema_10, ema_20
+      - vol_20: std dev of returns (volatility)
+      - momentum_10: close / ma_10 - 1
+      - rsi_14 (implementación simple)
     """
     if df is None or df.empty:
-        return {}
-    window = df.tail(lookback)
-    high = float(window["high"].max())
-    low = float(window["low"].min())
-    diff = high - low
-    if diff == 0:
-        return {"high": high, "low": low}
-    levels = {
-        "high": high,
-        "low": low,
-        "0.0": low,
-        "0.236": high - 0.236 * diff,
-        "0.382": high - 0.382 * diff,
-        "0.5": high - 0.5 * diff,
-        "0.618": high - 0.618 * diff,
-        "1.0": high,
-    }
-    return levels
+        return pd.DataFrame()
 
+    df2 = _ensure_ts_index(df)
 
-# --------------------
-# Feature engineering
-# --------------------
-def features_from_candles(df: pd.DataFrame, feature_cfg: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    """
-    Given df with ts,timestamp,open,high,low,close,volume, generate features:
-      - ema_{12,26,50}
-      - sma_{50,200}
-      - rsi_14
-      - atr_14
-      - momentum_{5,10}
-      - vol_{20}
-      - returns_{1,5,10}
-      - fib levels (as distances to current close)
-    Returns a DataFrame with index aligned to input df (same length).
-    """
-    cfg = feature_cfg or {}
-    df = df.copy().reset_index(drop=True)
-    close = _ensure_numeric_series(df["close"])
-    high = _ensure_numeric_series(df["high"])
-    low = _ensure_numeric_series(df["low"])
-    vol = _ensure_numeric_series(df["volume"]) if "volume" in df.columns else pd.Series(np.nan, index=df.index)
+    close = pd.to_numeric(df2["close"], errors="coerce")
+    open_ = pd.to_numeric(df2["open"], errors="coerce")
+    high = pd.to_numeric(df2["high"], errors="coerce")
+    low = pd.to_numeric(df2["low"], errors="coerce")
+    volume = pd.to_numeric(df2.get("volume", pd.Series([np.nan] * len(df2))), errors="coerce")
 
-    features = pd.DataFrame(index=df.index)
-    # EMAs
-    for s in (12, 26, 50):
-        features[f"ema_{s}"] = ema(close, s)
-    # SMAs
-    for w in (50, 200):
-        features[f"sma_{w}"] = sma(close, w)
-    # RSI
-    features["rsi_14"] = rsi(close, 14)
-    # ATR
-    features["atr_14"] = atr(df, 14)
-    # momentum
-    for w in (5, 10):
-        features[f"mom_{w}"] = momentum(close, w)
-    # volatility
-    features["vol_20"] = volatility(close, 20)
+    out = pd.DataFrame(index=df2.index)
+    out["ts"] = df2["ts"].astype("int64")
+    out["close"] = close
+    out["open"] = open_
+    out["high"] = high
+    out["low"] = low
+    out["volume"] = volume
+
     # returns
-    features["ret_1"] = close.pct_change(1)
-    features["ret_5"] = close.pct_change(5)
-    features["ret_10"] = close.pct_change(10)
-    # price ratios
-    features["close_over_ema12"] = _safe_div(close, features["ema_12"])
-    features["close_over_sma50"] = _safe_div(close, features["sma_50"])
-    # fib levels relative distances
+    out["ret_1"] = np.log(close) - np.log(close.shift(1))
+
+    # moving averages
+    out["ma_5"] = close.rolling(5, min_periods=1).mean()
+    out["ma_10"] = close.rolling(10, min_periods=1).mean()
+    out["ma_20"] = close.rolling(20, min_periods=1).mean()
+
+    # ema
+    out["ema_10"] = close.ewm(span=10, adjust=False).mean()
+    out["ema_20"] = close.ewm(span=20, adjust=False).mean()
+
+    # volatility (std of returns)
+    out["vol_20"] = out["ret_1"].rolling(20, min_periods=1).std()
+
+    # momentum
+    out["mom_10"] = close / out["ma_10"] - 1.0
+
+    # rsi 14 (simple)
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    roll_up = up.ewm(span=14, adjust=False).mean()
+    roll_down = down.ewm(span=14, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    out["rsi_14"] = 100 - (100 / (1 + rs))
+
+    # fill small NaNs (but keep large NaNs)
+    out = out.replace([np.inf, -np.inf], np.nan)
+
+    # select included features if requested
+    if include:
+        cols = [c for c in include if c in out.columns]
+        if not cols:
+            raise ValueError("include no contiene columnas válidas")
+        out = out[["ts"] + cols]
+
+    return out
+
+
+def make_target(df: pd.DataFrame, horizon: int = 1, target_type: str = "forward_return") -> pd.Series:
+    """
+    Construye objetivo a predecir a partir de velas.
+    - horizon: número de barras hacia adelante
+    - target_type: 'forward_return' -> (close_{t+h} / close_t) - 1
+                  'forward_logret' -> log return
+    Retorna Series indexada por ts_dt (misma indexación que features_from_candles).
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+
+    df2 = _ensure_ts_index(df)
+    close = pd.to_numeric(df2["close"], errors="coerce")
+    if target_type == "forward_return":
+        target = (close.shift(-horizon) / close) - 1.0
+    elif target_type == "forward_logret":
+        target = np.log(close.shift(-horizon)) - np.log(close)
+    else:
+        raise ValueError("Unsupported target_type")
+
+    # align index and drop last horizon rows (they will be NaN)
+    target.name = "target"
+    return target
+
+
+# ---------------------------
+# Training helpers
+# ---------------------------
+def _ensure_models_dir():
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+
+def _train_sklearn_regressor(X: pd.DataFrame, y: pd.Series, model_params: Optional[Dict[str, Any]] = None) -> Tuple[Any, Dict[str, Any]]:
+    """Entrena RandomForestRegressor (fallback) o LinearRegression si sample muy pequeño."""
+    if RandomForestRegressor is None:
+        raise RuntimeError("scikit-learn no está disponible en el entorno.")
+
+    X2 = X.fillna(0).astype(float)
+    y2 = y.astype(float)
+
+    # train/test split
+    if len(X2) < 50:
+        # dataset pequeño -> usar regresión simple
+        model = LinearRegression()
+    else:
+        params = model_params or {"n_estimators": 100, "max_depth": 8, "random_state": 42}
+        model = RandomForestRegressor(**params)
+
+    X_train, X_test, y_train, y_test = train_test_split(X2, y2, test_size=0.2, random_state=42)
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+    rmse = float(np.sqrt(mean_squared_error(y_test, preds))) if mean_squared_error else None
+    r2 = float(r2_score(y_test, preds)) if r2_score else None
+    metrics = {"rmse": rmse, "r2": r2, "train_samples": len(X_train), "test_samples": len(X_test)}
+    return model, metrics
+
+
+def _train_lightgbm(X: pd.DataFrame, y: pd.Series, model_params: Optional[Dict[str, Any]] = None) -> Tuple[Any, Dict[str, Any]]:
+    """Entrena un LightGBM regresor si está disponible."""
+    if lgb is None:
+        raise RuntimeError("lightgbm no está instalado")
+
+    X2 = X.fillna(0).astype(float)
+    y2 = y.astype(float)
+
+    params = model_params or {"objective": "regression", "metric": "rmse", "verbosity": -1, "seed": 42}
+    lgb_train = lgb.Dataset(X2, label=y2)
+    booster = lgb.train(params, lgb_train, num_boost_round=100)
+    # No hay split por defecto aquí — métricas mínimas
+    preds = booster.predict(X2)
+    rmse = float(np.sqrt(((preds - y2) ** 2).mean()))
+    metrics = {"rmse": rmse, "train_samples": len(X2)}
+    return booster, metrics
+
+
+# ---------------------------
+# Persistence: train_and_persist
+# ---------------------------
+def train_and_persist(storage: Any, asset: str, interval: str, model_name: str, X: pd.DataFrame, y: pd.Series,
+                      model_type: str = "auto", model_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Entrena un modelo y lo persiste en disco + storage.save_model_record.
+
+    Parámetros:
+      - storage: instancia con método save_model_record(asset, interval, model_name, metadata, path)
+      - asset, interval, model_name: strings
+      - X: DataFrame features (index ts_dt, has 'ts' column)
+      - y: Series target (aligned index)
+      - model_type: 'auto'|'lgb'|'sklearn'
+      - model_params: dict con hyperparams
+
+    Retorna metadata dict con métricas y ruta de archivo.
+    """
+    if X is None or X.empty:
+        raise ValueError("X vacío")
+    if y is None or y.empty:
+        raise ValueError("y vacío")
+
+    _ensure_models_dir()
+    # ensure index alignment
+    Xc = X.copy().drop(columns=["ts"], errors="ignore").fillna(0)
+    # align y with X
+    y_aligned = y.reindex(X.index).dropna()
+    Xc = Xc.loc[y_aligned.index]
+
+    # choose model
+    chosen = model_type
+    if model_type == "auto":
+        chosen = "lgb" if lgb is not None else "sklearn"
+
+    if chosen == "lgb":
+        model, metrics = _train_lightgbm(Xc, y_aligned, model_params=model_params)
+    elif chosen == "sklearn":
+        model, metrics = _train_sklearn_regressor(Xc, y_aligned, model_params=model_params)
+    else:
+        raise ValueError("model_type desconocido")
+
+    # persist model
+    ts = int(time.time() * 1000)
+    safe_name = f"{asset}_{interval}_{ts}_{model_name}".replace("/", "_")
+    path = os.path.join(MODELS_DIR, f"{safe_name}.pkl")
+
+    # LightGBM booster no serializable con joblib? joblib works; otherwise dump booster with .save_model
     try:
-        fib = fibonacci_levels(df, lookback=cfg.get("fib_lookback", 100))
-        for k, v in fib.items():
-            # distance to level normalized by price
-            features[f"dist_to_fib_{k}"] = (v - close) / close
+        if joblib is None:
+            raise RuntimeError("joblib no disponible para persistir modelos")
+        joblib.dump(model, path)
     except Exception:
-        logger.exception("fibonacci feature generation failed")
-    # time features if timestamp exists
-    if "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"])
-        features["hour"] = ts.dt.hour
-        features["dayofweek"] = ts.dt.dayofweek
-    # fill inf / nan sensibly
-    features = features.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(0.0)
-    return features
+        # fallback para lightgbm: usar save_model
+        if lgb is not None and isinstance(model, lgb.Booster):
+            path = os.path.join(MODELS_DIR, f"{safe_name}.txt")
+            model.save_model(path)
+        else:
+            raise
 
+    # metadata
+    metadata = {
+        "asset": asset,
+        "interval": interval,
+        "model_name": model_name,
+        "model_type": chosen,
+        "model_params": model_params or {},
+        "metrics": metrics,
+        "saved_at": int(time.time() * 1000),
+    }
 
-# --------------------
-# Target creation
-# --------------------
-def make_target(df: pd.DataFrame, horizon: int = 60, method: str = "future_return") -> pd.Series:
-    """
-    Create a regression target:
-      - future_return: (close_{t+h} / close_t) - 1  (float)
-      - future_sign: sign(future_return) (-1/0/1) if method == 'sign'
-    horizon: number of bars ahead (depending on your interval).
-    """
-    close = _ensure_numeric_series(df["close"])
-    future = close.shift(-horizon)
-    fut_ret = (future / close) - 1
-    if method == "future_return":
-        return fut_ret
-    elif method == "sign":
-        return np.sign(fut_ret).fillna(0).astype(int)
-    else:
-        raise ValueError("Unknown method for make_target")
-
-
-# --------------------
-# Model helpers
-# --------------------
-def _train_sklearn_regressor(X: pd.DataFrame, y: pd.Series, random_state: int = 42, **kwargs):
-    """
-    Train a RandomForestRegressor by default (fast to run locally). Returns fitted model.
-    """
-    model = RandomForestRegressor(n_estimators=200, random_state=random_state, n_jobs=-1, **kwargs)
-    model.fit(X, y)
-    return model
-
-
-def _train_lightgbm(X: pd.DataFrame, y: pd.Series, params: Optional[dict] = None):
-    if not HAS_LGB:
-        raise RuntimeError("lightgbm not available")
-    dtrain = lgb.Dataset(X, label=y)
-    p = params or {"objective": "regression", "metric": "rmse", "verbose": -1}
-    model = lgb.train(p, dtrain, num_boost_round=200)
-    return model
-
-
-def _save_model_file(model, path: str):
-    if joblib is None:
-        raise RuntimeError("joblib required to save model files (pip install joblib)")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    joblib.dump(model, path)
-    logger.info("Model saved to %s", path)
-
-
-def _load_model_file(path: str):
-    if joblib is None:
-        raise RuntimeError("joblib required to load model files")
-    return joblib.load(path)
-
-
-# --------------------
-# ScoreEngine
-# --------------------
-class ScoreEngine:
-    def __init__(self, storage: Optional[PostgresStorage] = None, model_dir: str = "models"):
-        self.storage = storage or PostgresStorage()
-        self.model_dir = model_dir
-        self.storage.init_db()
-        os.makedirs(self.model_dir, exist_ok=True)
-
-    # Indicator / features helpers
-    def compute_indicators(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Returns a dict of scalar indicators for last bar (useful for UI).
-        """
-        res = {}
+    # save model record in storage if API available
+    if storage and hasattr(storage, "save_model_record"):
         try:
-            last_window = df.tail(200)
-            res["ema_12"] = float(ema(last_window["close"], 12).iloc[-1])
-            res["ema_26"] = float(ema(last_window["close"], 26).iloc[-1])
-            res["sma_50"] = float(sma(last_window["close"], 50).iloc[-1])
-            res["sma_200"] = float(sma(last_window["close"], 200).iloc[-1])
-            res["rsi_14"] = float(rsi(last_window["close"], 14).iloc[-1])
-            res["atr_14"] = float(atr(last_window, 14).iloc[-1])
-            res["fib"] = fibonacci_levels(last_window, lookback=100)
+            storage.save_model_record(asset, interval, model_name, metadata, path)
         except Exception:
-            logger.exception("compute_indicators failed")
-        return res
+            logger.exception("save_model_record falló — continuar de todos modos")
 
-    def features_from_candles(self, df: pd.DataFrame, feature_cfg: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-        return features_from_candles(df, feature_cfg)
+    return {"path": path, "metadata": metadata}
 
-    # Training / eval
-    def train_model(self,
-                    asset: str,
-                    interval: str,
-                    df_candles: pd.DataFrame,
-                    horizon: int = 60,
-                    model_type: str = "lgbm",
-                    feature_cfg: Optional[Dict[str, Any]] = None,
-                    save_to_storage: bool = True,
-                    model_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        End-to-end train:
-        - compute features from df_candles
-        - create target (future_return) with horizon
-        - split by time (TimeSeriesSplit) and train model
-        - save model file and register metadata in storage.models table
-        Returns dict with metrics and model path & id.
-        """
-        if df_candles is None or df_candles.empty:
-            raise ValueError("df_candles empty")
-        df_candles = df_candles.sort_values("ts").reset_index(drop=True)
-        features = self.features_from_candles(df_candles, feature_cfg)
-        target = make_target(df_candles, horizon=horizon, method="future_return")
-        # align
-        X = features.iloc[:-horizon].reset_index(drop=True)
-        y = target.iloc[:-horizon].reset_index(drop=True).fillna(0.0)
-        # drop any NaNs
-        X = X.fillna(0.0)
-        # simple time-series split CV for metrics
-        tscv = TimeSeriesSplit(n_splits=3)
-        metrics = {"folds": []}
-        fold = 0
-        models = []
-        for train_idx, test_idx in tscv.split(X):
-            fold += 1
-            X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-            # train
-            if model_type == "lgbm" and HAS_LGB:
-                model = _train_lightgbm(X_tr, y_tr)
-            else:
-                model = _train_sklearn_regressor(X_tr, y_tr)
-            # predict
-            if model_type == "lgbm" and HAS_LGB:
-                y_pred = model.predict(X_te)
-            else:
-                y_pred = model.predict(X_te)
-            rmse = float(math.sqrt(mean_squared_error(y_te, y_pred)))
-            r2 = float(r2_score(y_te, y_pred))
-            metrics["folds"].append({"fold": fold, "rmse": rmse, "r2": r2})
-            models.append(model)
-        # retrain on full data
-        if model_type == "lgbm" and HAS_LGB:
-            final_model = _train_lightgbm(X, y)
-        else:
-            final_model = _train_sklearn_regressor(X, y)
-        # save model to disk
-        timestamp = int(time.time())
-        model_name = model_name or f"{asset}_{interval}_{model_type}_{timestamp}.pkl"
-        model_path = os.path.join(self.model_dir, model_name)
+
+# ---------------------------
+# Infer & persist
+# ---------------------------
+def infer_and_persist(storage: Any, asset: str, interval: str, model_name: Optional[str] = None,
+                      model_path: Optional[str] = None, lookback: Optional[int] = None) -> pd.DataFrame:
+    """
+    Ejecuta inferencia con el último modelo (o model_path si se da) sobre velas recientes y persiste scores.
+
+    Output:
+      - DataFrame con columnas ts (ms) y score (dict)
+    """
+    if storage is None:
+        raise ValueError("storage requerido para infer_and_persist")
+
+    # obtener modelo: preferir model_path, luego storage.get_latest_model_record
+    model = None
+    used_path = model_path
+    if model_path:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"model_path no encontrado: {model_path}")
         if joblib is None:
-            logger.warning("joblib not installed - model won't be saved to disk")
-            model_saved = None
-        else:
-            _save_model_file(final_model, model_path)
-            model_saved = model_path
-        # persist model metadata in DB
-        model_id = None
-        if save_to_storage:
-            try:
-                metadata = {
-                    "asset": asset, "interval": interval, "model_type": model_type,
-                    "model_path": model_saved, "trained_at": timestamp,
-                    "metrics": metrics
-                }
-                model_id = self.storage.save_model_record(model_name, asset, interval, metadata)
-            except Exception:
-                logger.exception("Failed to save model record in DB")
-        return {"model_name": model_name, "model_path": model_saved, "model_id": model_id, "metrics": metrics}
-
-    def load_model(self, model_path: str):
-        if joblib is None:
-            raise RuntimeError("joblib required to load models")
-        return _load_model_file(model_path)
-
-    def infer(self,
-              asset: str,
-              interval: str,
-              df_candles: pd.DataFrame,
-              model: Any,
-              horizon: int = 60,
-              feature_cfg: Optional[Dict[str, Any]] = None,
-              output_raw_scores: bool = True) -> pd.DataFrame:
-        """
-        Given a candles DF and a fitted model, compute features and produce a DataFrame with:
-          ts, timestamp, score (predicted future_return), meta fields.
-        The predicted score aligns with current bar predicting future horizon.
-        """
-        if df_candles is None or df_candles.empty:
-            return pd.DataFrame()
-        df = df_candles.sort_values("ts").reset_index(drop=True)
-        feats = self.features_from_candles(df, feature_cfg)
-        feats = feats.fillna(0.0)
-        # remove last horizon rows that cannot have target if we had target
-        X = feats
-        # predict - if lightgbm model object predict same way as sklearn
+            raise RuntimeError("joblib requerido para cargar modelos")
         try:
+            model = joblib.load(model_path)
+        except Exception:
+            # try LightGBM load
+            if lgb is not None:
+                try:
+                    model = lgb.Booster(model_file=model_path)
+                except Exception:
+                    raise
+            else:
+                raise
+    else:
+        rec = None
+        if hasattr(storage, "get_latest_model_record"):
+            rec = storage.get_latest_model_record(asset, interval)
+        if rec is None:
+            raise RuntimeError("No se encontró modelo en storage; proporciona model_path o entrena primero.")
+        used_path = rec.get("path")
+        if not used_path or not os.path.exists(used_path):
+            raise FileNotFoundError(f"Ruta de modelo no válida en storage: {used_path}")
+        if joblib is None:
+            raise RuntimeError("joblib requerido para cargar modelos")
+        try:
+            model = joblib.load(used_path)
+        except Exception:
+            if lgb is not None:
+                try:
+                    model = lgb.Booster(model_file=used_path)
+                except Exception:
+                    raise
+            else:
+                raise
+
+    # cargar velas recientes
+    # lookback defines how many candles to fetch; try to use 1000 default
+    lookback = int(lookback) if lookback else 1000
+    try:
+        df_candles = storage.load_candles(asset, interval, limit=lookback)
+    except Exception as e:
+        logger.exception("load_candles falló en infer_and_persist: %s", e)
+        raise
+
+    if df_candles is None or df_candles.empty:
+        raise RuntimeError("No hay velas para inferir")
+
+    feats = features_from_candles(df_candles)
+    X = feats.drop(columns=["ts"], errors="ignore").fillna(0)
+    X_idx = X.index
+    # predict
+    preds = None
+    try:
+        if lgb is not None and isinstance(model, lgb.Booster):
             preds = model.predict(X)
-        except Exception:
-            # handle lgb Booster where predict expects np.array
+        else:
+            preds = model.predict(X.values)
+    except Exception as e:
+        logger.exception("Error al predecir: %s", e)
+        # intentar predict en bloques
+        preds = []
+        for i in range(0, len(X), 1000):
+            block = X.iloc[i : i + 1000]
             try:
-                preds = model.predict(X.values)
+                if lgb is not None and isinstance(model, lgb.Booster):
+                    preds_block = model.predict(block)
+                else:
+                    preds_block = model.predict(block.values)
+                preds.extend(list(preds_block))
             except Exception:
-                logger.exception("Model prediction failed")
-                preds = np.zeros(len(X))
-        out = pd.DataFrame({
-            "ts": df["ts"].astype(int),
-            "timestamp": df["timestamp"],
-            "score_raw": preds
-        })
-        # normalize/scale raw score to a bounded [-3,3] or probability-like score
-        out["score"] = _normalize_score(out["score_raw"])
-        # attach indicators snapshot for UI convenience
-        try:
-            ind = self.compute_indicators(df)
-            # broadcast
-            for k, v in ind.items():
-                out[f"ind_{k}"] = str(v)  # store as string to avoid heavy JSON here
-        except Exception:
-            logger.exception("attach indicators failed")
-        # Optionally persist scores to DB
-        return out
+                preds.extend([None] * len(block))
+        preds = np.array(preds)
 
-    def predict_and_persist(self, asset: str, interval: str, df_candles: pd.DataFrame, model_path: Optional[str] = None, model_obj: Optional[Any] = None, persist: bool = True, horizon: int = 60):
-        """
-        Convenience: load model (if path given), run infer and persist scores in DB via storage.save_scores
-        """
-        if model_obj is None and model_path is None:
-            # get latest model for this asset/interval from storage
-            rec = self.storage.get_latest_model_record(asset, interval)
-            if rec and rec.get("metadata") and rec["metadata"].get("model_path"):
-                model_path = rec["metadata"]["model_path"]
-        if model_obj is None:
-            if model_path is None:
-                raise ValueError("No model path or model object provided")
-            model_obj = self.load_model(model_path)
-        df_scores = self.infer(asset, interval, df_candles, model_obj, horizon=horizon)
-        if df_scores is None or df_scores.empty:
-            return None
-        # prepare for DB: keep last N rows (e.g., all)
-        df_db = df_scores[["ts", "timestamp", "score"]].copy()
-        # storage.save_scores expects column 'score' to be serializable; wrap in dict for traceability
-        df_db["asset"] = asset
-        df_db["interval"] = interval
-        df_db["score"] = df_db["score"].apply(lambda s: {"score": float(s)})
-        # cast ts to int
-        df_db["ts"] = df_db["ts"].astype(int)
-        # persist
-        if persist:
-            try:
-                # save in batches via storage.save_scores
-                self.storage.save_scores(df_db)
-            except Exception:
-                logger.exception("Failed to persist scores to DB")
-        return df_scores
+    # construir DataFrame para persistir
+    df_scores = pd.DataFrame({"ts": feats["ts"].astype("int64"), "score": [None] * len(feats)}, index=feats.index)
+    for i, p in enumerate(preds):
+        # asume regresor -> valor numérico
+        val = float(p) if p is not None and not np.isnan(p) else None
+        df_scores.iat[i, df_scores.columns.get_loc("score")] = {"pred": val}
 
-    # --------------------
-    # Evaluation & backtest
-    # --------------------
-    def evaluate_model(self, asset: str, interval: str, df_candles: pd.DataFrame, model_type: str = "lgbm", horizon: int = 60, n_splits: int = 3) -> Dict[str, Any]:
-        """
-        Walk-forward evaluation: trains model on each fold and returns aggregated metrics.
-        Uses TimeSeriesSplit.
-        """
-        df_candles = df_candles.sort_values("ts").reset_index(drop=True)
-        features = self.features_from_candles(df_candles)
-        target = make_target(df_candles, horizon=horizon, method="future_return")
-        X_full = features.iloc[:-horizon].fillna(0.0)
-        y_full = target.iloc[:-horizon].fillna(0.0)
-        tscv = TimeSeriesSplit(n_splits=n_splits)
-        metrics = []
-        for train_idx, test_idx in tscv.split(X_full):
-            X_tr, X_te = X_full.iloc[train_idx], X_full.iloc[test_idx]
-            y_tr, y_te = y_full.iloc[train_idx], y_full.iloc[test_idx]
-            if model_type == "lgbm" and HAS_LGB:
-                model = _train_lightgbm(X_tr, y_tr)
-                y_pred = model.predict(X_te)
-            else:
-                model = _train_sklearn_regressor(X_tr, y_tr)
-                y_pred = model.predict(X_te)
-            rmse = float(math.sqrt(mean_squared_error(y_te, y_pred)))
-            r2 = float(r2_score(y_te, y_pred))
-            metrics.append({"rmse": rmse, "r2": r2})
-        # aggregate
-        avg_rmse = float(np.mean([m["rmse"] for m in metrics])) if metrics else None
-        avg_r2 = float(np.mean([m["r2"] for m in metrics])) if metrics else None
-        return {"folds": metrics, "avg_rmse": avg_rmse, "avg_r2": avg_r2}
+    # Persistir usando storage.save_scores (espera df_scores, asset, interval)
+    try:
+        storage.save_scores(df_scores, asset, interval)
+    except Exception:
+        logger.exception("storage.save_scores falló — intentar persistir por lotes")
+        # intento de persistencia manual (si save_scores no existe)
+        if hasattr(storage, "save_scores"):
+            raise
+        else:
+            # fallback: intentar insertar fila por fila con save_scores/otro método no implementado -> raise
+            raise RuntimeError("storage.save_scores no implementado y no se pudo persistir scores")
 
-    def backtest_signals(self, asset: str, interval: str, df_candles: pd.DataFrame, model_obj: Any, horizon: int = 60, threshold: float = 0.0, **backtest_kwargs) -> Dict[str, Any]:
-        """
-        Convert model predictions into simple buy/sell signals and run backtest using core.backtest.run_backtest.
-        Strategy used:
-          - buy when predicted future_return > threshold
-          - sell when predicted future_return <= threshold (or stronger logic)
-        Returns backtest result dict.
-        """
-        from core.backtest import run_backtest
-        # infer scores
-        df_scores = self.infer(asset, interval, df_candles, model_obj, horizon=horizon)
-        if df_scores is None or df_scores.empty:
-            return {"error": "no_scores"}
-        # strategy function
-        def strategy_fn(row, idx, df_all, state=None):
-            # row is a row from df_candles in backtest loop; align by ts
-            ts = int(row["ts"])
-            # find corresponding score row (exact ts)
-            sr = df_scores[df_scores["ts"] == ts]
-            if sr.empty:
-                return None
-            score_val = float(sr.iloc[0]["score_raw"])
-            # simple: buy if predicted return > threshold
-            if score_val > threshold:
-                return "buy"
-            elif score_val < -threshold:
-                return "sell"
-            return None
-        # pass df_candles to backtest.run_backtest
-        result = run_backtest(df_candles, strategy_fn, **backtest_kwargs)
-        return result
+    return df_scores
 
 
-# --------------------
-# Helpers
-# --------------------
-def _normalize_score(arr: Sequence[float], method: str = "tanh_scale") -> np.ndarray:
-    """
-    Normalize raw predictions into bounded scores.
-    Default: tanh scaling to [-1,1], then multiply by 3 to map to [-3,3] (like previous behavior).
-    """
-    arr = np.asarray(arr, dtype=float)
-    if method == "tanh_scale":
-        # guard against big outliers
-        scaled = np.tanh(arr / (np.std(arr) + 1e-9))
-        return (scaled * 3.0)
-    else:
-        # simple clipping
-        mx = np.nanmax(np.abs(arr)) if len(arr) > 0 else 1.0
-        mx = mx if mx != 0 else 1.0
-        return np.clip(arr / mx * 3.0, -3.0, 3.0)
-
-
-# --------------------
-# convenience top-level functions
-# --------------------
-def train_and_persist(storage: Optional[PostgresStorage], asset: str, interval: str, df_candles: pd.DataFrame, horizon: int = 60, model_type: str = "lgbm", save_to_storage: bool = True):
-    se = ScoreEngine(storage=storage)
-    return se.train_model(asset, interval, df_candles, horizon=horizon, model_type=model_type, save_to_storage=save_to_storage)
-
-
-def infer_and_persist(storage: Optional[PostgresStorage], asset: str, interval: str, df_candles: pd.DataFrame, model_path: Optional[str] = None, horizon: int = 60):
-    se = ScoreEngine(storage=storage)
-    return se.predict_and_persist(asset, interval, df_candles, model_path=model_path, horizon=horizon)
-
+# Export API
+__all__ = [
+    "features_from_candles",
+    "make_target",
+    "train_and_persist",
+    "infer_and_persist",
+]

@@ -1,811 +1,582 @@
 """
-dashboard/app_full.py
-=====================
+Dashboard completo y exhaustivo para Proyecto-Trading
+=================================
+Objetivo: exponer TODO lo que ofrece el proyecto desde la UI — sin "simplificar". Si el módulo
+central está implementado, cada botón / acción llamará a la función correspondiente.
 
-Single-file Streamlit dashboard "Trading Project" — todo-en-uno.
+Características incluidas:
+- Navegación por pestañas: Overview, Watchlist, Backfill, Scores, Assets, Models, Train/Infer, Backtest, IA, Settings, Logs
+- Gestión completa de watchlist: añadir, editar meta, eliminar, importar/exportar CSV, sincronizar con DB
+- Backfill: ver solicitudes pendientes, crear request (add_backfill_request), marcar processed (update_backfill_status), lanzar backfill inmediato (si existe init_and_backfill/orchestrator hook)
+- Scores & Indicators: ver últimos scores, listar históricos, expandir JSON, recalcular indicadores (si orchestrator.compute_indicators_for disponible)
+- Assets inspector: listar activos, ver intervals, cargar velas con parámetros (start/end/limit), mostrar chart de velas + indicadores (si hay funciones indicadoras en core.score)
+- Model registry: listar modelos, ver metadata, descargar ruta, eliminar (si se desea)
+- Entrenamiento IA: trigger a core.ai_train.train_ai_model (con opciones de hiperparams mínimas), ver progreso (spinner) y registro en storage.models
+- Inferencia: trigger a core.score.infer_and_persist para un asset/interval
+- Backtest: lanzar backtest sincronamente con core.backtest.run_backtest_for y mostrar métricas y equity curve
+- IA (OpenAI): sección opcional que llama a core.ai_interference if available; muestra fallbacks y plantilla de prompt
+- Health & Logs: checks de storage.health(), fetcher.now_ms() (si existe), ver últimos logs en /tmp/watchlist_logs
+- Settings: instrucciones para setear vars de entorno, botones para reinicializar DB (llama storage.init_db())
 
-Objetivo:
- - Dashboard profesional y robusto para gestionar la WATCHLIST, BACKFILL, SCORES y revisión de ASSETS.
- - Manejo de errores extenso: si la capa de storage no provee una función, el UI sigue funcionando y muestra mensajes claros.
- - Integraciones opcionales: AI (OpenAI) si se proporciona OPENAI_API_KEY en el entorno.
- - Funcionalidades:
-    * Añadir / eliminar símbolos en watchlist
-    * Filtrado flexible por cualquier columna / atributo
-    * Ordenación por cualquier columna
-    * Backfill (crear peticiones en DB) por selección o bulk
-    * Ver peticiones pendientes (y marcarlas processed)
-    * Explorar scores (filtrar por score, interval, model, asset)
-    * Visualizar candles (últimas N velas) y calcular Targets/Stops por ATR (14)
-    * Export CSV/download
-    * Simple password gate con DASHBOARD_PASSWORD (opcional)
- - Requisitos: streamlit, pandas, numpy. Recomendado: psycopg2 / storage_postgres en core.
+Principios de diseño:
+- Cada acción envuelve llamadas en try/except y muestra mensajes claros. No hay suposiciones: si una función falta, el botón mostrará instrucción y no romperá la app.
+- Uso intensivo de st.spinner y st.success/error para UX.
+- No se ejecuta trabajo en background automáticamente; el usuario debe pulsar botones para acciones que toman tiempo (backfill, train, backtest).
+- Mantener compatibilidad con la interfaz de PostgresStorage creada anteriormente.
+
+NOTA: este archivo es "granular": expone TODO. Si alguna función no existe en tu core, verás mensajes que te dicen qué añadir.
 
 Uso:
-  streamlit run dashboard/app_full.py
+    streamlit run dashboard/app_full.py
 
-Nota importante:
-  Este archivo pretende ser autónomo dentro de tu repo. Espera que exista un módulo core.storage_postgres
-  con una función make_storage_from_env() o al menos una clase PostgresStorage con métodos usados abajo.
-  Si tu storage tiene nombres distintos, el dashboard falla de forma controlada y te indicará qué método falta.
 """
-import logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
+from __future__ import annotations
 
 import os
-import traceback
 import json
-from typing import Any, Dict, List, Optional, Tuple, Callable
+import logging
+import tempfile
+from typing import Optional, Any, Dict, List, Tuple
 from datetime import datetime
+
 import streamlit as st
 import pandas as pd
-import numpy as np
-from dashboard.utils import load_assets_from_cache, load_user_watchlist_csv, save_user_watchlist_csv
 
-
-# Optional AI integration
-OPENAI_AVAILABLE = False
-if os.getenv("OPENAI_API_KEY"):
-    try:
-        import openai
-
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-        OPENAI_AVAILABLE = True
-    except Exception:
-        OPENAI_AVAILABLE = False
-
-# Attempt to import factory for storage
-make_storage_from_env = None
-PostgresStorage = None
-make_storage_from_env = None
-PostgresStorage = None
+# Intentar importar módulos core (cada import es opcional — el UI seguirá funcionando sin ellos)
+_core_imports = {}
 try:
-    from core.storage_postgres import make_storage_from_env, PostgresStorage  # type: ignore
-except Exception as e:
-    # mostrar la traza en Streamlit y en logs para depuración
-    import traceback, logging
-    logging.getLogger(__name__).exception("Error importando core.storage_postgres")
-    try:
-        import streamlit as st
-        st.error("Error importando core.storage_postgres. Mira el log para más detalles.")
-        st.exception(traceback.format_exc())
-    except Exception:
-        # si no funciona Streamlit (p.ej. en proceso worker), no rompemos el arranque
-        pass
-    make_storage_from_env = None
+    from core.storage_postgres import make_storage_from_env, PostgresStorage
+    _core_imports['storage'] = True
+except Exception:
     PostgresStorage = None
+    make_storage_from_env = None
+    _core_imports['storage'] = False
+
+try:
+    from core.orchestrator import Orchestrator
+    _core_imports['orchestrator'] = True
+except Exception:
+    Orchestrator = None
+    _core_imports['orchestrator'] = False
+
+try:
+    import core.fetch as fetch_module
+    _core_imports['fetch'] = True
+except Exception:
+    fetch_module = None
+    _core_imports['fetch'] = False
+
+try:
+    import core.ai_train as ai_train_module
+    _core_imports['ai_train'] = True
+except Exception:
+    ai_train_module = None
+    _core_imports['ai_train'] = False
+
+try:
+    import core.ai_interference as ai_interf_module
+    _core_imports['ai_interference'] = True
+except Exception:
+    ai_interf_module = None
+    _core_imports['ai_interference'] = False
+
+try:
+    import core.score as score_module
+    _core_imports['score'] = True
+except Exception:
+    score_module = None
+    _core_imports['score'] = False
+
+try:
+    import core.backtest as backtest_module
+    _core_imports['backtest'] = True
+except Exception:
+    backtest_module = None
+    _core_imports['backtest'] = False
+
+# logger
+logger = logging.getLogger('dashboard.app_full')
+logger.setLevel(os.getenv('LOG_LEVEL', 'INFO'))
+
+st.set_page_config(page_title='Trading Intelligence — Full Dashboard', layout='wide')
 
 # ---------------------------
-# Utility wrappers & helpers
+# Helpers: storage factory
 # ---------------------------
-
-def safe_call(storage: Any, fn_name: str, *args, default=None, **kwargs):
-    """
-    Llamada segura a métodos de storage. Si no existe o lanza excepción, devuelve default.
-    Además retorna (ok, result, error) tuple when verbose needed.
-    """
+@st.cache_resource
+def get_storage() -> Optional[PostgresStorage]:
+    if make_storage_from_env is None:
+        st.warning('Fábrica de storage no disponible (make_storage_from_env). Algunas funciones estarán deshabilitadas.')
+        return None
     try:
-        if storage is None:
-            return default
-        fn = getattr(storage, fn_name, None)
-        if not fn:
-            return default
-        return fn(*args, **kwargs)
-    except Exception as e:
-        # Log to Streamlit if in UI context, otherwise ignore
+        s = make_storage_from_env()
         try:
-            st.error(f"Error calling storage.{fn_name}: {e}")
+            s.init_db()
         except Exception:
-            pass
-        return default
-
-
-def make_storage():
-    """
-    Intenta crear storage en varios modos:
-      1) make_storage_from_env() si existe
-      2) PostgresStorage() desde env vars (si clase exportada)
-      3) raise RuntimeError con mensaje útil
-    """
-    # 1) factory
-    if make_storage_from_env is not None:
-        try:
-            s = make_storage_from_env()
-            return s
-        except Exception as e:
-            # Dejar que fallback intente
-            st.warning(f"make_storage_from_env() falló: {e}")
-    # 2) direct class
-    if PostgresStorage is not None:
-        try:
-            # Intentar constructor sin args — PostgresStorage debe leer env
-            s = PostgresStorage()
-            return s
-        except Exception as e:
-            st.warning(f"PostgresStorage() fallo: {e}")
-    # 3) no storage posible
-    raise RuntimeError(
-        "No se pudo crear storage automáticamente. Asegúrate de que `core.storage_postgres` exporta "
-        "make_storage_from_env() o PostgresStorage y que DATABASE_URL está configurada."
-    )
-
-
-def df_from_list_of_dicts(maybe_list) -> pd.DataFrame:
-    if maybe_list is None:
-        return pd.DataFrame()
-    if isinstance(maybe_list, pd.DataFrame):
-        return maybe_list
-    try:
-        return pd.DataFrame(maybe_list)
-    except Exception:
-        return pd.DataFrame()
-
-
-def safe_to_csv_download(df: pd.DataFrame, filename: str):
-    """Return (label, data) for st.download_button usage"""
-    try:
-        csv = df.to_csv(index=False)
-        return csv
-    except Exception:
-        return df.to_json(orient="records")
-
-
-def calculate_atr_from_df(df_candles: pd.DataFrame, period: int = 14) -> Optional[float]:
-    """
-    Calcula ATR simple (True Range rolling mean).
-    df_candles must tener columnas: high, low, close (puede usar floats/strings).
-    Devuelve ATR del último punto o None.
-    """
-    try:
-        df = df_candles.copy()
-        df["high"] = pd.to_numeric(df["high"], errors="coerce")
-        df["low"] = pd.to_numeric(df["low"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df = df.dropna(subset=["high", "low", "close"])
-        if df.empty:
-            return None
-        high = df["high"]
-        low = df["low"]
-        close = df["close"]
-        tr1 = (high - low).abs()
-        tr2 = (high - close.shift(1)).abs()
-        tr3 = (low - close.shift(1)).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(period, min_periods=1).mean().iloc[-1]
-        return float(atr)
-    except Exception:
+            logger.exception('init_db fallo (continuando)')
+        return s
+    except Exception as e:
+        logger.exception('No se pudo crear storage: %s', e)
+        st.error(f'No se pudo conectar a la DB: {e}')
         return None
 
-
-# ---------------------------
-# Streamlit app layout start
-# ---------------------------
-st.set_page_config(page_title="Trading Project", layout="wide")
-st.title("Trading Project — Dashboard")
-
-# Authentication simple
-PASSWORD = os.getenv("DASHBOARD_PASSWORD") or None
-if PASSWORD:
-    if "auth_ok" not in st.session_state:
-        st.session_state.auth_ok = False
-    if not st.session_state.auth_ok:
-        st.write("### Introduce la contraseña para acceder al dashboard")
-        pwd = st.text_input("Contraseña", type="password")
-        if st.button("Entrar"):
-            if pwd == PASSWORD:
-                st.session_state.auth_ok = True
-                st.rerun()
-            else:
-                st.error("Contraseña incorrecta")
-        st.stop()
-
-# Create / cache storage
 @st.cache_resource
-def get_storage_cached():
+def get_orchestrator(storage: Optional[PostgresStorage]) -> Optional[Orchestrator]:
+    if Orchestrator is None:
+        return None
     try:
-        return make_storage()
-    except Exception as e:
-        # we want a clear message in UI, but propagate for pages to handle
-        raise
-
-try:
-    storage = get_storage_cached()
-except Exception as e:
-    st.error(f"No se pudo inicializar el storage: {e}")
-    st.stop()
-
-# Sidebar navigation and global controls
-with st.sidebar:
-    st.header("Navegación")
-    page = st.radio("Ir a:", ["Watchlist", "Backfill Requests", "Scores Explorer", "Asset Viewer", "Health & Logs"])
-    st.markdown("---")
-    st.write("Acciones globales")
-    if st.button("Forzar refresco (UI)"):
-        st.rerun()
-    if OPENAI_AVAILABLE:
-        st.info("AI disponible: OpenAI API key detectada.")
-    else:
-        st.caption("AI deshabilitada (poner OPENAI_API_KEY para activar)")
-
-# -------------
-# Page: Watchlist
-# -------------
-def page_watchlist(storage):
-    st.header("Watchlist — Gestión avanzada")
-
-    # Left column: add symbol
-    left, right = st.columns([1, 2])
-    with left:
-        st.subheader("Añadir / Editar símbolo")
-        with st.form("add_symbol", clear_on_submit=True):
-            asset = st.text_input("Símbolo (ej. BTCUSDT)").strip().upper()
-            asset_type = st.selectbox("Tipo", ["crypto", "stock", "forex", "other"], index=0)
-            interval = st.text_input("Intervalo (ej. 1h, 15m)", value="1h")
-            added_by = st.text_input("Añadido por", value="dashboard")
-            metadata_text = st.text_area("Metadata JSON (opcional)", value="{}")
-            try:
-                metadata = json.loads(metadata_text) if metadata_text.strip() else {}
-            except Exception as e:
-                st.warning("Metadata no es JSON válido — se usará {}")
-                metadata = {}
-            submitted = st.form_submit_button("Guardar en Watchlist")
-            if submitted:
-                if not asset:
-                    st.error("El símbolo no puede estar vacío")
-                else:
-                    try:
-                        res = safe_call(storage, "add_watchlist_symbol", asset, asset_type, interval, added_by, metadata, default=None)
-                        if res is None:
-                            # Try with named args (compatibility)
-                            res = safe_call(storage, "add_watchlist_symbol", asset=asset, asset_type=asset_type, interval=interval, added_by=added_by, metadata=metadata, default=None)
-                        if res is None:
-                            st.error("Storage no implementa add_watchlist_symbol() o falló. Revisa logs.")
-                        else:
-                            st.success(f"{asset} añadido/actualizado en watchlist.")
-                            st.rerun()
-                    except Exception as e:
-                        st.exception(e)
-                        
-    # -----------------------------
-    # Catálogo desde CSV (data/cache) y añadir seleccionados
-    # -----------------------------
-    st.markdown("---")
-    st.subheader("Añadir desde catálogo CSV (data/cache)")
-    try:
-        assets_df = load_assets_from_cache()
+        return Orchestrator(storage)
     except Exception:
-        assets_df = None
-    
-    if assets_df is None or assets_df.empty:
-        st.info("No se han encontrado CSV en data/cache/ — si tienes candles en disco, revisa su ruta.")
-        assets_list = []
-    else:
-        st.write(f"{len(assets_df)} activos detectados en data/cache")
-        tipo_sel = st.selectbox("Tipo", options=["all", "crypto", "stock", "other"], index=0)
-        if tipo_sel != "all":
-            shown_df = assets_df[assets_df["asset_type"] == tipo_sel]
-        else:
-            shown_df = assets_df
-        assets_list = shown_df["asset"].astype(str).tolist()
-        selected_assets = st.multiselect("Selecciona activos para añadir a tu watchlist", options=assets_list, default=[])
-    
-    if st.button("Añadir seleccionados"):
-        if not assets_list or not selected_assets:
-            st.warning("Selecciona primero los activos que quieres añadir.")
-        else:
-            user_id = st.session_state.get("user_id", "default")
-            successes, failures = [], []
-            for a in selected_assets:
-                # Intentar añadir vía storage si está disponible
-                res = safe_call(storage, "add_watchlist_symbol", a, "auto", "1h", "dashboard", default=None) \
-                      or safe_call(storage, "add_watchlist_symbol", asset=a, asset_type="auto", interval="1h", added_by="dashboard", default=None)
-                if res is None:
-                    # Fallback CSV
-                    try:
-                        existing = [r["asset"] for r in load_user_watchlist_csv(user_id)]
-                        new_set = sorted(set(existing) | set([a.upper()]))
-                        save_user_watchlist_csv(new_set, user_id=user_id)
-                        successes.append(a)
-                    except Exception as e:
-                        failures.append((a, str(e)))
-                else:
-                    successes.append(a)
-            if successes:
-                st.success(f"Añadidos: {', '.join(successes)}")
-                st.experimental_rerun()
-            if failures:
-                st.error(f"Fallos: {failures}")
+        logger.exception('No se pudo crear orchestrator')
+        return None
 
-    with right:
-        st.subheader("Watchlist — Tabla y filtros")
+# ---------------------------
+# UI small components
+# ---------------------------
 
-        # Load watchlist (try get_watchlist or list_watchlist)
-        # Load watchlist (DB storage first, then CSV fallback)
-    raw_wl = safe_call(storage, "get_watchlist", default=None) or safe_call(storage, "list_watchlist", default=None)
-    if not raw_wl:
-        user_id = st.session_state.get("user_id", "default")
-        try:
-            raw_wl = load_user_watchlist_csv(user_id)
-        except Exception:
-            raw_wl = None
-    
-    df = df_from_list_of_dicts(raw_wl)
-    if df.empty:
-        st.info("La watchlist está vacía. Añade símbolos desde el catálogo a la izquierda o usa la UI para crear tu selección personal.")
-        return
+def download_df_as_csv(df: pd.DataFrame, filename: str = 'export.csv'):
+    return df.to_csv(index=False).encode('utf-8')
 
-        # Ensure consistent columns
-        if "asset" not in df.columns and "symbol" in df.columns:
-            df = df.rename(columns={"symbol": "asset"})
-        if "created_at" in df.columns:
-            # normalize ts
+# JSON prettifier
+def pretty_json(j):
+    try:
+        return json.dumps(j, indent=2, ensure_ascii=False)
+    except Exception:
+        return str(j)
+
+# ---------------------------
+# Tabs
+# ---------------------------
+
+def overview_tab(storage: Optional[PostgresStorage]):
+    st.title('Overview')
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.subheader('Storage')
+        st.write('Disponible' if storage else 'NO disponible')
+        if storage:
             try:
-                df["created_at"] = pd.to_datetime(df["created_at"])
-            except Exception:
-                pass
-
-        # Optional: attach latest score if storage supports load_latest_scores or load_scores
-        scores_attached = False
-        try:
-            # Try storage.load_latest_scores() returning a dataframe/list/dict
-            df_scores = safe_call(storage, "load_latest_scores", default=None)
-            if df_scores is None:
-                df_scores = safe_call(storage, "load_scores", default=None)
-            if df_scores is not None:
-                df_scores = df_from_list_of_dicts(df_scores)
-                if not df_scores.empty and "asset" in df_scores.columns:
-                    # We expect df_scores to have asset and score (or JSON score)
-                    if "score" in df_scores.columns and df_scores["score"].apply(lambda s: isinstance(s, (int, float))).any():
-                        # prefer numeric score
-                        score_col = "score"
-                    else:
-                        # try to extract numeric from JSON-like
-                        df_scores["score_extracted"] = df_scores["score"].apply(lambda s: (s.get("score") if isinstance(s, dict) and "score" in s else np.nan))
-                        score_col = "score_extracted"
-                    # Merge by asset, keep last
-                    df_scores = df_scores.sort_values(by=["asset"]).drop_duplicates(subset=["asset"], keep="last")
-                    df = df.merge(df_scores[["asset", score_col]], on="asset", how="left")
-                    df = df.rename(columns={score_col: "score"})
-                    scores_attached = True
-        except Exception:
-            scores_attached = False
-
-        # Filters UI (dynamic)
-        st.markdown("**Filtros**")
-        c1, c2, c3, c4 = st.columns([2,2,1,1])
-        with c1:
-            search = st.text_input("Buscar (asset / tipo / metadata)", value="").strip().upper()
-        with c2:
-            interval_filter = st.text_input("Intervalo (ej. 1h) — vacío = todos", value="").strip()
-        with c3:
-            min_score = st.number_input("Score mínimo (si disponible)", value=float(0.0))
-        with c4:
-            col_options = list(df.columns)
-            order_by = st.selectbox("Ordenar por", options=col_options, index=0)
-            asc = st.checkbox("Ascendente", value=False)
-
-        # Apply filters
-        df_filtered = df.copy()
-        if search:
-            def row_matches_search(r):
-                s = str(r.get("asset", "")).upper()
-                if search in s:
-                    return True
-                t = str(r.get("asset_type", "")).upper()
-                if search in t:
-                    return True
+                h = storage.health()
+                st.json(h)
+            except Exception as e:
+                st.error(f'Health check fallo: {e}')
+    with col2:
+        st.subheader('Core modules')
+        st.write({k: v for k, v in _core_imports.items()})
+    with col3:
+        st.subheader('Quick actions')
+        if st.button('Reinicializar DB (init_db)'):
+            if storage:
                 try:
-                    meta = r.get("metadata", "")
-                    if isinstance(meta, dict):
-                        if search in json.dumps(meta).upper():
-                            return True
-                    elif search in str(meta).upper():
-                        return True
-                except Exception:
-                    pass
-                return False
-            df_filtered = df_filtered[df_filtered.apply(row_matches_search, axis=1)]
-        if interval_filter:
-            df_filtered = df_filtered[df_filtered["interval"].astype(str).str.contains(interval_filter, na=False)]
-        if scores_attached and "score" in df_filtered.columns:
-            df_filtered["score_num"] = pd.to_numeric(df_filtered["score"], errors="coerce").fillna(0.0)
-            df_filtered = df_filtered[df_filtered["score_num"] >= float(min_score)]
-
-        # Ordering
-        if order_by in df_filtered.columns:
-            try:
-                df_filtered = df_filtered.sort_values(by=order_by, ascending=asc)
-            except Exception:
-                df_filtered = df_filtered.sort_values(by=order_by, ascending=asc, key=lambda s: s.astype(str))
-
-        st.write(f"Mostrando {len(df_filtered)} símbolos")
-        # Multi-select assets for actions
-        assets_list = list(df_filtered["asset"].astype(str).tolist())
-        selected = st.multiselect("Selecciona símbolos para acciones", options=assets_list)
-
-        # Data display (use data_editor if available)
-        try:
-            st.dataframe(df_filtered.reset_index(drop=True))
-        except Exception:
-            st.write(df_filtered)
-
-        # Action buttons
-        a1, a2, a3, a4 = st.columns(4)
-        with a1:
-            if st.button("Eliminar seleccionados"):
-                if not selected:
-                    st.warning("Selecciona al menos un símbolo primero.")
-                else:
-                    deleted = 0
-                    for sym in selected:
-                        ok = safe_call(storage, "remove_watchlist_symbol", sym, default=False)
-                        if ok:
-                            deleted += 1
-                    st.success(f"Eliminados: {deleted}")
-                    st.rerun()
-        with a2:
-            if st.button("Pedir backfill (seleccionados)"):
-                if not selected:
-                    st.warning("Selecciona al menos un símbolo.")
-                else:
-                    created = 0
-                    for sym in selected:
-                        try:
-                            # get interval from df
-                            row = df_filtered[df_filtered["asset"] == sym].iloc[0]
-                            interval = row.get("interval") or "1h"
-                        except Exception:
-                            interval = "1h"
-                        res = safe_call(storage, "add_backfill_request", sym, interval, "dashboard_manual", {}, default=None)
-                        if res is None:
-                            # try named args
-                            res = safe_call(storage, "add_backfill_request", asset=sym, interval=interval, requested_by="dashboard_manual", params={}, default=None)
-                        if res:
-                            created += 1
-                    st.success(f"Peticiones creadas: {created}")
-        with a3:
-            if st.button("Pedir backfill (todos filtrados)"):
-                created = 0
-                for _, r in df_filtered.iterrows():
-                    sym = r.get("asset")
-                    interval = r.get("interval") or "1h"
-                    res = safe_call(storage, "add_backfill_request", sym, interval, "dashboard_bulk", {}, default=None)
-                    if res:
-                        created += 1
-                st.success(f"Peticiones creadas: {created}")
-        with a4:
-            if st.button("Exportar filtrado (CSV)"):
-                csv = safe_to_csv_download(df_filtered)
-                st.download_button("Descargar CSV", csv, file_name=f"watchlist_filtered_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
-
-        # Detail & ATR suggestions
-        st.markdown("---")
-        st.subheader("Detalle y sugerencias (Targets / Stops por ATR)")
-        if selected:
-            sel = selected[0]
-            st.write(f"Detalle: **{sel}**")
-            try:
-                row = df_filtered[df_filtered["asset"] == sel].iloc[0].to_dict()
-                st.json(row)
-            except Exception:
-                st.write("No se pudo mostrar detalle del registro.")
-
-            # Show recent candles if available and compute ATR
-            if hasattr(storage, "load_candles"):
-                interval_for_sel = row.get("interval") or "1h"
-                st.write(f"Cargando velas para {sel} ({interval_for_sel}) — si están disponibles en storage")
-                try:
-                    df_c = safe_call(storage, "load_candles", sel, interval_for_sel, None, None, default=None)
-                    df_c = df_from_list_of_dicts(df_c)
-                    if df_c is None or df_c.empty:
-                        st.info("No hay velas históricas disponibles en storage para este asset/interval.")
-                    else:
-                        # Normalize
-                        if "ts" in df_c.columns:
-                            try:
-                                df_c["timestamp"] = pd.to_datetime(df_c["ts"], unit="s")
-                            except Exception:
-                                pass
-                        st.write("Últimas 200 velas (si hay):")
-                        st.dataframe(df_c.tail(200).reset_index(drop=True))
-                        atr = calculate_atr_from_df(df_c, period=14)
-                        try:
-                            last_close = float(df_c.sort_values("ts").iloc[-1]["close"])
-                        except Exception:
-                            last_close = None
-                        if atr is not None and last_close is not None:
-                            k = st.number_input("Multiplicador ATR (k)", value=1.5, step=0.1)
-                            suggested_stop = last_close - k * atr
-                            suggested_target = last_close + k * atr
-                            st.metric("Último cierre", f"{last_close:.6f}")
-                            st.metric("ATR(14)", f"{atr:.6f}")
-                            st.metric("Sugerencia Stop", f"{suggested_stop:.6f}")
-                            st.metric("Sugerencia Target", f"{suggested_target:.6f}")
-                            if st.button("Guardar target/stop en metadata"):
-                                try:
-                                    meta = row.get("metadata") or {}
-                                    if isinstance(meta, str):
-                                        try:
-                                            meta = json.loads(meta)
-                                        except Exception:
-                                            meta = {}
-                                    meta.update({
-                                        "suggested_stop": float(suggested_stop),
-                                        "suggested_target": float(suggested_target),
-                                        "atr": float(atr),
-                                        "atr_k": float(k),
-                                        "saved_at": datetime.utcnow().isoformat()
-                                    })
-                                    res = safe_call(storage, "add_watchlist_symbol", sel, row.get("asset_type"), row.get("interval"), "dashboard_targets", meta, default=None)
-                                    if res is None:
-                                        # fallback named
-                                        res = safe_call(storage, "add_watchlist_symbol", asset=sel, asset_type=row.get("asset_type"), interval=row.get("interval"), added_by="dashboard_targets", metadata=meta, default=None)
-                                    if res:
-                                        st.success("Target/stop guardados en metadata de watchlist.")
-                                    else:
-                                        st.error("No se pudo guardar metadata: storage no implementa add_watchlist_symbol correctamente.")
-                                except Exception as e:
-                                    st.exception(e)
-                        else:
-                            st.info("No se pudo calcular ATR/último cierre con los datos disponibles.")
+                    storage.init_db()
+                    st.success('DB inicializada (init_db)')
                 except Exception as e:
-                    st.exception(e)
+                    st.error(f'init_db falló: {e}')
             else:
-                st.info("Storage no implementa load_candles(). No es posible calcular targets/stops automáticamente.")
+                st.error('Storage no disponible')
 
-        else:
-            st.info("Selecciona un símbolo (de la lista) para ver detalle y sugerencias ATR.")
 
-# -------------
-# Page: Backfill Requests
-# -------------
-def page_backfill_requests(storage):
-    st.header("Backfill Requests — Cola y acciones")
-    try:
-        reqs = safe_call(storage, "fetch_pending_backfill_requests", 500, default=[])
-        df_reqs = df_from_list_of_dicts(reqs)
-        if df_reqs.empty:
-            st.info("No hay peticiones pendientes.")
-            return
-        st.write(f"Peticiones pendientes: {len(df_reqs)}")
-        st.dataframe(df_reqs)
-
-        # Select some requests
-        sel_ids = st.multiselect("Selecciona peticiones (id) para acciones", options=list(df_reqs["id"].tolist()))
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("Marcar seleccionadas como processed"):
-                if not sel_ids:
-                    st.warning("Selecciona al menos una petición.")
-                else:
-                    updated = 0
-                    for rid in sel_ids:
-                        ok = safe_call(storage, "update_backfill_request_status", rid, "processed", default=False)
-                        if ok:
-                            updated += 1
-                    st.success(f"Actualizadas: {updated}")
-                    st.rerun()
-        with col2:
-            if st.button("Reintentar seleccionadas (recrear request)"):
-                recreated = 0
-                for rid in sel_ids:
-                    try:
-                        row = df_reqs[df_reqs["id"] == rid].iloc[0]
-                        asset = row.get("asset")
-                        interval = row.get("interval") or "1h"
-                        res = safe_call(storage, "add_backfill_request", asset, interval, "dashboard_retry", {}, default=None)
-                        if res:
-                            recreated += 1
-                    except Exception:
-                        pass
-                st.success(f"Recreadas: {recreated}")
-        with col3:
-            if st.button("Exportar lista CSV"):
-                csv = safe_to_csv_download(df_reqs)
-                st.download_button("Descargar CSV", csv, file_name=f"backfill_requests_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
-
-    except Exception as e:
-        st.exception(e)
-
-# -------------
-# Page: Scores Explorer
-# -------------
-def page_scores_explorer(storage):
-    st.header("Scores Explorer — filtra, ordena, exporta")
-
-    # Try various methods to obtain scores
-    df_scores = None
-    try:
-        df_scores = safe_call(storage, "load_scores", default=None)
-        if df_scores is None:
-            df_scores = safe_call(storage, "load_latest_scores", default=None)
-    except Exception:
-        df_scores = None
-
-    df_scores = df_from_list_of_dicts(df_scores)
-    if df_scores.empty:
-        st.info("No se pudieron cargar scores desde storage. Asegúrate de que storage implementa load_scores().")
-        return
-
-    # Normalize common columns
-    if "ts" in df_scores.columns:
-        try:
-            df_scores["timestamp"] = pd.to_datetime(df_scores["ts"], unit="s")
-        except Exception:
+def watchlist_tab(storage: Optional[PostgresStorage]):
+    st.title('Watchlist')
+    st.markdown('Gestiona la watchlist: añadir, editar meta, eliminar, importar/exportar CSV')
+    col1, col2 = st.columns([2,1])
+    with col1:
+        if storage:
             try:
-                df_scores["timestamp"] = pd.to_datetime(df_scores["ts"])
-            except Exception:
-                pass
-
-    st.write(f"Records: {len(df_scores)}")
-    # Filters
-    c1, c2, c3, c4 = st.columns([2,2,1,1])
-    with c1:
-        asset_q = st.text_input("Asset contains")
-    with c2:
-        interval_q = st.text_input("Interval equals")
-    with c3:
-        model_q = st.text_input("Model id equals")
-    with c4:
-        min_score = st.number_input("Score >= (if numeric)", value=0.0)
-
-    df_filtered = df_scores.copy()
-    if asset_q:
-        if "asset" in df_filtered.columns:
-            df_filtered = df_filtered[df_filtered["asset"].astype(str).str.contains(asset_q, case=False)]
-    if interval_q and "interval" in df_filtered.columns:
-        df_filtered = df_filtered[df_filtered["interval"] == interval_q]
-    if model_q and "model_id" in df_filtered.columns:
-        df_filtered = df_filtered[df_filtered["model_id"].astype(str) == model_q]
-    if "score" in df_filtered.columns:
-        try:
-            df_filtered["score_num"] = pd.to_numeric(df_filtered["score"], errors="coerce").fillna(0.0)
-            df_filtered = df_filtered[df_filtered["score_num"] >= float(min_score)]
-        except Exception:
-            pass
-
-    st.dataframe(df_filtered)
-    if st.button("Exportar Scores CSV"):
-        csv = safe_to_csv_download(df_filtered)
-        st.download_button("Descargar CSV", csv, file_name=f"scores_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
-
-# -------------
-# Page: Asset Viewer
-# -------------
-def page_asset_viewer(storage):
-    st.header("Asset Viewer — ver velas y pistas")
-    # Choose asset from watchlist if available
-    raw_wl = safe_call(storage, "get_watchlist", default=None) or safe_call(storage, "list_watchlist", default=None)
-    df_wl = df_from_list_of_dicts(raw_wl)
-    assets = []
-    if not df_wl.empty and "asset" in df_wl.columns:
-        assets = df_wl["asset"].astype(str).tolist()
-
-    asset = st.selectbox("Selecciona asset", options=([""] + assets))
-    interval = st.selectbox("Intervalo", options=["1m", "5m", "15m", "1h", "4h", "1d"], index=3)
-    n_candles = st.number_input("Velas a mostrar", min_value=10, max_value=10000, value=500, step=10)
-
-    if not asset:
-        st.info("Selecciona un asset para ver velas.")
-        return
-
-    if not hasattr(storage, "load_candles"):
-        st.error("Storage no implementa load_candles(asset, interval, start_ts, end_ts).")
-        return
-
-    try:
-        df_c = safe_call(storage, "load_candles", asset, interval, None, None, default=None)
-        df_c = df_from_list_of_dicts(df_c)
-        if df_c.empty:
-            st.info("No hay velas disponibles en storage para este asset/interval.")
-            return
-        # Try to normalize
-        if "ts" in df_c.columns:
-            try:
-                df_c["timestamp"] = pd.to_datetime(df_c["ts"], unit="s")
-            except Exception:
-                try:
-                    df_c["timestamp"] = pd.to_datetime(df_c["ts"])
-                except Exception:
-                    pass
-        df_small = df_c.sort_values("ts").tail(int(n_candles)).reset_index(drop=True)
-        st.line_chart(df_small.set_index("timestamp")["close"])
-        st.dataframe(df_small.tail(200))
-    except Exception as e:
-        st.exception(e)
-
-# -------------
-# Page: Health & Logs
-# -------------
-def page_health_logs(storage):
-    st.header("Health & Logs")
-    st.write("Estado del storage / Base de datos")
-
-    try:
-        health = safe_call(storage, "health", default=None)
-        if health is None:
-            st.warning("Storage no implementa health(). Intentando operación simple...")
-            # Try a simple action: fetch one watchlist row via get_watchlist
-            try:
-                wl = safe_call(storage, "get_watchlist", default=None) or safe_call(storage, "list_watchlist", default=None)
-                if wl is None:
-                    st.error("No fue posible realizar operaciones básicas con el storage.")
-                else:
-                    st.success("Storage responde (get_watchlist ok).")
-                    st.write(f"Watchlist length (sample): {len(wl)}")
+                wl = storage.list_watchlist()
             except Exception as e:
-                st.exception(e)
+                logger.exception('list_watchlist')
+                wl = []
         else:
-            st.json(health)
-    except Exception as e:
-        st.exception(e)
+            wl = []
+        df = pd.DataFrame(wl) if wl else pd.DataFrame(columns=['asset','meta'])
+        st.dataframe(df)
+        # export
+        if not df.empty:
+            csv = download_df_as_csv(df)
+            st.download_button('Exportar watchlist CSV', csv, file_name='watchlist.csv')
+    with col2:
+        st.subheader('Añadir / Editar')
+        with st.form('add_watchlist'):
+            asset = st.text_input('Asset (símbolo)')
+            asset_type = st.selectbox('Tipo', ['crypto','stock','other'])
+            added_by = st.text_input('Added by', value=os.getenv('USER','dashboard'))
+            submit = st.form_submit_button('Añadir a watchlist')
+            if submit:
+                if not asset:
+                    st.error('Especifica un asset')
+                elif not storage:
+                    st.error('Storage no disponible')
+                else:
+                    try:
+                        res = storage.add_watchlist_symbol(asset.strip(), asset_type, added_by)
+                        st.success(f"Añadido: {res.get('asset')}")
+                    except Exception as e:
+                        st.error(f'Error añadiendo: {e}')
+        st.markdown('---')
+        st.subheader('Importar watchlist (CSV)')
+        up = st.file_uploader('Sube CSV con columna `asset`', type=['csv'])
+        if up:
+            try:
+                df_in = pd.read_csv(up)
+                if 'asset' not in df_in.columns:
+                    st.error('CSV debe tener columna asset')
+                else:
+                    added = []
+                    failed = []
+                    for a in df_in['asset'].dropna().astype(str).str.strip().unique():
+                        try:
+                            storage.add_watchlist_symbol(a, 'import', os.getenv('USER','csv'))
+                            added.append(a)
+                        except Exception as e:
+                            failed.append((a,str(e)))
+                    st.success(f'Añadidos: {len(added)}. Fallos: {len(failed)}')
+            except Exception as e:
+                st.error(f'Error leyendo CSV: {e}')
 
-    st.markdown("---")
-    st.write("Acciones administrativas rápidas")
+
+def backfill_tab(storage: Optional[PostgresStorage], orchestrator: Optional[Orchestrator]):
+    st.title('Backfill')
+    st.markdown('Gestiona solicitudes de backfill y ejecuta backfills manuales')
+    col1, col2 = st.columns([2,1])
+    with col1:
+        st.subheader('Solicitudes pendientes (tabla backfill_status)')
+        try:
+            if storage:
+                # cargar toda la tabla backfill_status: no API directa; usar list_assets + get_backfill_status por asset
+                assets = storage.list_watchlist() if hasattr(storage, 'list_watchlist') else []
+                rows = []
+                # if backfill_status table exists, try to query a simple helper method; else iterate
+                try:
+                    # if storage has method to fetch all backfill statuses, use it
+                    if hasattr(storage, 'get_all_backfill_status'):
+                        rows = storage.get_all_backfill_status()
+                    else:
+                        # fallback: iterate known assets and call get_backfill_status
+                        for a in storage.list_watchlist():
+                            asset = a.get('asset')
+                            stat = storage.get_backfill_status(asset)
+                            if stat:
+                                rows.append(stat)
+                except Exception:
+                    logger.exception('get backfill status loop')
+                df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=['asset','interval','last_ts','updated_at'])
+                st.dataframe(df)
+            else:
+                st.info('Storage no disponible')
+        except Exception as e:
+            st.error(f'Error mostrando backfill_status: {e}')
+    with col2:
+        st.subheader('Pedir un backfill')
+        with st.form('req_backfill'):
+            asset = st.text_input('Asset')
+            interval = st.text_input('Interval (e.g. 5m,1h)')
+            requester = st.text_input('Requested by', value=os.getenv('USER','dashboard'))
+            submit = st.form_submit_button('Crear request')
+            if submit:
+                if not asset or not interval:
+                    st.error('Completa asset y interval')
+                elif not storage:
+                    st.error('Storage no disponible')
+                else:
+                    try:
+                        res = storage.add_backfill_request(asset.strip(), interval.strip(), requested_by=requester)
+                        st.success(f'Request creado para {asset} {interval}')
+                    except Exception as e:
+                        st.error(f'Error creando request: {e}')
+        st.markdown('---')
+        st.subheader('Backfill inmediato (intento síncrono)')
+        asset2 = st.text_input('Asset para backfill inmediato')
+        interval2 = st.text_input('Interval para backfill inmediato')
+        if st.button('Ejecutar backfill ahora'):
+            if not orchestrator:
+                st.error('Orchestrator no disponible — no se puede ejecutar backfill programado desde UI')
+            elif not asset2 or not interval2:
+                st.error('Completa asset y interval')
+            else:
+                try:
+                    with st.spinner('Ejecutando backfill...'): 
+                        # El orchestrator puede exponer init_and_backfill o run_backfill_for
+                        if hasattr(orchestrator, 'run_backfill_for'):
+                            orchestrator.run_backfill_for(asset2.strip(), interval2.strip())
+                        elif hasattr(orchestrator, 'compute_indicators_for'):
+                            # fallback: compute indicators as proxy for fetching
+                            orchestrator.compute_indicators_for(asset2.strip(), interval2.strip(), lookback=1000)
+                        else:
+                            raise RuntimeError('Orchestrator no expone run_backfill_for ni compute_indicators_for')
+                    st.success('Backfill completado (o iniciado)')
+                except Exception as e:
+                    st.error(f'Backfill falló: {e}')
+
+
+def scores_tab(storage: Optional[PostgresStorage]):
+    st.title('Scores & Indicators')
+    col1, col2 = st.columns([1,2])
+    with col1:
+        st.subheader('Últimos scores por asset')
+        n = st.number_input('Últimos por asset', min_value=1, max_value=10, value=1)
+        if st.button('Cargar últimos scores'):
+            if not storage:
+                st.error('Storage no disponible')
+            else:
+                try:
+                    df = storage.load_latest_scores(limit_per_asset=int(n))
+                    if df.empty:
+                        st.info('No hay scores')
+                    else:
+                        st.dataframe(df)
+                except Exception as e:
+                    st.error(f'Error cargando scores: {e}')
+    with col2:
+        st.subheader('Inferencia (ejecutar modelo y persistir scores)')
+        asset = st.text_input('Asset para inferir')
+        interval = st.text_input('Interval')
+        if st.button('Ejecutar inferencia (infer_and_persist)'):
+            if not storage:
+                st.error('Storage no disponible')
+            elif not asset or not interval:
+                st.error('Rellena asset/interval')
+            else:
+                if score_module and hasattr(score_module, 'infer_and_persist'):
+                    try:
+                        with st.spinner('Ejecutando inferencia...'):
+                            score_module.infer_and_persist(storage, asset.strip(), interval.strip(), model_name=None)
+                        st.success('Inferencia ejecutada y guardada en scores')
+                    except Exception as e:
+                        st.error(f'Inferencia fallo: {e}')
+                else:
+                    st.error('Modulo score/infer_and_persist no disponible — implementa core.score.infer_and_persist')
+
+
+def assets_tab(storage: Optional[PostgresStorage]):
+    st.title('Assets Inspector')
+    try:
+        assets = storage.list_assets() if storage else []
+    except Exception:
+        assets = []
+    asset = st.selectbox('Asset', options=[''] + sorted(assets))
+    if not asset:
+        return
+    intervals = storage.list_intervals_for_asset(asset) if storage else []
+    interval = st.selectbox('Interval', options=[''] + intervals)
+    start = st.text_input('start ts (ms, optional)')
+    end = st.text_input('end ts (ms, optional)')
+    limit = st.number_input('limit', min_value=1, max_value=5000, value=500)
+    if st.button('Cargar velas'):
+        if not storage:
+            st.error('Storage no disponible')
+        elif not interval:
+            st.error('Selecciona interval')
+        else:
+            try:
+                s = int(start) if start else None
+                e = int(end) if end else None
+                df = storage.load_candles(asset, interval, start_ts=s, end_ts=e, limit=limit)
+                if df.empty:
+                    st.info('No hay velas')
+                else:
+                    st.line_chart(df.set_index('ts')['close'])
+                    st.dataframe(df.tail(500))
+                    # si core.score tiene funciones de indicadores, mostrar ejemplo
+                    if score_module and hasattr(score_module, 'features_from_candles'):
+                        try:
+                            feats = score_module.features_from_candles(df)
+                            st.subheader('Features sample')
+                            st.dataframe(feats.tail(50))
+                        except Exception:
+                            logger.exception('features_from_candles')
+            except Exception as e:
+                st.error(f'Error cargando velas: {e}')
+
+
+def models_tab(storage: Optional[PostgresStorage]):
+    st.title('Models Registry')
+    st.markdown('Lista y gestión de modelos guardados en storage.models')
+    asset = st.text_input('Asset (opcional)')
+    interval = st.text_input('Interval (opcional)')
+    if st.button('Listar modelos'):
+        if not storage:
+            st.error('Storage no disponible')
+        else:
+            rows = []
+            try:
+                if asset and interval:
+                    rows = storage.list_models_for_asset_interval(asset.strip(), interval.strip())
+                else:
+                    # intentar listar todos — si no hay helper, leer por asset known
+                    if hasattr(storage, 'list_models'):
+                        rows = storage.list_models()
+                    else:
+                        # fallback: provemos assets y list_models_for_asset_interval
+                        for a in storage.list_assets():
+                            for iv in storage.list_intervals_for_asset(a):
+                                rows += storage.list_models_for_asset_interval(a, iv)
+                if not rows:
+                    st.info('No hay modelos')
+                else:
+                    st.dataframe(pd.DataFrame(rows))
+            except Exception as e:
+                st.error(f'Error listando modelos: {e}')
+
+
+def train_infer_tab(storage: Optional[PostgresStorage]):
+    st.title('Train / Infer')
+    st.markdown('Entrenamiento de modelos y ejecución de inferencia desde UI')
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Inicializar tablas watchlist/backfill (si storage lo soporta)"):
-            try:
-                # call a helper that might create tables: init_db or similar if exists
-                res = safe_call(storage, "init_db", default=None)
-                if res is not None:
-                    st.success("init_db() ejecutado (ver logs del storage).")
-                else:
-                    st.info("storage no implementa init_db(). Si usas Postgres, revisa core/storage_postgres._ensure_watchlist_tables().")
-            except Exception as e:
-                st.exception(e)
+        st.subheader('Entrenar modelo (train_ai_model)')
+        asset = st.text_input('Asset para entrenar')
+        interval = st.text_input('Interval')
+        model_name = st.text_input('Model name', value='model_auto')
+        epochs = st.number_input('Epochs (si aplica)', min_value=1, max_value=1000, value=10)
+        if st.button('Entrenar modelo'):
+            if not ai_train_module or not hasattr(ai_train_module, 'train_ai_model'):
+                st.error('core.ai_train.train_ai_model no disponible — implementa core/ai_train.train_ai_model')
+            elif not storage:
+                st.error('Storage no disponible')
+            elif not asset or not interval:
+                st.error('Rellena asset e interval')
+            else:
+                try:
+                    with st.spinner('Entrenando (puede tardar)...'):
+                        ai_train_module.train_ai_model(storage, asset.strip(), interval.strip(), model_name=model_name, epochs=int(epochs))
+                    st.success('Entrenamiento finalizado y modelo persistido')
+                except Exception as e:
+                    st.error(f'Entrenamiento falló: {e}')
     with col2:
-        if st.button("Test DB query (SELECT 1)"):
+        st.subheader('Inferir (batch)')
+        asset_i = st.text_input('Asset para inferencia', key='i_asset')
+        interval_i = st.text_input('Interval para inferencia', key='i_interval')
+        if st.button('Ejecutar inferencia y persistir'):
+            if not score_module or not hasattr(score_module, 'infer_and_persist'):
+                st.error('core.score.infer_and_persist no disponible')
+            elif not storage:
+                st.error('Storage no disponible')
+            elif not asset_i or not interval_i:
+                st.error('Rellena asset/interval')
+            else:
+                try:
+                    with st.spinner('Ejecutando inferencia...'):
+                        score_module.infer_and_persist(storage, asset_i.strip(), interval_i.strip(), model_name=None)
+                    st.success('Inferencia guardada')
+                except Exception as e:
+                    st.error(f'Inferencia falló: {e}')
+
+
+def backtest_tab(storage: Optional[PostgresStorage]):
+    st.title('Backtest')
+    st.markdown('Ejecutar backtests desde UI y visualizar métricas y equity curve')
+    asset = st.text_input('Asset para backtest')
+    interval = st.text_input('Interval')
+    start = st.text_input('Start ts ms (optional)')
+    end = st.text_input('End ts ms (optional)')
+    if st.button('Ejecutar backtest'):
+        if not backtest_module or not hasattr(backtest_module, 'run_backtest_for'):
+            st.error('core.backtest.run_backtest_for no disponible — implementa motor de backtest')
+        elif not storage:
+            st.error('Storage no disponible')
+        elif not asset or not interval:
+            st.error('Rellena asset/interval')
+        else:
             try:
-                res = safe_call(storage, "health", default=None)
-                if res is not None:
-                    st.success("health() OK")
-                else:
-                    st.warning("health() no disponible en storage, intenta ejecutar un script de comprobación en el server.")
+                s = int(start) if start else None
+                e = int(end) if end else None
+                with st.spinner('Ejecutando backtest...'):
+                    res = backtest_module.run_backtest_for(storage, asset.strip(), interval.strip(), start_ts=s, end_ts=e)
+                st.subheader('Resultados')
+                st.json(res.get('metrics') if isinstance(res, dict) else res)
+                if isinstance(res, dict) and 'equity_curve' in res:
+                    df = pd.DataFrame(res['equity_curve'])
+                    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+                    st.line_chart(df.set_index('ts')['equity'])
             except Exception as e:
-                st.exception(e)
+                st.error(f'Backtest falló: {e}')
 
-# ---------------------------
-# AI helper (opcional)
-# ---------------------------
-def ai_explain_score(asset: str, score_obj: Any) -> Optional[str]:
-    """
-    Si OPENAI_API_KEY está presente, enviar prompt para generar explicación breve.
-    Devuelve texto o None si falla.
-    """
-    if not OPENAI_AVAILABLE:
-        return None
-    try:
-        prompt = (
-            f"Explica brevemente el score para el asset {asset}.\n"
-            f"Score raw: {json.dumps(score_obj, default=str)}\n"
-            "Dame un resumen corto en lenguaje claro con posibles niveles objetivo basados en el score."
-        )
-        resp = openai.Completion.create(model="text-davinci-003", prompt=prompt, max_tokens=200, temperature=0.0)
-        txt = resp.choices[0].text.strip()
-        return txt
-    except Exception:
-        return None
 
-# ---------------------------
-# Dispatch pages
-# ---------------------------
-try:
-    if page == "Watchlist":
-        page_watchlist(storage)
-    elif page == "Backfill Requests":
-        page_backfill_requests(storage)
-    elif page == "Scores Explorer":
-        page_scores_explorer(storage)
-    elif page == "Asset Viewer":
-        page_asset_viewer(storage)
-    elif page == "Health & Logs":
-        page_health_logs(storage)
+def ai_tab(storage: Optional[PostgresStorage]):
+    st.title('IA — OpenAI / Interference')
+    if not os.getenv('OPENAI_API_KEY'):
+        st.info('OPENAI_API_KEY no configurada. Configúrala en el entorno para habilitar la IA.')
     else:
-        st.info("Página no encontrada.")
-except Exception as e:
-    st.exception(e)
-    st.stop()
+        st.success('OpenAI configurado')
+    st.markdown('Funciones IA opcionales: resumen de activos, generación de insights, explicaciones de scores')
+    if ai_interf_module and hasattr(ai_interf_module, 'explain_scores'):
+        asset = st.text_input('Asset a explicar (IA)')
+        if st.button('Explicar scores con IA'):
+            if not asset:
+                st.error('Especifica asset')
+            else:
+                try:
+                    with st.spinner('Llamando IA...'):
+                        text = ai_interf_module.explain_scores(asset)
+                    st.text_area('Explicación IA', value=text, height=300)
+                except Exception as e:
+                    st.error(f'IA fallo: {e}')
+    else:
+        st.info('core.ai_interference.explain_scores no disponible — implementa para habilitar')
+
+
+def settings_tab(storage: Optional[PostgresStorage]):
+    st.title('Settings')
+    st.markdown('Variables de entorno y configuración de despliegue')
+    envs = {k: bool(os.getenv(k)) for k in ['DATABASE_URL','OPENAI_API_KEY']}
+    st.json(envs)
+    st.markdown('Instrucciones para ambiente: export DATABASE_URL="postgresql://user:pass@host:5432/db"')
+
+
+def logs_tab():
+    st.title('Logs')
+    log_dir = '/tmp/watchlist_logs'
+    if not os.path.exists(log_dir):
+        st.info('No existe /tmp/watchlist_logs')
+        return
+    files = sorted(os.listdir(log_dir), reverse=True)
+    sel = st.selectbox('Fichero de logs', options=[''] + files)
+    if sel:
+        path = os.path.join(log_dir, sel)
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                data = f.read()[-20000:]
+            st.code(data)
+        except Exception as e:
+            st.error(f'Error leyendo log: {e}')
+
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def main():
+    storage = get_storage()
+    orchestrator = get_orchestrator(storage)
+
+    tabs = ['Overview','Watchlist','Backfill','Scores','Assets','Models','Train/Infer','Backtest','IA','Settings','Logs']
+    choice = st.sidebar.selectbox('Pestañas', options=tabs)
+
+    if choice == 'Overview':
+        overview_tab(storage)
+    elif choice == 'Watchlist':
+        watchlist_tab(storage)
+    elif choice == 'Backfill':
+        backfill_tab(storage, orchestrator)
+    elif choice == 'Scores':
+        scores_tab(storage)
+    elif choice == 'Assets':
+        assets_tab(storage)
+    elif choice == 'Models':
+        models_tab(storage)
+    elif choice == 'Train/Infer':
+        train_infer_tab(storage)
+    elif choice == 'Backtest':
+        backtest_tab(storage)
+    elif choice == 'IA':
+        ai_tab(storage)
+    elif choice == 'Settings':
+        settings_tab(storage)
+    elif choice == 'Logs':
+        logs_tab()
+    else:
+        st.info('Seleccione una pestaña')
+
+if __name__ == '__main__':
+    main()

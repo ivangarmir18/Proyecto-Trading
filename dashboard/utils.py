@@ -1,160 +1,157 @@
 # dashboard/utils.py
 """
-Dashboard Utilities para Proyecto-Trading
-
-Este módulo combina TODO lo que tu proyecto original usaba + mejoras:
-- Funciones legacy (no rompen imports de app.py)
-- Carga de assets desde CSV y DB
-- Gestión de watchlist (leer/guardar CSV)
-- Cache de velas con PostgresStorage
-- Render de listas largas con scroll en Streamlit
-- Manejo de errores robusto y logging
+Utilities para el dashboard:
+- storage() singleton (PostgresStorage desde DATABASE_URL)
+- load_assets_from_cache() lee data/cache/assets_*.json
+- load_user_watchlist_csv()/save_user_watchlist_csv(): manejo CSV atómico
+- format_ts(): helper para formatos
+- simple helpers para detectar entorno (is_running_render)
 """
 
+from __future__ import annotations
+
 import os
-import logging
-from typing import List, Optional
+import json
+import glob
+import tempfile
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
 import pandas as pd
-import streamlit as st
-from functools import lru_cache
 
-# Importa tu Storage
-from core.storage_postgres import PostgresStorage
+# intentamos importar la fábrica de storage (compatible con core/storage_postgres)
+try:
+    from core.storage_postgres import make_storage_from_env, PostgresStorage
+except Exception:
+    make_storage_from_env = None
+    PostgresStorage = None
 
-logger = logging.getLogger("dashboard.utils")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-    logger.addHandler(ch)
+# caching simple (module-level)
+_storage_instance: Optional[PostgresStorage] = None
 
 
-# -------------------------
-# Conexión a Storage (singleton)
-# -------------------------
-_storage: Optional[PostgresStorage] = None
-
-def storage() -> PostgresStorage:
+def storage(**kwargs) -> Optional[PostgresStorage]:
     """
-    Devuelve instancia única de PostgresStorage (singleton).
+    Devuelve un singleton PostgresStorage.
+    kwargs opcionales sobrescriben la fábrica.
     """
-    global _storage
-    if _storage is None:
+    global _storage_instance
+    if _storage_instance is not None:
+        return _storage_instance
+    if make_storage_from_env is None:
+        return None
+    _storage_instance = make_storage_from_env(**kwargs)
+    try:
+        # idempotent init
+        _storage_instance.init_db()
+    except Exception:
+        # no fallamos aquí (la app puede seguir funcionando en modo parcial)
+        pass
+    return _storage_instance
+
+
+# -----------------------
+# Cache / assets helpers
+# -----------------------
+def load_assets_from_cache(cache_dir: str = "data/cache") -> List[Dict[str, Any]]:
+    """
+    Lee todos los archivos data/cache/assets_*.json y devuelve lista única de assets:
+    [{ "asset": "BTCUSDT", "meta": { ... } }, ...]
+    Si no hay archivos, devuelve [].
+    """
+    out: List[Dict[str, Any]] = []
+    p = Path(cache_dir)
+    if not p.exists():
+        return out
+    for path in sorted(glob.glob(str(p / "assets_*.json"))):
         try:
-            _storage = PostgresStorage()
-            _storage.init_db()
-            logger.info("Storage inicializado correctamente")
-        except Exception as e:
-            logger.exception("Error inicializando PostgresStorage: %s", e)
-            raise
-    return _storage
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                for e in data:
+                    if isinstance(e, dict) and "asset" in e:
+                        out.append(e)
+                    elif isinstance(e, str):
+                        out.append({"asset": e})
+        except Exception:
+            # no paramos por un cache corrupto; lo ignoramos
+            continue
+    # deduplicate by asset
+    seen = set()
+    uniq = []
+    for e in out:
+        a = e.get("asset")
+        if a and a not in seen:
+            seen.add(a)
+            uniq.append(e)
+    return uniq
 
 
-# -------------------------
-# Assets desde CSV / DB
-# -------------------------
-@st.cache_data
-def load_assets_from_cache(csv_path: str = "data/assets.csv") -> List[str]:
+# -----------------------
+# Watchlist CSV helpers
+# -----------------------
+def load_user_watchlist_csv(path: str = "data/user_watchlist.csv") -> List[Dict[str, Any]]:
     """
-    Carga lista de assets desde CSV (mantiene compatibilidad con código original).
+    Lee CSV simple con columna 'asset' y opcional 'meta' (JSON string) y devuelve lista de dicts.
     """
-    try:
-        if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
-            if "symbol" in df.columns:
-                return sorted(df["symbol"].dropna().astype(str).tolist())
-        logger.warning("Archivo de assets no encontrado o sin columna 'symbol'")
+    p = Path(path)
+    if not p.exists():
         return []
-    except Exception:
-        logger.exception("Error al cargar assets desde CSV")
-        return []
-
-
-def get_all_assets_from_db() -> List[str]:
-    """
-    Devuelve lista de assets únicos presentes en la tabla candles.
-    """
     try:
-        s = storage()
-        return sorted(s.get_all_assets() or [])
+        df = pd.read_csv(p)
     except Exception:
-        logger.exception("Error obteniendo assets desde DB")
-        return []
+        # fallback: try to read with utf-8-sig
+        df = pd.read_csv(p, encoding="utf-8-sig")
+    out: List[Dict[str, Any]] = []
+    if "asset" not in df.columns:
+        return out
+    for _, row in df.iterrows():
+        asset = str(row["asset"]).strip()
+        meta_raw = None
+        if "meta" in df.columns and not pd.isna(row.get("meta", None)):
+            mr = row.get("meta")
+            try:
+                meta_raw = json.loads(mr) if isinstance(mr, str) else mr
+            except Exception:
+                meta_raw = {"raw": mr}
+        out.append({"asset": asset, "meta": meta_raw})
+    return out
 
 
-# -------------------------
-# Watchlist de usuario
-# -------------------------
-WATCHLIST_CSV = "data/user_watchlist.csv"
-
-def load_user_watchlist_csv(path: str = WATCHLIST_CSV) -> List[str]:
+def save_user_watchlist_csv(data: List[Dict[str, Any]], path: str = "data/user_watchlist.csv") -> None:
     """
-    Lee la watchlist desde CSV. Crea archivo vacío si no existe.
+    Escritura atómica CSV. `data` = list of dicts with 'asset' and optional 'meta'.
     """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # normalize to DataFrame
+    rows = []
+    for e in data:
+        asset = e.get("asset")
+        meta = e.get("meta")
+        rows.append({"asset": asset, "meta": json.dumps(meta, ensure_ascii=False) if meta is not None else ""})
+    df = pd.DataFrame(rows)
+    # atomic write: write to temp file then replace
+    fd, tmp_path = tempfile.mkstemp(prefix="tmp_watchlist_", dir=str(p.parent))
+    os.close(fd)
+    df.to_csv(tmp_path, index=False)
+    # atomic replace
+    os.replace(tmp_path, str(p))
+
+
+# -----------------------
+# Misc helpers
+# -----------------------
+def format_ts(ts_ms: Optional[int]) -> str:
+    """Convierte ms -> ISO string local (o devuelve '-')"""
+    if ts_ms is None:
+        return "-"
     try:
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            return df["symbol"].dropna().astype(str).tolist()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        pd.DataFrame({"symbol": []}).to_csv(path, index=False)
-        return []
+        return pd.to_datetime(int(ts_ms), unit="ms", utc=True).isoformat()
     except Exception:
-        logger.exception("Error cargando watchlist")
-        return []
+        return str(ts_ms)
 
 
-def save_user_watchlist_csv(symbols: List[str], path: str = WATCHLIST_CSV):
-    """
-    Guarda la watchlist del usuario en CSV.
-    """
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        pd.DataFrame({"symbol": symbols}).to_csv(path, index=False)
-        logger.info("Watchlist guardada correctamente en %s", path)
-    except Exception:
-        logger.exception("Error guardando watchlist")
-
-
-# -------------------------
-# Cache de velas
-# -------------------------
-@lru_cache(maxsize=64)
-def get_cached_candles(asset: str, interval: str, limit: int = 1000, ascending: bool = False) -> pd.DataFrame:
-    """
-    Devuelve velas desde DB con cache en memoria.
-    """
-    try:
-        s = storage()
-        df = s.load_candles(asset, interval, limit=limit, ascending=ascending)
-        return df
-    except Exception:
-        logger.exception("Error cargando velas en cache")
-        return pd.DataFrame()
-
-
-# -------------------------
-# UI Helpers
-# -------------------------
-def render_scrollable_list(items: List[str], title: str = "Lista", height: int = 300):
-    """
-    Renderiza lista scrollable en Streamlit (ideal para assets/backfills grandes).
-    """
-    if not items:
-        st.info(f"No hay elementos en {title}")
-        return
-    with st.container():
-        st.markdown(f"#### {title}")
-        st.markdown(
-            f"""
-            <div style="height:{height}px;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:5px;">
-            {"<br>".join(items)}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-
-# -------------------------
-# Aliases Legacy (para compatibilidad)
-# -------------------------
-get_assets_from_csv = load_assets_from_cache
+def is_running_render() -> bool:
+    """Heurística simple: Render defines $RENDER (feature) or $PORT present in env."""
+    return bool(os.getenv("RENDER") or os.getenv("PORT"))

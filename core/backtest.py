@@ -1,421 +1,428 @@
 # core/backtest.py
 """
-Backtester robusto y compatible con la versión original del proyecto.
+Backtest engine sencillo pero completo.
 
-Características principales
-- Simulación bar-by-bar (ejecución sobre close por defecto, con slippage y fee)
-- Soporta long y short (simplificado), sizing ('allin' o fraction)
-- Stops / Take-profit intrabar (usando high/low de la vela)
-- Registro detallado de trades y equity curve
-- Métricas: final_value, returns, sharpe, max_drawdown, win_rate, avg_win/loss
-- Hooks para IA:
-    - on_trade(trade_dict) -> llamado cada vez que se registra un trade
-    - trades_to_labels(trades) -> convierte trades a etiquetas (realized returns)
-    - generate_training_examples_from_trades(df_candles, trades, feature_fn) -> X,y
-- API estable: run_backtest(...) devuelve dict con keys documentadas.
+Función principal exportada:
+    run_backtest_for(storage, asset, interval, start_ts=None, end_ts=None,
+                     initial_capital=10000.0, fee=0.0005, slippage=0.0005,
+                     fraction_of_capital=1.0, score_threshold=0.0, hold_period=1,
+                     use_scores=True)
 
-Estructura de trade dict:
-    {"ts": int, "action": "buy"|"sell"|"short"|"cover", "price": float, "qty": float, "pnl": float|None, "entry_ts": int|None}
+Retorna un dict con:
+    {
+      "asset": asset,
+      "interval": interval,
+      "start_ts": start_ts,
+      "end_ts": end_ts,
+      "initial_capital": ...,
+      "final_capital": ...,
+      "total_return": ...,
+      "cagr": ...,
+      "annual_volatility": ...,
+      "sharpe": ...,
+      "max_drawdown": ...,
+      "max_drawdown_start": ...,
+      "max_drawdown_end": ...,
+      "trades": [ {trade dicts} ],
+      "equity_curve": [ { "ts": ..., "equity": ... } ],
+      "per_bar": pandas.DataFrame (index ts_dt) with columns: close, position, pnl, equity, returns
+    }
 
-Notas:
-- Si necesitas matching exacto de comportamiento con un exchange (fills parciales, maker/taker distinct), dímelo y adapto.
+Notas de diseño:
+- El backtest usa precios de cierre para entradas/salidas (entrada al close de la barra cuando señal aparece).
+- Si hay scores (storage.load_scores), alinea score por timestamp <= candle.ts y genera señales: long si score['pred'] > score_threshold.
+- hold_period define cuántas barras mantener (1 = próxima barra exit allowed).
+- fraction_of_capital define fracción del capital usada por trade (1.0 = todo el capital).
+- fee y slippage aplicados en cada operación como costos relativos.
 """
-from typing import Callable, Dict, Any, List, Optional, Tuple
-import math
+from __future__ import annotations
+
 import logging
+import math
+from typing import Optional, Dict, Any, List
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
-logger = logging.getLogger("core.backtest")
+logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(ch)
 
 
-# -------------------------
-# Utilities / metrics
-# -------------------------
-def compute_max_drawdown(equity: List[float]) -> float:
-    ser = pd.Series(equity)
-    if ser.empty:
+def _bars_per_year_from_interval(interval: str) -> float:
+    """
+    Estimar número de barras por año según interval:
+    - minutos/hours -> 365 * 24 * 60 / minutes
+    - '1d' -> 252
+    - '1w' -> 52
+    - '1M' -> 12
+    Fallback: 365
+    """
+    s = interval.strip().lower()
+    try:
+        if s.endswith("m"):
+            mins = int(s[:-1]) if s[:-1].isdigit() else 1
+            return 365.0 * 24.0 * 60.0 / max(1, mins)
+        if s.endswith("h"):
+            hours = int(s[:-1]) if s[:-1].isdigit() else 1
+            return 365.0 * 24.0 / max(1, hours)
+        if s.endswith("d"):
+            # use trading days approximation
+            return 252.0 / max(1, int(s[:-1]) if s[:-1].isdigit() else 1)
+        if s.endswith("w"):
+            return 52.0 / max(1, int(s[:-1]) if s[:-1].isdigit() else 1)
+        if s.endswith("m"):  # 'M' months
+            return 12.0
+    except Exception:
+        pass
+    # fallback
+    return 365.0
+
+
+def _compute_drawdown(equity_series: pd.Series) -> Dict[str, Any]:
+    """
+    Recibe equity_series index datetime, returns max_dd value (positive fraction), start/end timestamps (ints ms),
+    and drawdown series.
+    """
+    # equity_series must be numeric
+    eq = equity_series.fillna(method="ffill").fillna(0.0)
+    running_max = eq.cummax()
+    drawdown = (running_max - eq) / running_max
+    # handle case where running_max==0 -> drawdown NaN -> set 0
+    drawdown = drawdown.fillna(0.0)
+    if drawdown.empty:
+        return {"max_drawdown": 0.0, "start": None, "end": None, "dd_series": drawdown}
+    max_dd = float(drawdown.max())
+    if max_dd <= 0:
+        return {"max_drawdown": 0.0, "start": None, "end": None, "dd_series": drawdown}
+    # find end index (first occurrence of max)
+    end_idx = drawdown.idxmax()
+    # find previous peak (running_max before end where running_max equals peak)
+    peak_val = running_max.loc[: end_idx].max()
+    # start is last index where running_max == peak_val before or at end_idx
+    peaks = running_max.loc[: end_idx]
+    # locate the last timestamp where peaks == peak_val
+    starts = peaks[peaks == peak_val]
+    start_idx = starts.index[-1] if not starts.empty else None
+    # convert timestamps to ms
+    start_ts = int(start_idx.value // 10 ** 6) if start_idx is not None else None
+    end_ts = int(end_idx.value // 10 ** 6) if end_idx is not None else None
+    return {"max_drawdown": max_dd, "start": start_ts, "end": end_ts, "dd_series": drawdown}
+
+
+def _annualize_return(total_return: float, years: float) -> float:
+    if years <= 0:
         return 0.0
-    roll_max = ser.cummax()
-    dd = (roll_max - ser) / roll_max
-    return float(dd.max())
+    # (1 + total_return) ** (1/years) - 1
+    return (1.0 + total_return) ** (1.0 / years) - 1.0
 
 
-def compute_sharpe_from_returns(returns: pd.Series, annual_factor: float = 252.0) -> Optional[float]:
-    if returns.empty:
-        return None
-    mean = returns.mean()
-    std = returns.std()
-    if std == 0 or math.isnan(std):
-        return None
-    return float((mean / std) * math.sqrt(annual_factor))
-
-
-def _record_trade(log: List[Dict[str, Any]], ts: int, action: str, price: float, qty: float, pnl: Optional[float] = None, entry_ts: Optional[int] = None):
-    entry = {"ts": int(ts), "action": action, "price": float(price), "qty": float(qty)}
-    if pnl is not None:
-        entry["pnl"] = float(pnl)
-    if entry_ts is not None:
-        entry["entry_ts"] = int(entry_ts)
-    log.append(entry)
-    return entry
-
-
-# -------------------------
-# Core backtest
-# -------------------------
-def run_backtest(df: pd.DataFrame,
-                 strategy_fn: Callable[[pd.Series, int, pd.DataFrame, dict], Optional[str]],
-                 initial_capital: float = 1000.0,
-                 fee: float = 0.0005,
-                 slippage: float = 0.0,
-                 risk_per_trade: float = 1.0,
-                 allow_short: bool = False,
-                 position_sizing: str = "allin",
-                 stop_loss_pct: Optional[float] = None,
-                 take_profit_pct: Optional[float] = None,
-                 compute_metrics_periods_per_year: int = 252,
-                 on_trade: Optional[Callable[[Dict[str, Any]], None]] = None,
-                 **kwargs) -> Dict[str, Any]:
+def run_backtest_for(
+    storage: Any,
+    asset: str,
+    interval: str,
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+    initial_capital: float = 10000.0,
+    fee: float = 0.0005,
+    slippage: float = 0.0005,
+    fraction_of_capital: float = 1.0,
+    score_threshold: float = 0.0,
+    hold_period: int = 1,
+    use_scores: bool = True,
+) -> Dict[str, Any]:
     """
-    Ejecuta la simulación.
-
-    - df: DataFrame con columnas mínimas ['ts','timestamp','open','high','low','close','volume'] (ts epoch seconds)
-    - strategy_fn(row, idx, df, state) -> 'buy'|'sell'|'short'|'cover'|None
-    - stop_loss_pct / take_profit_pct: valores positivos (ej. 0.02 para 2%). Se aplican intrabar usando high/low:
-        * para una posición long: TP si high >= entry_price*(1+tp), SL si low <= entry_price*(1-sl)
-        * para short: invertido
-    - on_trade: callback recibirá trade dict cada vez que se haga un trade
-    - devuelve dict con: initial_capital, final_value, returns, n_trades, win_rate, avg_win, avg_loss,
-      sharpe, max_drawdown, trades, equity_curve
+    Ejecuta backtest para asset/interval sobre datos en storage.
+    - storage debe exponer load_candles(asset, interval, start_ts=None, end_ts=None, limit=None)
+      y opcionalmente load_scores(asset, interval, start_ts=None, end_ts=None, limit=None)
+      (en este proyecto PostgresStorage implementa esas funciones).
+    - use_scores: si True, intenta usar storage.load_scores para generar señales, si no hay scores,
+      cae al buy_and_hold.
     """
+    if storage is None:
+        raise ValueError("storage requerido para run_backtest_for")
+
+    # 1) cargar velas
+    try:
+        # preferir cargar con rango si se proporciona
+        df = storage.load_candles(asset, interval, start_ts=start_ts, end_ts=end_ts, limit=None)
+    except Exception as e:
+        logger.exception("storage.load_candles falló en backtest: %s", e)
+        raise RuntimeError("No se pudieron cargar velas para backtest") from e
+
     if df is None or df.empty:
-        return {"error": "no_data"}
+        raise RuntimeError("No hay velas para el backtest")
 
-    # copy & normalize
-    df = df.copy().sort_values("ts").reset_index(drop=True)
-    required_cols = {"ts", "close", "high", "low"}
-    if not required_cols.issubset(set(df.columns)):
-        logger.warning("DataFrame missing some required columns: required=%s, got=%s", required_cols, set(df.columns))
-    # initialize state
-    cash = float(initial_capital)
-    position_qty = 0.0
-    position_entry_price = None
-    position_side: Optional[str] = None  # 'long' or 'short'
-    entry_ts_of_position: Optional[int] = None
+    # normalizar df: ts int -> datetime index
+    df2 = df.copy()
+    if "ts" not in df2.columns:
+        raise RuntimeError("Las velas deben contener columna 'ts' (ms)")
+    df2["ts"] = df2["ts"].astype("int64")
+    df2["ts_dt"] = pd.to_datetime(df2["ts"], unit="ms", utc=True)
+    df2 = df2.set_index("ts_dt", drop=False)
+    df2 = df2.sort_index()
+    close = pd.to_numeric(df2["close"], errors="coerce")
 
+    # 2) load scores if requested and available
+    signals = None
+    if use_scores and hasattr(storage, "load_scores"):
+        try:
+            # load all scores in range to align
+            scores_df = storage.load_scores(asset=asset, interval=interval, start_ts=start_ts, end_ts=end_ts, limit=None)
+            if scores_df is not None and not scores_df.empty:
+                # convert ts to datetime index
+                scores_df = scores_df.copy()
+                scores_df["ts"] = scores_df["ts"].astype("int64")
+                scores_df["ts_dt"] = pd.to_datetime(scores_df["ts"], unit="ms", utc=True)
+                scores_df = scores_df.set_index("ts_dt", drop=False).sort_index()
+                # assume score JSON contains key 'pred' numeric (fallback to first numeric found)
+                def extract_pred(row):
+                    s = row.get("score") if isinstance(row, dict) else row
+                    if isinstance(s, dict):
+                        if "pred" in s:
+                            return float(s["pred"])
+                        # try first numeric value in dict
+                        for v in s.values():
+                            try:
+                                return float(v)
+                            except Exception:
+                                continue
+                    try:
+                        return float(s)
+                    except Exception:
+                        return np.nan
+                scores_df["_pred"] = scores_df["score"].apply(extract_pred)
+                # align to candle index by forward-fill last known score <= candle.ts
+                # create a series of preds indexed by ts_dt
+                pred_series = scores_df["_pred"]
+                # reindex to candles using asof (last valid index <= ts)
+                preds_aligned = pd.Series(index=df2.index, dtype=float)
+                # use pandas.merge_asof approach
+                joined = pd.merge_asof(df2.reset_index().rename(columns={"ts_dt":"ts_dt_c"}).sort_values("ts_dt"),
+                                       scores_df.reset_index().rename(columns={"ts_dt":"ts_dt_s"})[["ts_dt_s","_pred"]].sort_values("ts_dt_s"),
+                                       left_on="ts_dt", right_on="ts_dt_s", direction="backward")
+                preds_aligned = pd.Series(joined["_pred"].values, index=df2.index)
+                # fill nans with 0
+                preds_aligned = preds_aligned.fillna(0.0)
+                signals = preds_aligned
+        except Exception:
+            logger.exception("Error cargando/alineando scores. Se usará buy-and-hold fallback.")
+            signals = None
+
+    # 3) generate trading signals
+    # We'll produce 'signal' series: 1 -> long, 0 -> flat
+    if signals is not None:
+        signal = (signals > score_threshold).astype(int)
+        # apply hold_period: when signal becomes 1, keep it for hold_period bars (simple implementation)
+        if hold_period and hold_period > 1:
+            sig = signal.copy()
+            out = sig.copy() * 0
+            n = len(sig)
+            sig_values = sig.values
+            for i in range(n):
+                if sig_values[i] == 1:
+                    # keep next hold_period bars including current
+                    end = min(n, i + hold_period)
+                    out.iloc[i:end] = 1
+            signal = out
+    else:
+        # buy-and-hold: enter long at first available bar and hold to end
+        signal = pd.Series(0, index=df2.index)
+        signal.iloc[0] = 1
+        signal = signal.cumsum().clip(upper=1)  # ensure 1 for all forward bars
+
+    # 4) simulate PnL using close prices, simple discrete execution at close, position 0/1
+    equity = []
     trades: List[Dict[str, Any]] = []
-    equity_curve: List[Dict[str, Any]] = []
+    cash = float(initial_capital)
+    position = 0  # number of units (not quantity of assets) - we use fraction_of_capital to buy
+    position_qty = 0.0
+    entry_price = None
+    last_equity = cash
+    bar_index = 0
 
-    engine_state: Dict[str, Any] = {}  # state passed to strategy_fn
+    per_bar_rows = []
 
-    for idx, row in df.iterrows():
-        ts = int(row["ts"])
+    for ts, row in df2.iterrows():
         price = float(row["close"])
-        high = float(row.get("high", price))
-        low = float(row.get("low", price))
+        desired = int(signal.iloc[bar_index])  # 0 or 1
+        timestamp_ms = int(row["ts"])
 
-        # 1) first check if an intrabar stop/tp would trigger (only if we have a position)
-        closed_by_stop_or_tp = False
-        if position_qty > 0 and position_entry_price is not None and position_side == "long":
-            # check take profit
-            if take_profit_pct is not None:
-                tp_price = position_entry_price * (1.0 + take_profit_pct)
-                if high >= tp_price:
-                    exec_price = tp_price * (1.0 - slippage)  # sell at tp adjusted by slippage
-                    proceeds = position_qty * exec_price * (1 - fee)
-                    pnl = proceeds - (position_qty * position_entry_price)
-                    _record_trade(trades, ts, "sell", exec_price, position_qty, pnl, entry_ts_of_position)
-                    if on_trade:
-                        on_trade({"ts": ts, "action": "sell", "price": exec_price, "qty": position_qty, "pnl": pnl, "entry_ts": entry_ts_of_position})
-                    cash += proceeds
-                    position_qty = 0.0
-                    position_entry_price = None
-                    position_side = None
-                    entry_ts_of_position = None
-                    closed_by_stop_or_tp = True
-            # check stop loss (if not already closed by tp)
-            if (not closed_by_stop_or_tp) and (stop_loss_pct is not None):
-                sl_price = position_entry_price * (1.0 - stop_loss_pct)
-                if low <= sl_price:
-                    exec_price = sl_price * (1.0 + slippage)
-                    proceeds = position_qty * exec_price * (1 - fee)
-                    pnl = proceeds - (position_qty * position_entry_price)
-                    _record_trade(trades, ts, "sell", exec_price, position_qty, pnl, entry_ts_of_position)
-                    if on_trade:
-                        on_trade({"ts": ts, "action": "sell", "price": exec_price, "qty": position_qty, "pnl": pnl, "entry_ts": entry_ts_of_position})
-                    cash += proceeds
-                    position_qty = 0.0
-                    position_entry_price = None
-                    position_side = None
-                    entry_ts_of_position = None
-                    closed_by_stop_or_tp = True
+        # if currently flat and desired=1 -> enter
+        if position == 0 and desired == 1:
+            # capital to allocate
+            alloc = cash * float(fraction_of_capital)
+            # compute quantity after fees/slippage: buy at price * (1 + slippage)
+            buy_price = price * (1.0 + float(slippage))
+            qty = alloc / buy_price if buy_price > 0 else 0.0
+            # apply fee on trade value
+            trade_cost = alloc * float(fee)
+            cash = cash - alloc - trade_cost  # remaining cash
+            position = 1
+            position_qty = qty
+            entry_price = buy_price
+            trades.append({
+                "type": "buy",
+                "ts": timestamp_ms,
+                "price": buy_price,
+                "qty": qty,
+                "cash_after": cash,
+                "fee": trade_cost,
+                "slippage": slippage
+            })
+        # if currently long and desired==0 -> exit
+        elif position == 1 and desired == 0:
+            # sell at price * (1 - slippage)
+            sell_price = price * (1.0 - float(slippage))
+            proceeds = position_qty * sell_price
+            trade_cost = proceeds * float(fee)
+            cash = cash + proceeds - trade_cost
+            pnl = (sell_price - entry_price) * position_qty - trade_cost
+            trades.append({
+                "type": "sell",
+                "ts": timestamp_ms,
+                "price": sell_price,
+                "qty": position_qty,
+                "cash_after": cash,
+                "fee": trade_cost,
+                "slippage": slippage,
+                "pnl": pnl
+            })
+            # reset position
+            position = 0
+            position_qty = 0.0
+            entry_price = None
 
-        if position_qty > 0 and position_side == "short" and position_entry_price is not None:
-            # for shorts: TP if low <= entry*(1-tp), SL if high >= entry*(1+sl)
-            if take_profit_pct is not None:
-                tp_price = position_entry_price * (1.0 - take_profit_pct)
-                if low <= tp_price:
-                    exec_price = tp_price * (1.0 + slippage)
-                    pnl = (position_entry_price - exec_price) * position_qty - (position_entry_price * position_qty * fee)
-                    # simplificado: add pnl and free collateral
-                    cash += (position_entry_price * position_qty) + pnl
-                    _record_trade(trades, ts, "cover", exec_price, position_qty, pnl, entry_ts_of_position)
-                    if on_trade:
-                        on_trade({"ts": ts, "action": "cover", "price": exec_price, "qty": position_qty, "pnl": pnl, "entry_ts": entry_ts_of_position})
-                    position_qty = 0.0
-                    position_entry_price = None
-                    position_side = None
-                    entry_ts_of_position = None
-                    closed_by_stop_or_tp = True
-            if (not closed_by_stop_or_tp) and (stop_loss_pct is not None):
-                sl_price = position_entry_price * (1.0 + stop_loss_pct)
-                if high >= sl_price:
-                    exec_price = sl_price * (1.0 - slippage)
-                    pnl = (position_entry_price - exec_price) * position_qty - (position_entry_price * position_qty * fee)
-                    cash += (position_entry_price * position_qty) + pnl
-                    _record_trade(trades, ts, "cover", exec_price, position_qty, pnl, entry_ts_of_position)
-                    if on_trade:
-                        on_trade({"ts": ts, "action": "cover", "price": exec_price, "qty": position_qty, "pnl": pnl, "entry_ts": entry_ts_of_position})
-                    position_qty = 0.0
-                    position_entry_price = None
-                    position_side = None
-                    entry_ts_of_position = None
-                    closed_by_stop_or_tp = True
+        # mark-to-market equity: cash + position_qty * price (mid price)
+        mtm = cash + position_qty * price
+        last_equity = float(mtm)
+        equity.append({"ts": timestamp_ms, "equity": float(last_equity)})
+        per_bar_rows.append({
+            "ts": timestamp_ms,
+            "close": price,
+            "position": int(position),
+            "qty": float(position_qty),
+            "cash": float(cash),
+            "equity": float(last_equity)
+        })
+        bar_index += 1
 
-        # 2) if a stop/tp closed the position, continue to next bar
-        if closed_by_stop_or_tp:
-            # record equity for this bar and continue
-            if position_qty > 0:
-                mark = position_qty * price if position_side == "long" else cash + (position_entry_price - price) * position_qty
-            else:
-                mark = cash
-            equity_curve.append({"ts": ts, "equity": float(mark)})
-            continue
+    # If still long at the end, close position at last close
+    if position == 1 and position_qty > 0:
+        final_price = float(df2["close"].iloc[-1]) * (1.0 - float(slippage))
+        proceeds = position_qty * final_price
+        trade_cost = proceeds * float(fee)
+        cash = cash + proceeds - trade_cost
+        pnl = (final_price - entry_price) * position_qty - trade_cost if entry_price is not None else 0.0
+        timestamp_ms = int(df2["ts"].iloc[-1])
+        trades.append({
+            "type": "sell",
+            "ts": timestamp_ms,
+            "price": final_price,
+            "qty": position_qty,
+            "cash_after": cash,
+            "fee": trade_cost,
+            "slippage": slippage,
+            "pnl": pnl
+        })
+        position = 0
+        position_qty = 0.0
+        entry_price = None
+        last_equity = float(cash)
+        equity.append({"ts": timestamp_ms, "equity": float(last_equity)})
+        per_bar_rows.append({
+            "ts": timestamp_ms,
+            "close": float(df2["close"].iloc[-1]),
+            "position": 0,
+            "qty": 0.0,
+            "cash": float(cash),
+            "equity": float(last_equity)
+        })
 
-        # 3) otherwise, call strategy for a signal on this bar
-        action = strategy_fn(row, idx, df, engine_state)
+    # Build equity series
+    equity_df = pd.DataFrame(equity)
+    if equity_df.empty:
+        raise RuntimeError("No se generó equity curve en backtest")
+    equity_df = equity_df.drop_duplicates(subset=["ts"]).set_index(pd.to_datetime(equity_df["ts"], unit="ms", utc=True))
+    equity_series = equity_df["equity"].astype(float)
 
-        # buy logic
-        if action == "buy":
-            # if currently short, first cover
-            if position_qty > 0 and position_side == "short":
-                # close short
-                exec_price = price * (1.0 - slippage)
-                pnl = (position_entry_price - exec_price) * position_qty - (position_entry_price * position_qty * fee)
-                cash += (position_entry_price * position_qty) + pnl
-                _record_trade(trades, ts, "cover", exec_price, position_qty, pnl, entry_ts_of_position)
-                if on_trade:
-                    on_trade({"ts": ts, "action": "cover", "price": exec_price, "qty": position_qty, "pnl": pnl, "entry_ts": entry_ts_of_position})
-                position_qty = 0.0
-                position_entry_price = None
-                position_side = None
-                entry_ts_of_position = None
+    # Metrics
+    start_equity = float(initial_capital)
+    end_equity = float(equity_series.iloc[-1])
+    total_return = (end_equity / start_equity) - 1.0 if start_equity != 0 else 0.0
 
-            # then open long (if not already long)
-            if position_side != "long":
-                if position_sizing == "allin":
-                    spend = cash * float(risk_per_trade)
-                else:
-                    spend = cash * float(risk_per_trade)
-                if spend > 0:
-                    exec_price = price * (1.0 + slippage)
-                    qty = (spend * (1 - fee)) / exec_price
-                    if qty > 0:
-                        position_qty = qty
-                        position_entry_price = exec_price
-                        position_side = "long"
-                        entry_ts_of_position = ts
-                        cash -= (qty * exec_price) + (qty * exec_price * fee)
-                        t = _record_trade(trades, ts, "buy", exec_price, qty, None, entry_ts_of_position)
-                        if on_trade:
-                            on_trade({**t, "entry_ts": entry_ts_of_position})
+    # period in years: compute from timestamps
+    seconds = (equity_series.index[-1].to_datetime64() - equity_series.index[0].to_datetime64()) / np.timedelta64(1, "s")
+    years = float(seconds) / (365.0 * 24.0 * 3600.0) if seconds > 0 else 0.0
+    # fallback using bars_per_year
+    bars_per_year = _bars_per_year_from_interval(interval)
+    # per-bar returns for volatility: pct change of equity
+    eq_returns = equity_series.pct_change().fillna(0.0)
 
-        # sell logic
-        elif action == "sell":
-            # if have a long -> close it
-            if position_qty > 0 and position_side == "long":
-                exec_price = price * (1.0 - slippage)
-                proceeds = position_qty * exec_price * (1 - fee)
-                pnl = proceeds - (position_qty * position_entry_price)
-                _record_trade(trades, ts, "sell", exec_price, position_qty, pnl, entry_ts_of_position)
-                if on_trade:
-                    on_trade({"ts": ts, "action": "sell", "price": exec_price, "qty": position_qty, "pnl": pnl, "entry_ts": entry_ts_of_position})
-                cash += proceeds
-                position_qty = 0.0
-                position_entry_price = None
-                position_side = None
-                entry_ts_of_position = None
-            else:
-                # optionally open short if allowed
-                if allow_short and position_side != "short":
-                    spend_collateral = cash * float(risk_per_trade)
-                    if spend_collateral > 0:
-                        exec_price = price * (1.0 + slippage)
-                        qty = (spend_collateral * (1 - fee)) / exec_price
-                        if qty > 0:
-                            position_qty = qty
-                            position_entry_price = exec_price
-                            position_side = "short"
-                            entry_ts_of_position = ts
-                            cash -= (qty * exec_price * fee)  # simplified collateral handling
-                            t = _record_trade(trades, ts, "short", exec_price, qty, None, entry_ts_of_position)
-                            if on_trade:
-                                on_trade({**t, "entry_ts": entry_ts_of_position})
-
-        # other actions (None, hold) -> nothing to do
-
-        # record equity at end of bar
-        if position_qty > 0:
-            if position_side == "long":
-                mark = position_qty * price
-            elif position_side == "short":
-                mark = cash + (position_entry_price - price) * position_qty
-            else:
-                mark = cash
+    # annualized return
+    if years > 0:
+        cagr = _annualize_return(total_return, years)
+    else:
+        # fallback: use geometric mean with bars_per_year
+        periods = len(eq_returns)
+        if periods > 0:
+            total_return_alt = (end_equity / start_equity) - 1.0
+            years_alt = float(periods) / bars_per_year
+            cagr = _annualize_return(total_return_alt, years_alt) if years_alt > 0 else 0.0
         else:
-            mark = cash
-        equity_curve.append({"ts": ts, "equity": float(mark)})
+            cagr = 0.0
 
-    # after loop, close any open position at last price (mark-to-market already used; but we won't force close)
-    equity_series = pd.Series([e["equity"] for e in equity_curve]) if equity_curve else pd.Series([])
-    if equity_series.empty:
-        return {"error": "no_equity_curve"}
-    final_value = float(equity_series.iloc[-1])
-    returns = (final_value - initial_capital) / initial_capital
-    per_returns = equity_series.pct_change().dropna()
-    sharpe = compute_sharpe_from_returns(per_returns, annual_factor=compute_metrics_periods_per_year)
-    max_dd = compute_max_drawdown(list(equity_series))
-    pnl_list = [t.get("pnl") for t in trades if t.get("pnl") is not None]
-    wins = [p for p in pnl_list if p > 0] if pnl_list else []
-    losses = [p for p in pnl_list if p <= 0] if pnl_list else []
-    win_rate = (len(wins) / len(pnl_list)) if pnl_list else 0.0
-    avg_win = float(pd.Series(wins).mean()) if wins else 0.0
-    avg_loss = float(pd.Series(losses).mean()) if losses else 0.0
+    # annualized vol
+    try:
+        ann_vol = float(eq_returns.std(ddof=0) * math.sqrt(bars_per_year))
+    except Exception:
+        ann_vol = float(0.0)
+
+    # sharpe (risk-free = 0)
+    sharpe = float((cagr) / ann_vol) if ann_vol > 0 else float("nan")
+
+    # drawdown
+    dd_info = _compute_drawdown(equity_series)
+    max_dd = float(dd_info.get("max_drawdown", 0.0))
+    dd_start = dd_info.get("start")
+    dd_end = dd_info.get("end")
+
+    # trades summary
+    trades_summary = {
+        "n_trades": len([t for t in trades if t.get("type") == "buy"]),
+        "n_wins": len([t for t in trades if t.get("type") == "sell" and t.get("pnl", 0) > 0]),
+        "n_losses": len([t for t in trades if t.get("type") == "sell" and t.get("pnl", 0) <= 0]),
+        "net_pnl": float(end_equity - start_equity),
+    }
+
+    # per_bar DataFrame
+    per_bar_df = pd.DataFrame(per_bar_rows)
+    if not per_bar_df.empty:
+        per_bar_df = per_bar_df.set_index(pd.to_datetime(per_bar_df["ts"], unit="ms", utc=True))
+        per_bar_df["returns"] = per_bar_df["equity"].pct_change().fillna(0.0)
 
     result = {
-        "initial_capital": initial_capital,
-        "final_value": final_value,
-        "returns": returns,
-        "n_trades": len(trades),
-        "win_rate": win_rate,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "sharpe": sharpe,
-        "max_drawdown": max_dd,
+        "asset": asset,
+        "interval": interval,
+        "start_ts": int(df2["ts"].iloc[0]),
+        "end_ts": int(df2["ts"].iloc[-1]),
+        "initial_capital": float(initial_capital),
+        "final_capital": float(end_equity),
+        "total_return": float(total_return),
+        "cagr": float(cagr),
+        "annual_volatility": float(ann_vol),
+        "sharpe": float(sharpe) if not np.isnan(sharpe) else None,
+        "max_drawdown": float(max_dd),
+        "max_drawdown_start": dd_start,
+        "max_drawdown_end": dd_end,
         "trades": trades,
-        "equity_curve": equity_curve
+        "trades_summary": trades_summary,
+        "equity_curve": equity_df.reset_index().rename(columns={"index": "ts_dt"}).to_dict(orient="records"),
+        "per_bar": per_bar_df,
     }
+
     return result
 
 
-# -------------------------
-# Helpers for IA
-# -------------------------
-def trades_to_labels(trades: List[Dict[str, Any]], only_entries: bool = True) -> Dict[int, float]:
-    """
-    Convierte una lista de trades (FIFO) a un mapping entry_ts -> realized_return.
-
-    - only_entries: si True devuelve solo entradas tipo 'buy' (o 'short' si invertimos).
-    - Realized return = (exit_price - entry_price) / entry_price for longs.
-    - Para shorts: (entry_price - exit_price) / entry_price.
-    - Empareja buys con sells por orden FIFO; para short empareja 'short'->'cover'.
-    """
-    labels: Dict[int, float] = {}
-    buy_stack: List[Dict[str, Any]] = []
-    short_stack: List[Dict[str, Any]] = []
-    for t in trades:
-        act = t.get("action")
-        if act == "buy":
-            buy_stack.append(t)
-        elif act == "sell":
-            if buy_stack:
-                entry = buy_stack.pop(0)
-                entry_price = entry.get("price")
-                exit_price = t.get("price")
-                qty = min(entry.get("qty", 0), t.get("qty", 0))
-                if entry_price and qty:
-                    realized = (exit_price - entry_price) / entry_price
-                    labels[int(entry.get("ts"))] = float(realized)
-        elif act == "short":
-            short_stack.append(t)
-        elif act in ("cover",):
-            if short_stack:
-                entry = short_stack.pop(0)
-                entry_price = entry.get("price")
-                exit_price = t.get("price")
-                qty = min(entry.get("qty", 0), t.get("qty", 0))
-                if entry_price and qty:
-                    realized = (entry_price - exit_price) / entry_price
-                    labels[int(entry.get("ts"))] = float(realized)
-    if only_entries:
-        return labels
-    # else include also exits keyed by exit ts (not typical)
-    return labels
-
-
-def generate_training_examples_from_trades(df_candles: pd.DataFrame,
-                                           trades: List[Dict[str, Any]],
-                                           feature_fn: Callable[[pd.DataFrame], pd.DataFrame],
-                                           lookback_for_features: Optional[int] = None) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Dado df_candles y trades, devuelve X (features) y y (targets) para entrenamiento.
-    - feature_fn debe aceptar el df_candles completo y devolver features alineadas por índice (igual length).
-    - Por convención, para una trade de entry en ts T, buscamos la fila en df_candles con ts==T y tomamos la fila features.loc[T_index].
-    - Si no coincide ts exacto, hacemos búsqueda por igualdad entera.
-    """
-    if df_candles is None or df_candles.empty:
-        return pd.DataFrame(), pd.Series(dtype=float)
-    features = feature_fn(df_candles)
-    labels_map = trades_to_labels(trades, only_entries=True)
-    # map ts -> index
-    ts_to_idx = {int(ts): idx for idx, ts in enumerate(df_candles["ts"].astype(int).tolist())}
-    rows = []
-    targets = []
-    for entry_ts, realized in labels_map.items():
-        idx = ts_to_idx.get(int(entry_ts))
-        if idx is None:
-            # try approximate match (nearest)
-            diffs = (df_candles["ts"].astype(int) - int(entry_ts)).abs()
-            if diffs.min() <= 1:
-                idx = int(diffs.idxmin())
-            else:
-                continue
-        row_feat = features.iloc[idx]
-        rows.append(row_feat)
-        targets.append(float(realized))
-    if not rows:
-        return pd.DataFrame(), pd.Series(dtype=float)
-    X = pd.DataFrame(rows).reset_index(drop=True)
-    y = pd.Series(targets).reset_index(drop=True)
-    return X, y
-
-
-# -------------------------
-# Quick unit-test helpers (used while debugging)
-# -------------------------
-def _sanity_check_basic():
-    """Ejecuta un test rápido local para comprobar el comportamiento."""
-    df = pd.DataFrame([
-        {"ts": 1, "timestamp": "t1", "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1},
-        {"ts": 2, "timestamp": "t2", "open": 110, "high": 110, "low": 110, "close": 110, "volume": 1},
-        {"ts": 3, "timestamp": "t3", "open": 120, "high": 120, "low": 120, "close": 120, "volume": 1},
-    ])
-    def strat(row, idx, df, state):
-        if idx == 0: return "buy"
-        if idx == 2: return "sell"
-        return None
-    res = run_backtest(df, strat, initial_capital=1000.0, fee=0.001, slippage=0.0)
-    print("sanity:", res)
-    return res
-
-
-if __name__ == "__main__":
-    # quick local check when run as script
-    _sanity_check_basic()
+# Convenience alias (expected by Orchestrator)
+def run_backtest_for_storage(*args, **kwargs):
+    return run_backtest_for(*args, **kwargs)

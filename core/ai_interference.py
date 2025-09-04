@@ -1,282 +1,272 @@
-# core/ai_train.py
+# core/ai_interference.py
 """
-Genera dataset para IA y entrena un LightGBM classifier que predice la probabilidad
-de que un trade alcance target antes que stop (dentro de un horizonte).
+AI Interference / Explainability utilities
 
-Requisitos:
-- core.storage tiene funciones load_candles(asset, interval) -> DataFrame
-  y load_scores(asset, interval) -> DataFrame. Si no, use --db para sqlite fallback.
-- Guarda:
-  - models/ai_score_model.pkl  (joblib)
-  - models/ai_feature_names.json (lista de features en orden)
-Usage example:
-python -m core.ai_train --asset BTCUSDT --interval 1h --db data/db/cryptos.db --out models/ai_score_model.pkl
+Funciones principales:
+ - explain_scores(asset, storage=None, n_samples=200, use_openai=True, model=None)
+   -> devuelve texto explicativo (string). Usa OpenAI si está disponible y configurado,
+      si no ofrece un resumen local estadístico.
+ - describe_scores_df(scores_df) -> dict con estadísticas útiles.
+
+Implementación:
+ - Caching simple por fichero: data/ai_cache/{asset}.json con TTL controlado por env AI_EXPLAIN_CACHE_TTL.
+ - Rate-limit simple entre llamadas a OpenAI controlado por AI_CALL_MIN_INTERVAL (segundos).
+ - Manejo robusto de errores: si falla OpenAI, cae al resumen local sin lanzar.
 """
-import argparse
-import json
+from __future__ import annotations
+
 import os
-from pathlib import Path
-from typing import List, Tuple
-
-import joblib
-import numpy as np
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
-import lightgbm as lgb
-
-# try to import core.storage
-try:
-    from core import storage
-    _HAS_STORAGE = True
-except Exception:
-    storage = None
-    _HAS_STORAGE = False
-
-
-def load_data(asset: str, interval: str, db_path: str = None):
-    if _HAS_STORAGE:
-        candles = storage.load_candles(asset, interval)
-        scores = storage.load_scores(asset, interval)
-        try:
-            indicators = storage.load_indicators(asset, interval)
-        except Exception:
-            indicators = pd.DataFrame()
-    else:
-        if not db_path:
-            raise RuntimeError("No core.storage and no --db provided")
-        # fallback sqlite read
-        import sqlite3
-        con = sqlite3.connect(db_path)
-        candles = pd.read_sql("SELECT ts, open, high, low, close, volume FROM candles WHERE asset=? AND interval=? ORDER BY ts",
-                              con, params=(asset, interval))
-        scores = pd.read_sql("SELECT ts, score, range_min, range_max, stop, target, multiplier FROM scores WHERE asset=? AND interval=? ORDER BY ts",
-                             con, params=(asset, interval))
-        try:
-            ind_q = "SELECT c.ts as ts, i.ema9, i.ema40, i.atr, i.macd, i.macd_signal, i.rsi, i.support, i.resistance FROM candles c JOIN indicators i ON c.id=i.candle_id WHERE c.asset=? AND c.interval=? ORDER BY c.ts"
-            indicators = pd.read_sql(ind_q, con, params=(asset, interval))
-        except Exception:
-            indicators = pd.DataFrame()
-        con.close()
-
-    # coerce types
-    for df in (candles, scores, indicators):
-        if df is None:
-            df = pd.DataFrame()
-        if not df.empty and df['ts'].dtype == object:
-            try:
-                df['ts'] = pd.to_datetime(df['ts']).astype(int) // 10**9
-            except Exception:
-                df['ts'] = pd.to_numeric(df['ts'], errors='coerce').astype('Int64')
-
-    return candles, scores, indicators
-
-
-def build_label_and_features(candles: pd.DataFrame, scores: pd.DataFrame, indicators: pd.DataFrame,
-                             horizon: int = 24) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    For each score row, produce label = 1 if target is reached before stop within next `horizon` candles.
-    Features: score, ema_rel, ema_diff_norm, rsi, atr_rel, ret_1, ret_5, vol20
-    """
-
-    # merge scores onto candles using asof (score at or before candle.ts)
-    dfc = candles.sort_values('ts').reset_index(drop=True).copy()
-    dfs = scores.sort_values('ts').reset_index(drop=True).copy()
-    dfc['ts_dt'] = pd.to_datetime(dfc['ts'], unit='s')
-    dfs['ts_dt'] = pd.to_datetime(dfs['ts'], unit='s')
-    merged = pd.merge_asof(dfc, dfs, on='ts_dt', direction='backward', tolerance=pd.Timedelta('1H'))
-    merged = merged.sort_values('ts').reset_index(drop=True)
-
-    # join indicators by ts if available
-    if not indicators.empty:
-        inds = indicators.sort_values('ts').reset_index(drop=True)
-        inds['ts_dt'] = pd.to_datetime(inds['ts'], unit='s')
-        merged = pd.merge_asof(merged, inds, on='ts_dt', direction='backward', tolerance=pd.Timedelta('1H'))
-    merged = merged.drop(columns=[c for c in ['ts_dt'] if c in merged.columns], errors='ignore')
-
-    # compute fallback indicators if missing
-    if 'ema9' not in merged.columns:
-        merged['ema9'] = merged['close'].ewm(span=9, adjust=False).mean()
-    if 'ema40' not in merged.columns:
-        merged['ema40'] = merged['close'].ewm(span=40, adjust=False).mean()
-    if 'rsi' not in merged.columns:
-        delta = merged['close'].diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=14, min_periods=14).mean()
-        avg_loss = loss.rolling(window=14, min_periods=14).mean()
-        rs = avg_gain / avg_loss
-        merged['rsi'] = 100 - (100 / (1 + rs))
-        merged['rsi'] = merged['rsi'].fillna(50)
-    if 'atr' not in merged.columns:
-        high_low = merged['high'] - merged['low']
-        high_close = (merged['high'] - merged['close'].shift()).abs()
-        low_close = (merged['low'] - merged['close'].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        merged['atr'] = tr.rolling(window=14, min_periods=1).mean().fillna(0.0)
-
-    # basic features
-    merged['score_f'] = merged['score'].fillna(0.0).astype(float)
-    merged['ema_rel'] = merged['close'] / (merged['ema40'] + 1e-9)
-    merged['ema_diff_norm'] = (merged['ema9'] - merged['ema40']) / (merged['ema40'] + 1e-9)
-    merged['atr_rel'] = merged['atr'] / (merged['close'] + 1e-9)
-    merged['ret_1'] = merged['close'].pct_change(1).fillna(0.0)
-    merged['ret_5'] = merged['close'].pct_change(5).fillna(0.0)
-    merged['vol20'] = merged['close'].pct_change().rolling(20).std().fillna(0.0)
-
-    feature_cols = ['score_f', 'ema_rel', 'ema_diff_norm', 'rsi', 'atr_rel', 'ret_1', 'ret_5', 'vol20']
-
-    # construct labels by scanning forward within horizon for each row
-    labels = []
-    rows = []
-    ts_to_index = {int(r['ts']): i for i, r in merged.iterrows()}
-
-    for i, row in merged.iterrows():
-        # require that row has stop & target
-        if pd.isna(row.get('stop')) or pd.isna(row.get('target')):
-            labels.append(np.nan)
-            continue
-        entry_idx = i + 1  # we assume entry at next candle open
-        if entry_idx >= len(merged):
-            labels.append(np.nan)
-            continue
-        stop = float(row['stop'])
-        target = float(row['target'])
-        hit_target_first = False
-        hit_any = False
-
-        for look in range(entry_idx, min(entry_idx + horizon, len(merged))):
-            high = float(merged.iloc[look]['high'])
-            low = float(merged.iloc[look]['low'])
-            # if target reached and stop not reached prior
-            if high >= target and low > stop:
-                hit_target_first = True
-                hit_any = True
-                break
-            if low <= stop and high < target:
-                hit_target_first = False
-                hit_any = True
-                break
-            if high >= target and low <= stop:
-                # both in same candle -> choose by proximity to open
-                open_price = float(merged.iloc[look]['open'])
-                if abs(target - open_price) <= abs(open_price - stop):
-                    hit_target_first = True
-                else:
-                    hit_target_first = False
-                hit_any = True
-                break
-        if not hit_any:
-            labels.append(0)  # treat as negative (target not reached within horizon)
-        else:
-            labels.append(1 if hit_target_first else 0)
-
-    merged['label'] = labels
-    # drop rows without label
-    df_model = merged.dropna(subset=['label']).reset_index(drop=True)
-    # keep only useful cols
-    X = df_model[feature_cols].fillna(0.0)
-    y = df_model['label'].astype(int).values
-
-    return X, y, feature_cols, df_model
-
-
-def train_model(X: pd.DataFrame, y: np.ndarray, params: dict = None, test_size: float = 0.2, random_state: int = 42):
-    if params is None:
-        params = {
-            'objective': 'binary',
-            'metric': 'auc',
-            'verbosity': -1,
-            'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'learning_rate': 0.05,
-            'n_estimators': 200
-        }
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, shuffle=True, stratify=y)
-    lgbm = lgb.LGBMClassifier(**params)
-    lgbm.fit(X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='auc', early_stopping_rounds=20, verbose=False)
-    preds = lgbm.predict_proba(X_test)[:, 1]
-    auc = roc_auc_score(y_test, preds)
-    return lgbm, auc
-
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--asset', required=True)
-    p.add_argument('--interval', default='1h')
-    p.add_argument('--db', default=None, help='sqlite fallback')
-    p.add_argument('--horizon', type=int, default=24)
-    p.add_argument('--out', default='models/ai_score_model.pkl')
-    p.add_argument('--feat_out', default='models/ai_feature_names.json')
-    p.add_argument('--test_size', type=float, default=0.2)
-    p.add_argument('--random_state', type=int, default=42)
-    args = p.parse_args()
-
-    os.makedirs(Path(args.out).parent, exist_ok=True)
-
-    candles, scores, indicators = load_data(args.asset, args.interval, db_path=args.db)
-    X, y, feature_cols, df_model = build_label_and_features(candles, scores, indicators, horizon=args.horizon)
-    if X.empty or len(y) == 0:
-        raise RuntimeError("Not enough labeled data to train")
-
-    model, auc = train_model(X, y, test_size=args.test_size, random_state=args.random_state)
-    joblib.dump(model, args.out)
-    with open(args.feat_out, 'w', encoding='utf-8') as f:
-        json.dump(feature_cols, f, indent=2)
-
-    print(f\"Model trained. AUC on holdout: {auc:.4f}\")\n```
-
----
-
-### core/ai_inference.py (mejorada)
-Reemplaza tu fichero con esta versión — ahora carga también el archivo `models/ai_feature_names.json` para asegurar orden correcto.
-```python
-# core/ai_inference.py
-import joblib
+import time
 import json
+import math
+import logging
 from pathlib import Path
+from typing import Optional, Dict, Any
+
+import pandas as pd
 import numpy as np
 
-MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "ai_score_model.pkl"
-FEATURES_PATH = Path(__file__).resolve().parents[1] / "models" / "ai_feature_names.json"
+# optional import of openai
+try:
+    import openai
+except Exception:
+    openai = None
 
-_model = None
-_model_features = None
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
-def load_model():
-    global _model, _model_features
-    if _model is None:
-        if MODEL_PATH.exists():
-            _model = joblib.load(MODEL_PATH)
-        else:
-            return None
-    if _model_features is None:
-        if FEATURES_PATH.exists():
-            with open(FEATURES_PATH, 'r', encoding='utf-8') as f:
-                _model_features = json.load(f)
-        else:
-            _model_features = None
-    return _model
+# cache dir
+CACHE_DIR = Path(os.getenv("AI_CACHE_DIR", "data/ai_cache"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_TTL = int(os.getenv("AI_EXPLAIN_CACHE_TTL", "3600"))  # seconds
 
-def predict_prob(feature_dict: dict):
-    \"\"\"Return probability in [0,1] or None if model missing.
+# minimum seconds between OpenAI calls (simple rate limiter)
+MIN_INTERVAL = float(os.getenv("AI_CALL_MIN_INTERVAL", "0.5"))
+_LAST_AI_CALL_TS = 0.0
 
-    feature_dict: mapping feature_name -> value
-    The function will order the features according to the saved feature list.
-    \"\"\"
-    mdl = load_model()
-    if mdl is None:
+
+def _ensure_seconds_between_calls():
+    """Simple wait to ensure MIN_INTERVAL between calls."""
+    global _LAST_AI_CALL_TS
+    now = time.time()
+    elapsed = now - _LAST_AI_CALL_TS
+    if elapsed < MIN_INTERVAL:
+        to_sleep = MIN_INTERVAL - elapsed
+        logger.debug("Sleeping %.3fs to respect AI_CALL_MIN_INTERVAL", to_sleep)
+        time.sleep(to_sleep)
+    _LAST_AI_CALL_TS = time.time()
+
+
+def _cache_path_for(asset: str) -> Path:
+    safe = str(asset).replace("/", "_").replace(" ", "_")
+    return CACHE_DIR / f"{safe}.json"
+
+
+def _load_cached(asset: str) -> Optional[Dict[str, Any]]:
+    p = _cache_path_for(asset)
+    if not p.exists():
         return None
-    if _model_features is None:
-        raise RuntimeError('Feature names file not found (models/ai_feature_names.json). Train model first.')
-
-    X = np.array([[feature_dict.get(fn, 0.0) for fn in _model_features]])
     try:
-        if hasattr(mdl, 'predict_proba'):
-            return float(mdl.predict_proba(X)[0, 1])
-        # fallback: if model returns raw score, map with sigmoid
-        preds = mdl.predict(X)
-        return float(1.0 / (1.0 + np.exp(-preds[0])))
-    except Exception as e:
-        # if prediction fails, return None to indicate no AI contribution
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        ts = obj.get("_generated_at", 0)
+        if time.time() - float(ts) > CACHE_TTL:
+            return None
+        return obj
+    except Exception:
         return None
+
+
+def _save_cache(asset: str, payload: Dict[str, Any]) -> None:
+    p = _cache_path_for(asset)
+    try:
+        payload["_generated_at"] = time.time()
+        p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.exception("Failed to write AI cache for %s", asset)
+
+
+def describe_scores_df(scores_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Extrae estadísticas y resumen útil de scores_df.
+    scores_df: DataFrame with columns ['ts','score'] where 'score' is dict-like or numeric.
+    Devuelve dict con count, mean, std, min, max, quantiles y small-sample examples.
+    """
+    if scores_df is None or scores_df.empty:
+        return {"count": 0}
+
+    def _extract_numeric(val):
+        # tries to get numeric pred from whatever representation
+        try:
+            if isinstance(val, dict):
+                if "pred" in val:
+                    return float(val["pred"])
+                # try first numeric
+                for v in val.values():
+                    try:
+                        return float(v)
+                    except Exception:
+                        continue
+            return float(val)
+        except Exception:
+            return float("nan")
+
+    s = scores_df["score"].apply(_extract_numeric).dropna()
+    if s.empty:
+        return {"count": 0}
+
+    desc = s.describe(percentiles=[0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]).to_dict()
+    top = s.nlargest(5).tolist()
+    bot = s.nsmallest(5).tolist()
+    out = {
+        "count": int(desc.get("count", 0)),
+        "mean": float(desc.get("mean", math.nan)),
+        "std": float(desc.get("std", math.nan)),
+        "min": float(desc.get("min", math.nan)),
+        "max": float(desc.get("max", math.nan)),
+        "25%": float(desc.get("25%", math.nan)),
+        "50%": float(desc.get("50%", math.nan)),
+        "75%": float(desc.get("75%", math.nan)),
+        "1%": float(desc.get("1%", math.nan)) if "1%" in desc else None,
+        "95%": float(desc.get("95%", math.nan)) if "95%" in desc else None,
+        "top5": top,
+        "bottom5": bot,
+    }
+    return out
+
+
+def _local_explain_text(asset: str, stats: Dict[str, Any]) -> str:
+    """
+    Genera texto explicativo a partir de stats dict (output de describe_scores_df).
+    """
+    if not stats or stats.get("count", 0) == 0:
+        return f"No hay scores numéricos suficientes para el activo {asset}."
+    lines = []
+    lines.append(f"Resumen automatizado de scores para {asset}:")
+    lines.append(f"- Número de muestras: {stats.get('count')}")
+    lines.append(f"- Media: {stats.get('mean'):.6f}, desviación típica: {stats.get('std'):.6f}")
+    lines.append(f"- Rango: min={stats.get('min'):.6f} / max={stats.get('max'):.6f}")
+    q25 = stats.get("25%")
+    q75 = stats.get("75%")
+    if q25 is not None and q75 is not None:
+        lines.append(f"- IQR (25%-75%): {q25:.6f} - {q75:.6f}")
+    top = stats.get("top5") or []
+    bot = stats.get("bottom5") or []
+    if top:
+        lines.append("- Top 5 preds: " + ", ".join([f"{v:.6f}" for v in top]))
+    if bot:
+        lines.append("- Bottom 5 preds: " + ", ".join([f"{v:.6f}" for v in bot]))
+    # suggestions
+    lines.append("")
+    lines.append("Sugerencias automáticas:")
+    if stats.get("std", 0) > 1e-3 * max(1.0, abs(stats.get("mean", 0))):
+        lines.append("- La varianza es relativamente alta: considera normalizar features o reducir la complejidad del modelo.")
+    else:
+        lines.append("- La varianza es baja; el modelo podría estar sobreajustado o producir predicciones conservadoras.")
+    lines.append("- Revisa que los datos de entrada no contengan leaks temporales y que el backfill de velas esté completo.")
+    return "\n".join(lines)
+
+
+def _call_openai(prompt: str, model: Optional[str] = None, max_tokens: int = 512) -> Optional[str]:
+    """
+    Llama a OpenAI ChatCompletion (síncrono). Retorna texto o None en caso de fallo.
+    """
+    if openai is None:
+        logger.debug("openai package no disponible")
+        return None
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        logger.debug("OPENAI_API_KEY no configurada")
+        return None
+
+    # comply with rate/min interval
+    _ensure_seconds_between_calls()
+
+    try:
+        openai.api_key = key
+        model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        # Build a compact system + user prompt
+        messages = [
+            {"role": "system", "content": "Eres un asistente que resume métricas de modelos y ofrece recomendaciones prácticas para mejorar modelos de trading."},
+            {"role": "user", "content": prompt},
+        ]
+        # Try ChatCompletion (works with older clients); if not, fallback to openai.ChatCompletion.create
+        resp = openai.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens, temperature=0.2)
+        # The API returns choices -> message for ChatCompletion
+        if resp and getattr(resp, "choices", None):
+            choice = resp.choices[0]
+            # support both .message.content and .text
+            text = None
+            if getattr(choice, "message", None) and getattr(choice.message, "content", None):
+                text = choice.message.content
+            elif getattr(choice, "text", None):
+                text = choice.text
+            if text:
+                return str(text).strip()
+        # fallback to text if shape differs
+        return None
+    except Exception:
+        logger.exception("OpenAI call failed")
+        return None
+
+
+def explain_scores(asset: str, storage=None, n_samples: int = 200, use_openai: bool = True, model: Optional[str] = None) -> str:
+    """
+    Main function:
+      - intenta cargar n_samples scores desde storage (si se proporciona)
+      - si hay cache válida devuelve cache
+      - si OPENAI y use_openai -> llama OpenAI (con rate limit + retries breve)
+      - si falla, genera resumen local y lo devuelve
+    """
+    # 1) try cache
+    cache = _load_cached(asset)
+    if cache is not None:
+        logger.debug("Returning cached AI explanation for %s", asset)
+        return cache.get("text", "")
+
+    # 2) load scores from storage if available
+    scores_df = None
+    if storage is not None and hasattr(storage, "load_scores"):
+        try:
+            scores_df = storage.load_scores(asset=asset, limit=n_samples)
+        except Exception:
+            logger.exception("storage.load_scores failed for explain_scores")
+            scores_df = None
+
+    # 3) compute local stats
+    stats = describe_scores_df(scores_df) if scores_df is not None else {"count": 0}
+
+    # 4) attempt OpenAI if requested
+    text = None
+    if use_openai and openai is not None and os.getenv("OPENAI_API_KEY"):
+        # build compact prompt
+        if stats.get("count", 0) == 0:
+            prompt = f"Provee una breve explicación sobre posibles problemas y checks para el asset {asset}. No hay suficientes scores numéricos; sugiere pasos de depuración."
+        else:
+            # include stats summary in the prompt
+            stats_json = json.dumps(stats, ensure_ascii=False, indent=2)
+            prompt = (
+                f"Here are summary statistics for model scores for asset {asset}:\n\n{stats_json}\n\n"
+                "Provide a clear explanation of what these statistics mean, likely causes (data, model), "
+                "and 3 practical suggestions to investigate or improve the model. Be concise and actionable."
+            )
+        # try with small retries
+        retries = int(os.getenv("AI_OPENAI_MAX_RETRIES", "2"))
+        for attempt in range(1, retries + 1):
+            text = _call_openai(prompt, model=model)
+            if text:
+                break
+            sleep = 0.5 * attempt
+            logger.debug("OpenAI attempt %d failed, sleeping %.2fs", attempt, sleep)
+            time.sleep(sleep)
+
+    # 5) fallback to local explanation
+    if not text:
+        text = _local_explain_text(asset, stats)
+
+    # 6) cache and return
+    try:
+        _save_cache(asset, {"text": text, "stats": stats})
+    except Exception:
+        logger.exception("Failed to save AI cache (continuing)")
+
+    return text

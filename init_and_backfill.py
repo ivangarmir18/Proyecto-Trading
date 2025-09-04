@@ -1,342 +1,281 @@
+#!/usr/bin/env python3
+# init_and_backfill.py
 """
-core/init_and_backfill.py
-
-Backfill robusto y resumable para Proyecto-Trading.
+Init DB + Backfill CLI (completo, resumable y concurrente).
 
 Características principales:
-- Lee lista de assets+intervals desde data/config/*.csv o desde la tabla watchlist.
-- Para cada asset:
-  - Consulta el estado de backfill en la DB (tabla backfill_status).
-  - Usa archivos locales en data/backfill_sources/ si existen.
-  - Si no hay archivos locales, intenta llamar a core.fetcher.fetch_historical (si existe).
-  - Divide rangos largos en ventanas manejables y hace fetch/insert por trozos.
-  - Retries con backoff, control de concurrencia, registro por asset y resumen final.
-- Proporciona hooks (callback) opcionales para progresos por asset (útil para UI).
+- init DB idempotente (--init-db).
+- Soporta entrada de assets por: --asset, --csv, --watchlist (DB).
+- Soporta --incremental (usa backfill_status.last_ts para reanudar).
+- Rango (--start/--end) en ISO o ms; utilidades de parseo robustas.
+- Concurrencia configurable (--concurrency) con ThreadPoolExecutor.
+- Retries y backoff configurables (--max-retries, --backoff-factor).
+- Dry-run mode (no escribe en DB).
+- Logs por asset (folder logs/backfill) y summary final.
+- Integración con Orchestrator.run_backfill_for (usa storage.save_candles a través del orchestrator).
+- Actualiza backfill_status (update_backfill_status) tras cada asset (ok / error).
+- Seguro frente a interrupciones; cada asset es independiente y reanudable.
 
-Uso (CLI):
-  python -m core.init_and_backfill --concurrency 6 --chunk-hours 168 --local-folder data/backfill_sources
-
-Devuelve un resumen con filas procesadas por asset.
+Uso:
+    python init_and_backfill.py --watchlist --incremental --concurrency 4
+    python init_and_backfill.py --asset BTCUSDT --interval 1h --start 2024-01-01 --end 2024-01-03
 """
+from __future__ import annotations
+
 import os
-import glob
-import time
+import sys
 import argparse
 import logging
+import time
+import math
+from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Callable, Dict, Any, List, Tuple
+from pathlib import Path
 
 import pandas as pd
 
-from core.storage_postgres import PostgresStorage
+# Intentar importar Orchestrator y storage factory (fallar con mensaje claro si no existen)
+try:
+    from core.orchestrator import Orchestrator
+    from core.storage_postgres import make_storage_from_env
+except Exception as e:
+    raise RuntimeError("No se pudieron importar core.orchestrator o core.storage_postgres. Asegúrate de haberlos implementado.") from e
+
+# Logging
+LOG_DIR = Path(os.getenv("PROJECT_LOG_DIR", "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+BACKFILL_LOG_DIR = LOG_DIR / "backfill"
+BACKFILL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("init_and_backfill")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-    logger.addHandler(ch)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+ch = logging.StreamHandler(sys.stdout)
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+ch.setFormatter(fmt)
+logger.addHandler(ch)
 
-# Try to import a project fetcher if present
-try:
-    from core.fetcher import fetch_historical  # type: ignore
-    HAS_FETCHER = True
-    logger.info("Found core.fetcher.fetch_historical — remote fetch enabled")
-except Exception:
-    fetch_historical = None  # type: ignore
-    HAS_FETCHER = False
-    logger.info("No core.fetcher found — relying on local CSVs or remote fetcher unavailable")
+# Helper: parse time arg
+def parse_time_arg(val: Optional[str]) -> Optional[int]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s == "":
+        return None
+    # digits -> assume ms
+    if s.isdigit():
+        return int(s)
+    # parse iso using pandas
+    try:
+        ts = pd.to_datetime(s, utc=True)
+        return int(ts.value // 10 ** 6)
+    except Exception:
+        raise argparse.ArgumentTypeError(f"Formato de tiempo no reconocido: {val}")
 
+def load_assets_from_csv(path: str) -> List[Dict[str, Any]]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"CSV no encontrado: {path}")
+    df = pd.read_csv(p)
+    if "asset" not in df.columns:
+        raise ValueError("CSV debe contener columna 'asset'")
+    out = []
+    for _, row in df.iterrows():
+        asset = str(row["asset"]).strip()
+        interval = str(row.get("interval", "")).strip() or None
+        out.append({"asset": asset, "interval": interval})
+    return out
 
-# ---------- Helpers to read configs ----------
-def read_config_assets(config_glob: str = "data/config/*.csv") -> List[Dict[str, str]]:
+def build_asset_list(args: argparse.Namespace, storage) -> List[Dict[str, Any]]:
+    if args.asset:
+        return [{"asset": args.asset.strip(), "interval": args.interval}]
+    if args.csv:
+        return load_assets_from_csv(args.csv)
+    if args.watchlist:
+        if storage is None:
+            raise RuntimeError("Storage requerido para --watchlist")
+        wl = storage.list_watchlist()
+        out = []
+        for e in wl:
+            if isinstance(e, dict):
+                asset = e.get("asset")
+                meta = e.get("meta") or {}
+                interval = meta.get("interval") if isinstance(meta, dict) else None
+            else:
+                asset = e
+                interval = None
+            out.append({"asset": asset, "interval": interval or args.interval})
+        return out
+    raise RuntimeError("No assets specified. Usa --asset, --csv o --watchlist.")
+
+def _asset_logger(asset: str) -> logging.Logger:
+    # logger por asset que escribe en logs/backfill/{asset}.log
+    name = f"backfill.{asset}"
+    l = logging.getLogger(name)
+    if not l.handlers:
+        fh = logging.FileHandler(BACKFILL_LOG_DIR / f"{asset}.log", encoding="utf-8")
+        fh.setFormatter(fmt)
+        l.addHandler(fh)
+        l.setLevel(logger.level)
+    return l
+
+def _safe_update_backfill_status(storage, asset: str, interval: str, last_ts: Optional[int]):
+    try:
+        if hasattr(storage, "update_backfill_status"):
+            storage.update_backfill_status(asset, interval=interval, last_ts=last_ts)
+    except Exception:
+        logger.exception("update_backfill_status fallo para %s", asset)
+
+def _run_backfill_single(orch: Orchestrator, storage, asset: str, interval: str,
+                         start_ms: Optional[int], end_ms: Optional[int],
+                         max_retries: int, backoff_factor: float, dry_run: bool,
+                         per_asset_log: bool = True) -> Dict[str, Any]:
     """
-    Read CSV files under data/config to get list of dicts {'asset':..., 'interval':...}.
-    Heurística tolerante a nombres de columna (asset/symbol/ticker ; interval/timeframe).
+    Ejecuta backfill para un solo asset; maneja reintentos/backoff; actualiza backfill_status.
+    Retorna dict resumen.
     """
-    assets: List[Dict[str, str]] = []
-    paths = glob.glob(config_glob)
-    for p in paths:
+    asset_log = _asset_logger(asset) if per_asset_log else logger
+    attempt = 0
+    last_exception = None
+
+    # deduce start/end with incremental if requested by caller previously
+    while attempt <= max_retries:
+        attempt += 1
         try:
-            df = pd.read_csv(p)
-        except Exception:
-            logger.exception("Failed to read config CSV %s", p)
-            continue
-        # Try explicit columns
-        a_col = None
-        i_col = None
-        for c in df.columns:
-            cl = c.lower()
-            if cl in ("asset", "symbol", "ticker"):
-                a_col = c
-            if cl in ("interval", "timeframe", "tf"):
-                i_col = c
-        if a_col:
-            for _, r in df.iterrows():
-                asset = str(r[a_col])
-                interval = str(r[i_col]) if i_col and pd.notna(r.get(i_col)) else "1m"
-                assets.append({"asset": asset, "interval": interval})
-    # Deduplicate and return
-    seen = set()
-    uniq = []
-    for x in assets:
-        k = (x["asset"], x["interval"])
-        if k not in seen:
-            seen.add(k)
-            uniq.append(x)
-    return uniq
-
-
-# ---------- local file helpers ----------
-def find_local_backfill_files(asset: str, interval: str, folder: str = "data/backfill_sources") -> List[str]:
-    """
-    Busca ficheros en folder que parezcan corresponder a asset+interval.
-    """
-    patt1 = os.path.join(folder, f"{asset}*{interval}*.csv")
-    files = glob.glob(patt1)
-    if not files:
-        patt2 = os.path.join(folder, f"{asset}*.csv")
-        files = glob.glob(patt2)
-    return sorted(files)
-
-
-def load_csv_to_df(path: str, asset: Optional[str] = None, interval: Optional[str] = None) -> pd.DataFrame:
-    """
-    Carga CSV, normaliza columnas (ts/timestamp/open/high/low/close/volume/asset/interval).
-    Convierte timestamp->ts (segundos).
-    Devuelve DataFrame ordenado por ts.
-    """
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        logger.exception("Failed reading backfill CSV %s", path)
-        return pd.DataFrame(columns=["ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"])
-    # normalize
-    colmap = {}
-    for ec in df.columns:
-        lc = ec.lower()
-        if lc in ("ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "symbol", "interval", "timeframe", "volume"):
-            if lc == "symbol":
-                colmap[ec] = "asset"
-            elif lc == "timeframe":
-                colmap[ec] = "interval"
-            else:
-                colmap[ec] = lc
-    df = df.rename(columns=colmap)
-    if "timestamp" in df.columns and "ts" not in df.columns:
-        df["ts"] = pd.to_datetime(df["timestamp"]).astype("int64") // 10 ** 9
-    if asset and "asset" not in df.columns:
-        df["asset"] = asset
-    if interval and "interval" not in df.columns:
-        df["interval"] = interval
-    # ensure cols
-    for c in ["ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"]:
-        if c not in df.columns:
-            df[c] = None
-    # drop dupes and sort
-    df = df.drop_duplicates(subset=["ts", "asset", "interval"], keep="last").sort_values("ts").reset_index(drop=True)
-    return df
-
-
-# ---------- backfill core ----------
-def _chunk_range(start_ts: int, end_ts: int, chunk_seconds: int) -> List[Tuple[int, int]]:
-    """
-    Divide [start_ts, end_ts] en ventanas de chunk_seconds (inclusive).
-    """
-    ranges = []
-    cur = start_ts
-    while cur <= end_ts:
-        end = min(end_ts, cur + chunk_seconds - 1)
-        ranges.append((cur, end))
-        cur = end + 1
-    return ranges
-
-
-def backfill_asset(storage: PostgresStorage,
-                   asset: str,
-                   interval: str,
-                   *,
-                   local_folder: str = "data/backfill_sources",
-                   chunk_hours: int = 168,
-                   retries: int = 3,
-                   retry_backoff: float = 2.0,
-                   default_days: int = 365,
-                   progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> Dict[str, Any]:
-    """
-    Backfill resumable para un único asset/interval.
-    - Usa estado en DB (backfill_status).
-    - Primero intenta cargar CSVs locales.
-    - Si no hay archivos locales, intenta fetch_historical si está disponible.
-    - chunk_hours controla el tamaño de piezas para fetch remoto.
-    - progress_callback(asset, info) se llama tras cada chunk/archivo procesado.
-    Retorna un dict resumen: {'asset':..., 'interval':..., 'rows': n, 'errors': [...]}.
-    """
-    logger.info("Backfill start for %s %s", asset, interval)
-    summary = {"asset": asset, "interval": interval, "rows": 0, "errors": []}
-    try:
-        # determine last ts from backfill_status or candles
-        last_ts = storage.get_backfill_status(asset)
-        if last_ts is None:
+            if dry_run:
+                asset_log.info("[DRY-RUN] Would run backfill for %s %s start=%s end=%s", asset, interval, start_ms, end_ms)
+                # do not update DB
+                return {"asset": asset, "interval": interval, "status": "dry-run", "attempt": attempt}
+            asset_log.info("Backfill attempt %d for %s %s (range %s - %s)", attempt, asset, interval, start_ms, end_ms)
+            # Orchestrator.run_backfill_for deduce rango si start_ms/end_ms is None
+            summary = orch.run_backfill_for(asset, interval, start_ms=start_ms, end_ms=end_ms, batch_window_ms=args.batch_window_ms)
+            asset_log.info("Backfill OK for %s %s -> %s", asset, interval, summary)
+            # update backfill_status: set last_ts = end of range (use summary or end_ms)
+            last_ts_val = None
+            # prefer summary end if present
+            if isinstance(summary, dict):
+                last_ts_val = summary.get("end_ms") or summary.get("end_ts") or summary.get("last_ts")
+            if last_ts_val is None and end_ms:
+                last_ts_val = end_ms
+            _safe_update_backfill_status(storage, asset, interval, last_ts_val)
+            return {"asset": asset, "interval": interval, "status": "ok", "summary": summary, "attempt": attempt}
+        except KeyboardInterrupt:
+            asset_log.warning("Interrupción por teclado en backfill de %s", asset)
+            return {"asset": asset, "interval": interval, "status": "interrupted", "attempt": attempt}
+        except Exception as e:
+            last_exception = e
+            asset_log.exception("Backfill attempt %d failed for %s: %s", attempt, asset, e)
+            # update backfill_status with null last_ts to mark attempted
             try:
-                last_rad = storage.load_candles(asset, interval, limit=1, ascending=False)
-                if not last_rad.empty:
-                    last_ts = int(last_rad.iloc[0]["ts"])
+                _safe_update_backfill_status(storage, asset, interval, last_ts=None)
             except Exception:
-                logger.debug("No candles in DB for %s %s", asset, interval)
-        # gather local files
-        files = find_local_backfill_files(asset, interval, local_folder)
-        if files:
-            logger.info("Found %d local backfill file(s) for %s", len(files), asset)
-            for fpath in files:
-                try:
-                    df = load_csv_to_df(fpath, asset=asset, interval=interval)
-                    if last_ts is not None:
-                        df = df[df["ts"] > last_ts]
-                    if df.empty:
-                        logger.info("Local file %s has no new rows for %s", fpath, asset)
-                        continue
-                    n = storage.save_candles(df, asset=asset, interval=interval)
-                    summary["rows"] += n
-                    last_ts = int(df["ts"].max())
-                    storage.update_backfill_status(asset, interval, last_ts)
-                    if progress_callback:
-                        progress_callback(asset, {"type": "local_file", "file": fpath, "rows": n})
-                except Exception:
-                    logger.exception("Failed processing local backfill file %s", fpath)
-                    summary["errors"].append(f"local:{fpath}")
-        else:
-            # No local files -> use remote fetcher (if available)
-            if not HAS_FETCHER:
-                msg = f"No local files and no remote fetcher for {asset}"
-                logger.warning(msg)
-                summary["errors"].append("no_source")
-                return summary
-            # determine start_ts for fetching
-            if last_ts is None:
-                start_ts = int((pd.Timestamp.utcnow() - pd.Timedelta(days=default_days)).timestamp())
-            else:
-                start_ts = int(last_ts + 1)
-            end_ts = int(pd.Timestamp.utcnow().timestamp())
-            chunk_seconds = max(60, chunk_hours * 3600)
-            ranges = _chunk_range(start_ts, end_ts, chunk_seconds)
-            logger.info("Remote fetcher for %s -> %d ranges", asset, len(ranges))
-            for (s_ts, e_ts) in ranges:
-                attempt = 0
-                while attempt <= retries:
-                    try:
-                        # fetch_historical should return a dataframe with ts/timestamp/open/high/low/close/volume
-                        df = fetch_historical(asset, interval, s_ts, e_ts)
-                        if df is None or df.empty:
-                            logger.info("Fetcher empty for %s %s -> %s-%s", asset, interval, s_ts, e_ts)
-                        else:
-                            # normalize and save
-                            df = load_csv_to_df(df.to_csv(index=False)) if isinstance(df, pd.DataFrame) else load_csv_to_df(df)  # safe normalization
-                            # Note: if fetch_historical returns a DataFrame already with correct cols, load_csv_to_df handles string path fallback wrongly.
-                            # Better: if df is DataFrame, normalize directly:
-                            if isinstance(df, pd.DataFrame):
-                                # ensure columns and types
-                                # (load_csv_to_df expects a path; so instead apply transformation inline)
-                                dfn = df.copy()
-                                # unify column names
-                                dfn.columns = [c.lower() for c in dfn.columns]
-                                if "timestamp" in dfn.columns and "ts" not in dfn.columns:
-                                    dfn["ts"] = pd.to_datetime(dfn["timestamp"]).astype("int64") // 10 ** 9
-                                for c in ["open","high","low","close","volume","asset","interval"]:
-                                    if c not in dfn.columns:
-                                        dfn[c] = None
-                                dfn["asset"] = asset
-                                dfn["interval"] = interval
-                                dfn = dfn[["ts","timestamp","open","high","low","close","volume","asset","interval"]]
-                                df = dfn.drop_duplicates(subset=["ts","asset","interval"]).sort_values("ts")
-                            # apply last_ts filter
-                            if last_ts is not None:
-                                df = df[df["ts"] > last_ts]
-                            if df.empty:
-                                logger.info("No new rows in fetched chunk %s-%s for %s", s_ts, e_ts, asset)
-                            else:
-                                n = storage.save_candles(df, asset=asset, interval=interval)
-                                summary["rows"] += n
-                                last_ts = int(df["ts"].max())
-                                storage.update_backfill_status(asset, interval, last_ts)
-                                if progress_callback:
-                                    progress_callback(asset, {"type": "remote_chunk", "range": (s_ts, e_ts), "rows": n})
-                        break  # success or empty -> next chunk
-                    except Exception:
-                        logger.exception("Fetcher failed for %s range %s-%s (attempt %d)", asset, s_ts, e_ts, attempt)
-                        attempt += 1
-                        time.sleep(retry_backoff ** attempt)
-                        if attempt > retries:
-                            summary["errors"].append(f"remote:{s_ts}-{e_ts}")
-    except Exception:
-        logger.exception("backfill_asset unexpected failure for %s", asset)
-        summary["errors"].append("unexpected")
-    logger.info("Backfill finished for %s rows=%s errors=%s", asset, summary["rows"], len(summary["errors"]))
-    return summary
+                asset_log.exception("No se pudo actualizar backfill_status tras fallo")
+            if attempt > max_retries:
+                break
+            # backoff sleep
+            sleep_for = backoff_factor * (2 ** (attempt - 1))
+            # cap the sleep to a reasonable amount (e.g. 1 hour)
+            sleep_for = min(sleep_for, 3600)
+            asset_log.info("Sleeping %.1fs before retry for %s", sleep_for, asset)
+            time.sleep(sleep_for)
+    # final failure
+    logger.exception("Backfill final failure for %s after %d attempts: %s", asset, max_retries, last_exception)
+    return {"asset": asset, "interval": interval, "status": "error", "error": str(last_exception), "attempt": attempt}
 
-
-def run_backfill(concurrency: int = 4,
-                 chunk_hours: int = 168,
-                 local_folder: str = "data/backfill_sources",
-                 default_days: int = 365,
-                 assets_override: Optional[List[Dict[str, str]]] = None,
-                 progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> Dict[str, Any]:
-    """
-    Orquesta backfill para todos los assets encontrados en config o watchlist.
-    - assets_override: lista [{'asset':.., 'interval':..}] para forzar conjunto.
-    - progress_callback se pasa hacia cada worker.
-    Devuelve resumen global.
-    """
-    storage = PostgresStorage()
-    storage.init_db()
-    if assets_override is None:
-        assets = read_config_assets()
-        if not assets:
-            # try watchlist
-            try:
-                wl = storage.list_watchlist()
-                assets = [{"asset": a, "interval": "1m"} for a in wl]
-            except Exception:
-                assets = []
-    else:
-        assets = assets_override
-
-    logger.info("run_backfill: assets count=%d", len(assets))
-    results = {}
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = {}
-        for a in assets:
-            asset = a["asset"]
-            interval = a.get("interval", "1m")
-            fut = ex.submit(backfill_asset,
-                             storage,
-                             asset,
-                             interval,
-                             local_folder=local_folder,
-                             chunk_hours=chunk_hours,
-                             default_days=default_days,
-                             progress_callback=progress_callback)
-            futures[fut] = (asset, interval)
-        for fut in as_completed(futures):
-            asset, interval = futures[fut]
-            try:
-                res = fut.result()
-                results[f"{asset}:{interval}"] = res
-            except Exception:
-                logger.exception("Backfill worker crashed for %s", asset)
-                results[f"{asset}:{interval}"] = {"asset": asset, "interval": interval, "rows": 0, "errors": ["worker_crash"]}
-    storage.close()
-    # summary
-    total_rows = sum(r.get("rows", 0) for r in results.values())
-    total_errors = sum(len(r.get("errors", [])) for r in results.values())
-    return {"assets": len(results), "total_rows": total_rows, "total_errors": total_errors, "per_asset": results}
-
+# --- CLI ---
+def _parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Init DB and run resumable backfills (concurrency, retries, resume).")
+    p.add_argument("--init-db", action="store_true", help="Inicializa la DB (create tables).")
+    p.add_argument("--watchlist", action="store_true", help="Leer assets desde storage.watchlist")
+    p.add_argument("--csv", help="CSV con columna asset (y opcional interval)")
+    p.add_argument("--asset", help="Asset único para backfill (overrides watchlist/csv)")
+    p.add_argument("--interval", default="1h", help="Interval por defecto si no viene en watchlist/CSV")
+    p.add_argument("--start", type=parse_time_arg, help="Start ts (ISO o ms)")
+    p.add_argument("--end", type=parse_time_arg, help="End ts (ISO o ms)")
+    p.add_argument("--incremental", action="store_true", help="Hacer incremental (usar backfill_status.last_ts como start)")
+    p.add_argument("--concurrency", type=int, default=2, help="Número de threads en paralelo")
+    p.add_argument("--max-retries", type=int, default=3, help="Reintentos por asset")
+    p.add_argument("--backoff-factor", type=float, default=1.0, help="Factor base para backoff exponencial (segundos)")
+    p.add_argument("--batch-window-ms", type=int, default=None, help="Tamaño de ventana para backfill_range (ms). Dejar None para heurística")
+    p.add_argument("--sleep-between", type=float, default=0.5, help="sleep entre assets durante ejecución secuencial")
+    p.add_argument("--dry-run", action="store_true", help="No persiste nada; solo muestra qué haría")
+    p.add_argument("--limit", type=int, default=None, help="Limitar número de assets a procesar (para pruebas)")
+    p.add_argument("--log-file", default=None, help="Escribir log principal a fichero")
+    return p.parse_args(argv)
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--concurrency", type=int, default=4)
-    p.add_argument("--chunk-hours", type=int, default=168)
-    p.add_argument("--local-folder", type=str, default="data/backfill_sources")
-    p.add_argument("--default-days", type=int, default=365)
-    args = p.parse_args()
-    summary = run_backfill(concurrency=args.concurrency, chunk_hours=args.chunk_hours, local_folder=args.local_folder, default_days=args.default_days)
-    logger.info("Backfill summary: %s", summary)
+    args = _parse_args(sys.argv[1:])
+
+    if args.log_file:
+        fh_main = logging.FileHandler(args.log_file, encoding="utf-8")
+        fh_main.setFormatter(fmt)
+        logger.addHandler(fh_main)
+
+    # crear storage + orchestrator
+    storage = make_storage_from_env()
+    orch = Orchestrator(storage=storage)
+
+    if args.init_db:
+        logger.info("Inicializando DB (init_db) ...")
+        storage.init_db()
+        logger.info("DB inicializada exitosamente.")
+
+    # construir lista de assets
+    try:
+        assets = build_asset_list(args, storage)
+    except Exception as e:
+        logger.exception("No se pudo construir lista de assets: %s", e)
+        sys.exit(2)
+
+    if args.limit:
+        assets = assets[: args.limit]
+
+    if not assets:
+        logger.info("No hay assets a procesar. Salida.")
+        sys.exit(0)
+
+    logger.info("Procesando %d assets (concurrency=%d)", len(assets), args.concurrency)
+
+    # If incremental and start not provided, deduce per-asset from backfill_status
+    tasks = []
+    for a in assets:
+        asset = a.get("asset")
+        interval = a.get("interval") or args.interval
+        start_ms = args.start
+        end_ms = args.end
+        if args.incremental and start_ms is None:
+            try:
+                st = storage.get_backfill_status(asset) if hasattr(storage, "get_backfill_status") else None
+                if st and st.get("last_ts"):
+                    start_ms = int(st.get("last_ts")) + 1
+                    logger.debug("Incremental start for %s deduced as %s", asset, start_ms)
+            except Exception:
+                logger.exception("No pudo leerse backfill_status para asset %s", asset)
+        tasks.append({"asset": asset, "interval": interval, "start_ms": start_ms, "end_ms": end_ms})
+
+    results = []
+    # Use ThreadPoolExecutor to run backfills in parallel safely
+    with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as ex:
+        future_to_task = {}
+        for t in tasks:
+            future = ex.submit(_run_backfill_single, orch, storage, t["asset"], t["interval"],
+                               t["start_ms"], t["end_ms"], args.max_retries, args.backoff_factor, args.dry_run)
+            future_to_task[future] = t
+        for fut in as_completed(future_to_task):
+            t = future_to_task[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                logger.exception("Backfill task raised exception for %s: %s", t, e)
+                res = {"asset": t["asset"], "interval": t["interval"], "status": "error", "error": str(e)}
+            results.append(res)
+            # small delay between finishing tasks to avoid DB spikes
+            time.sleep(args.sleep_between)
+
+    # Summary
+    oks = [r for r in results if r.get("status") == "ok" or r.get("status") == "dry-run"]
+    errs = [r for r in results if r.get("status") not in ("ok", "dry-run")]
+    logger.info("Backfill finished: %d OK, %d ERR", len(oks), len(errs))
+    if errs:
+        logger.info("Errors details: %s", errs)
+        sys.exit(1)
+    sys.exit(0)

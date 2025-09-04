@@ -1,221 +1,330 @@
+# core/orchestrator.py
 """
-core/orchestrator.py
+Orchestrator: coordina fetch, indicadores, scoring, entrenamiento y backtests.
 
-Coordinador central: cálculo de indicadores, scoring, entrenamiento ligero (metadata),
-persistencia de indicadores y scores, y ejecución de backtests.
+Provee métodos públicos que la UI y los scripts esperan:
+  - fetch_data(assets, interval, start_ms=None, end_ms=None)
+  - compute_indicators_for(asset, interval, lookback=1000) -> pd.DataFrame (indicators/features)
+  - compute_and_store_indicators(asset, interval, lookback=1000) -> stores indicators if storage supports it
+  - train_model(asset, interval, model_name, model_type='auto', model_params=None)
+  - compute_scores(asset, interval, model_name=None, lookback=1000) -> calls score.infer_and_persist if available
+  - run_backfill_for(asset, interval, start_ms, end_ms) -> uses Fetcher.backfill_range
+  - run_backtest_for(asset, interval, start_ts=None, end_ts=None) -> delegates to core.backtest.run_backtest_for if present
 
-Diseñado para:
-- Integrar PostgresStorage (guardar indicadores/scores/models)
-- Proveer API para la UI y scripts (compute_indicators_for, compute_and_store, compute_scores, train_model, run_backtest_for)
-- Ser extensible: si hay un módulo indicators.* con funciones avanzadas los usa; si no, cae a fallbacks.
+Robusto frente a falta de módulos: comprueba existencia de funciones y lanza errores informativos.
 """
+
+from __future__ import annotations
+
 import logging
-from typing import Optional, Callable, Dict, Any, List
+import time
+from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
 import numpy as np
 
-from core.storage_postgres import PostgresStorage
+logger = logging.getLogger(__name__)
+logger.setLevel("INFO")
 
-logger = logging.getLogger("orchestrator")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-    logger.addHandler(ch)
-
-# Optional imports from project's indicators/score modules
+# Intentar importar componentes opcionales (fallar con advertencias si no están)
 try:
-    from indicators import fibonacci as fib_module  # type: ignore
+    from core.storage_postgres import make_storage_from_env, PostgresStorage
 except Exception:
-    fib_module = None
+    PostgresStorage = None
+    make_storage_from_env = None
 
 try:
-    from core import score as core_score  # type: ignore
+    from core.fetch import Fetcher
 except Exception:
-    core_score = None
+    Fetcher = None
+
+try:
+    import core.score as score_module
+except Exception:
+    score_module = None
+
+try:
+    import core.backtest as backtest_module
+except Exception:
+    backtest_module = None
 
 
 class Orchestrator:
-    def __init__(self, storage: Optional[PostgresStorage] = None):
-        self.storage = storage or PostgresStorage()
-        self.storage.init_db()
+    """
+    Orchestrador central.
 
-    # ---------------------
-    # Indicators
-    # ---------------------
-    def compute_indicators_for(self, asset: str, interval: str, lookback: int = 1000) -> Dict[str, Any]:
+    storage: instancia que implemente la API usada (PostgresStorage)
+    fetcher: instancia de Fetcher (si no se provee, se intentará crear una)
+    config: dict opcional pasado hacia Fetcher / comportamiento
+    """
+
+    def __init__(self, storage: Optional[Any] = None, fetcher: Optional[Any] = None, config: Optional[Dict[str, Any]] = None):
+        # Storage
+        if storage is None:
+            if make_storage_from_env is None:
+                raise RuntimeError("No se proporcionó storage y make_storage_from_env no está disponible.")
+            storage = make_storage_from_env()
+        self.storage = storage
+
+        # Fetcher
+        if fetcher is None:
+            if Fetcher is not None:
+                self.fetcher = Fetcher(storage=self.storage, config=config or {})
+            else:
+                self.fetcher = None
+        else:
+            self.fetcher = fetcher
+
+        # keep config
+        self.config = config or {}
+
+    # -----------------------
+    # Fetch helpers
+    # -----------------------
+    def fetch_data(self, assets: List[str], interval: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None) -> Dict[str, pd.DataFrame]:
         """
-        Compute a set of indicators for asset/interval using stored candles.
-        Returns a dict with computed indicators (ema, rsi, fibonacci if available).
+        Fetch OHLCV for multiple assets. Returns dict asset -> DataFrame.
+        No hace persistencia automática; solo retorna los DataFrames.
         """
-        df = self.storage.load_candles(asset, interval, limit=lookback, ascending=True)
-        if df.empty:
-            logger.warning("No candles for %s %s", asset, interval)
-            return {}
-        res: Dict[str, Any] = {}
-        try:
-            # EMAs
-            res["ema_12"] = float(df["close"].ewm(span=12, adjust=False).mean().iloc[-1])
-            res["ema_26"] = float(df["close"].ewm(span=26, adjust=False).mean().iloc[-1])
-            # SMA 50/200
-            res["sma_50"] = float(df["close"].rolling(window=50, min_periods=1).mean().iloc[-1])
-            res["sma_200"] = float(df["close"].rolling(window=200, min_periods=1).mean().iloc[-1])
-            # RSI
-            res["rsi_14"] = float(self._rsi(df["close"], 14).iloc[-1])
-        except Exception:
-            logger.exception("Basic indicators computation failed")
-        # Fibonacci / custom indicators
-        if fib_module and hasattr(fib_module, "compute_fibonacci_levels"):
+        results: Dict[str, pd.DataFrame] = {}
+        if not self.fetcher:
+            raise RuntimeError("Fetcher no disponible en Orchestrator.")
+        for asset in assets:
             try:
-                res["fibonacci"] = fib_module.compute_fibonacci_levels(df)
+                df = self.fetcher.fetch_ohlcv(asset, interval, start_ms=start_ms, end_ms=end_ms)
+                # Normalizar: asegurar columnas y tipos
+                if df is None:
+                    df = pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+                else:
+                    # force numeric types and ts int
+                    if "ts" in df.columns:
+                        df["ts"] = df["ts"].astype("int64")
+                    for c in ["open", "high", "low", "close", "volume"]:
+                        if c in df.columns:
+                            df[c] = pd.to_numeric(df[c], errors="coerce")
+                results[asset] = df
             except Exception:
-                logger.exception("Fibonacci computation failed")
-        # Return indicators; caller can persist with save_indicators_to_db
+                logger.exception("fetch_data failed for asset %s", asset)
+                results[asset] = pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+        return results
+
+    # -----------------------
+    # Indicators / features
+    # -----------------------
+    def compute_indicators_for(self, asset: str, interval: str, lookback: int = 1000) -> pd.DataFrame:
+        """
+        Calcula features/indicadores para asset+interval.
+        Flujo:
+          1) intenta cargar velas desde storage.load_candles(limit=lookback)
+          2) si no hay velas, intenta fetcher.fetch_ohlcv para rellenar (no persistir)
+          3) si core.score.features_from_candles está disponible, la usa; sino aplica indicadores simples
+        Devuelve DataFrame de features indexado por datetime, y con columna 'ts' (ms).
+        """
+        # 1) obtener candles
+        df = None
+        try:
+            if hasattr(self.storage, "load_candles"):
+                df = self.storage.load_candles(asset, interval, limit=lookback)
+        except Exception:
+            logger.exception("storage.load_candles falló, intentaremos fetch directo")
+
+        # fallback fetch if no candles
+        if (df is None) or df.empty:
+            if self.fetcher:
+                try:
+                    df = self.fetcher.fetch_ohlcv(asset, interval, start_ms=None, end_ms=None)
+                except Exception:
+                    logger.exception("fetcher.fetch_ohlcv también falló")
+                    df = pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+            else:
+                df = pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+
+        # compute features
+        if score_module and hasattr(score_module, "features_from_candles"):
+            try:
+                feats = score_module.features_from_candles(df)
+                return feats
+            except Exception:
+                logger.exception("score.features_from_candles lanzó excepción; aplicando fallback")
+        # fallback simple: devolver columnas passthrough y returns
+        try:
+            df2 = df.copy()
+            if "ts" in df2.columns:
+                df2["ts"] = df2["ts"].astype("int64")
+                df2["ts_dt"] = pd.to_datetime(df2["ts"], unit="ms", utc=True)
+                df2 = df2.set_index("ts_dt", drop=False)
+            df2["ret_1"] = np.log(pd.to_numeric(df2["close"], errors="coerce")) - np.log(pd.to_numeric(df2["close"], errors="coerce")).shift(1)
+            # fill basic moving averages
+            df2["ma_5"] = pd.to_numeric(df2["close"], errors="coerce").rolling(5, min_periods=1).mean()
+            return df2[["ts", "close", "ret_1", "ma_5"]].copy()
+        except Exception:
+            logger.exception("Fallback indicators failed; devolviendo dataframe vacío")
+            return pd.DataFrame()
+
+    def compute_and_store_indicators(self, asset: str, interval: str, lookback: int = 1000) -> Optional[pd.DataFrame]:
+        """
+        Calcula indicadores y, si storage expone save_indicators, intenta guardarlos.
+        Retorna DataFrame calculado o None si fallo.
+        """
+        feats = self.compute_indicators_for(asset, interval, lookback=lookback)
+        if feats is None or feats.empty:
+            logger.info("No indicators computed for %s %s", asset, interval)
+            return feats
+        # intentar persistir
+        try:
+            if hasattr(self.storage, "save_indicators"):
+                self.storage.save_indicators(feats, asset, interval)
+            else:
+                logger.debug("storage.save_indicators no implementado; se omite persistencia de indicadores")
+        except Exception:
+            logger.exception("save_indicators falló")
+        return feats
+
+    # -----------------------
+    # Scoring / train / infer
+    # -----------------------
+    def train_model(self, asset: str, interval: str, model_name: str, model_type: str = "auto", model_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Construye dataset (features + target) y entrena un modelo usando score.train_and_persist.
+        Requisitos: core.score.train_and_persist disponible y storage con load_candles.
+        Retorna metadata dict (o lanza error informativo).
+        """
+        if score_module is None or not hasattr(score_module, "train_and_persist"):
+            raise RuntimeError("Module core.score.train_and_persist no disponible.")
+
+        # cargar velas
+        try:
+            df = self.storage.load_candles(asset, interval, limit=5000)
+        except Exception as e:
+            logger.exception("load_candles falló en train_model")
+            raise RuntimeError("No se pudieron cargar velas para entrenamiento.") from e
+
+        if df is None or df.empty:
+            raise RuntimeError("No hay velas para entrenar")
+
+        # features y target
+        feats = score_module.features_from_candles(df)
+        target = score_module.make_target(df, horizon=1)
+        # alinear
+        target = target.reindex(feats.index).dropna()
+        X = feats.reindex(target.index).drop(columns=["ts"], errors="ignore").fillna(0)
+
+        # delegar entrenamiento
+        res = score_module.train_and_persist(self.storage, asset, interval, model_name=model_name, X=X, y=target, model_type=model_type, model_params=model_params)
         return res
 
-    def save_indicators_to_db(self, asset: str, interval: str, ts: int, indicators: Dict[str, Any]) -> int:
+    def compute_scores(self, asset: str, interval: str, model_name: Optional[str] = None, lookback: int = 1000) -> pd.DataFrame:
         """
-        Save indicators as a JSONB entry in indicators table (with ts).
+        Ejecuta inferencia y persiste scores. Usa score.infer_and_persist si está disponible.
+        Retorna el DataFrame de scores que infer_and_persist devuelve.
         """
-        try:
-            df = pd.DataFrame([{"ts": int(ts), "asset": asset, "interval": interval, "indicators": indicators}])
-            # Insert manually using storage's models? Storage currently doesn't have save_indicators method,
-            # so we use 'indicators' table via save_scores-like insertion for simplicity.
-            # We'll implement insertion here using storage._get_conn for integrity.
-            conn = self.storage._get_conn()
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO indicators (ts, asset, interval, indicators) VALUES (%s,%s,%s,%s);",
-                (int(ts), asset, interval, JsonSafe(indicators))
-            )
-            conn.commit()
-            cur.close()
-            self.storage._put_conn(conn)
-            return 1
-        except Exception:
-            logger.exception("save_indicators_to_db failed")
+        if score_module is None or not hasattr(score_module, "infer_and_persist"):
+            raise RuntimeError("core.score.infer_and_persist no disponible.")
+
+        df_scores = score_module.infer_and_persist(self.storage, asset, interval, model_name=model_name, lookback=lookback)
+        return df_scores
+
+    # -----------------------
+    # Backfill / worker helpers
+    # -----------------------
+    def run_backfill_for(self, asset: str, interval: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None, batch_window_ms: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Ejecuta backfill para un activo/interval entre start_ms y end_ms.
+        - Si fetcher está disponible, llama a fetcher.backfill_range y usa storage.save_candles.
+        - Si start_ms/end_ms faltan, intenta leer backfill_status desde storage o hacer un backfill reciente.
+        Retorna resumen dict con conteos y tiempos.
+        """
+        if not self.fetcher:
+            raise RuntimeError("Fetcher no disponible para backfill")
+
+        # intentar deducir rango si no viene
+        if start_ms is None or end_ms is None:
+            # intentar leer last_ts de backfill_status
             try:
-                self.storage._put_conn(conn)
+                stat = None
+                if hasattr(self.storage, "get_backfill_status"):
+                    stat = self.storage.get_backfill_status(asset)
+                if stat and stat.get("last_ts"):
+                    start_ms = int(stat.get("last_ts")) + 1
+                    end_ms = self.fetcher.now_ms()
+                else:
+                    # falta info, backfill últimos 7 días
+                    end_ms = self.fetcher.now_ms()
+                    start_ms = end_ms - 7 * 24 * 3600 * 1000
             except Exception:
-                pass
+                logger.exception("No se pudo deducir rango backfill; usando últimos 7 días")
+                end_ms = self.fetcher.now_ms()
+                start_ms = end_ms - 7 * 24 * 3600 * 1000
+
+        summary = {"asset": asset, "interval": interval, "start_ms": start_ms, "end_ms": end_ms, "saved_batches": 0}
+        start_time = time.time()
+
+        def _callback_save(df_batch: pd.DataFrame):
+            # persistir lote
+            if df_batch is None or df_batch.empty:
+                return
+            try:
+                # intentar save_candles
+                if hasattr(self.storage, "save_candles"):
+                    self.storage.save_candles(df_batch, asset, interval)
+                    summary["saved_batches"] += 1
+                else:
+                    logger.warning("storage.save_candles no implementado; lote descartado")
+            except Exception:
+                logger.exception("Error guardando batch en storage")
+
+        try:
+            self.fetcher.backfill_range(asset, interval, int(start_ms), int(end_ms), batch_window_ms=batch_window_ms, callback=_callback_save)
+            # actualizar backfill_status si storage soporta update_backfill_status
+            try:
+                if hasattr(self.storage, "update_backfill_status"):
+                    last_ts = end_ms
+                    self.storage.update_backfill_status(asset, interval=interval, last_ts=last_ts)
+            except Exception:
+                logger.exception("update_backfill_status fallo")
+        except Exception:
+            logger.exception("run_backfill_for failed for %s %s", asset, interval)
             raise
 
-    # ---------------------
-    # Scoring
-    # ---------------------
-    def compute_scores_for(self, asset: str, interval: str, persist: bool = False) -> Dict[str, Any]:
-        """
-        Compute a score for the current latest state of an asset.
-        - Uses core.score.score_from_indicators if available, else a fallback deterministic logic.
-        - If persist=True, writes a row to scores table.
-        """
-        indicators = self.compute_indicators_for(asset, interval, lookback=500)
-        if not indicators:
-            return {}
-        score_obj: Dict[str, Any]
-        if core_score and hasattr(core_score, "score_from_indicators"):
-            try:
-                score_obj = core_score.score_from_indicators(indicators)
-            except Exception:
-                logger.exception("Project score function failed — using fallback")
-                score_obj = self._fallback_score(indicators)
-        else:
-            score_obj = self._fallback_score(indicators)
-        # Add metadata
-        score_obj = {"score": score_obj.get("score"), "meta": score_obj.get("meta", indicators)}
-        if persist:
-            try:
-                now_ts = int(pd.Timestamp.utcnow().timestamp())
-                df = pd.DataFrame([{"ts": now_ts, "asset": asset, "interval": interval, "score": score_obj}])
-                self.storage.save_scores(df)
-            except Exception:
-                logger.exception("Failed to persist score for %s", asset)
-        return score_obj
+        summary["duration_s"] = time.time() - start_time
+        return summary
 
-    # ---------------------
-    # Backtest orchestration
-    # ---------------------
-    def run_backtest_for(self,
-                         asset: str,
-                         interval: str,
-                         strategy_fn: Callable,
-                         lookback: int = 2000,
-                         initial_capital: float = 1000.0,
-                         fee: float = 0.0005,
-                         save_scores: bool = False) -> Dict[str, Any]:
+    # -----------------------
+    # Backtest wrapper
+    # -----------------------
+    def run_backtest_for(self, asset: str, interval: str, start_ts: Optional[int] = None, end_ts: Optional[int] = None) -> Dict[str, Any]:
         """
-        Load history and run backtest using core.backtest.run_backtest.
-        Returns the backtest result dict and optionally persists summary to scores.
+        Ejecuta backtest delegando a core.backtest.run_backtest_for si existe.
+        Devuelve lo que entregue el módulo backtest (métricas, equity_curve, etc.).
         """
-        from core.backtest import run_backtest  # local import to avoid cycles
-        df = self.storage.load_candles(asset, interval, limit=lookback, ascending=True)
-        if df.empty:
-            return {"error": "no_data"}
-        result = run_backtest(df, lambda r, i, d, ctx=None: strategy_fn(r, i, d), initial_capital=initial_capital, fee=fee)
-        if save_scores:
-            # Persist a summary row into scores table
-            now_ts = int(pd.Timestamp.utcnow().timestamp())
-            summary = {"final_value": result.get("final_value"), "returns": result.get("returns"), "n_trades": result.get("n_trades")}
-            dfscore = pd.DataFrame([{"ts": now_ts, "asset": asset, "interval": interval, "score": summary}])
-            self.storage.save_scores(dfscore)
-        return result
+        if backtest_module is None or not hasattr(backtest_module, "run_backtest_for"):
+            raise RuntimeError("core.backtest.run_backtest_for no disponible.")
 
-    # ---------------------
-    # Training placeholder (IA)
-    # ---------------------
-    def train_model(self, asset: str, interval: str, model_name: str, training_meta: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Placeholder for training. Implement your own training pipeline and call storage.save_model_record with metadata.
-        Here we just persist a metadata record so UI can show model entries.
-        """
         try:
-            mid = self.storage.save_model_record(model_name, asset, interval, training_meta)
-            return {"id": mid, "status": "saved_metadata"}
+            res = backtest_module.run_backtest_for(self.storage, asset, interval, start_ts=start_ts, end_ts=end_ts)
+            return res
         except Exception:
-            logger.exception("train_model failed")
+            logger.exception("run_backtest_for raised")
             raise
 
-    # ---------------------
+    # -----------------------
     # Utilities
-    # ---------------------
-    @staticmethod
-    def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-        delta = series.diff()
-        up = delta.clip(lower=0)
-        down = -1 * delta.clip(upper=0)
-        ma_up = up.rolling(period).mean()
-        ma_down = down.rolling(period).mean()
-        rs = ma_up / ma_down
-        return 100 - (100 / (1 + rs))
+    # -----------------------
+    def list_assets(self) -> List[str]:
+        if hasattr(self.storage, "list_assets"):
+            try:
+                return self.storage.list_assets()
+            except Exception:
+                logger.exception("list_assets failed")
+                return []
+        return []
 
-    @staticmethod
-    def _fallback_score(indicators: Dict[str, Any]) -> Dict[str, Any]:
-        score = 0
-        ema12 = indicators.get("ema_12")
-        ema26 = indicators.get("ema_26")
-        rsi = indicators.get("rsi_14")
-        if ema12 is not None and ema26 is not None:
-            score += 1 if ema12 > ema26 else -1
-        if rsi is not None:
-            if rsi > 70:
-                score += 1
-            elif rsi < 30:
-                score -= 1
-        return {"score": score, "meta": indicators}
+    def list_watchlist(self) -> List[Dict[str, Any]]:
+        if hasattr(self.storage, "list_watchlist"):
+            try:
+                return self.storage.list_watchlist()
+            except Exception:
+                logger.exception("list_watchlist failed")
+                return []
+        return []
 
-
-# JSON adapter for insertion (fallback)
-def JsonSafe(obj: Any) -> Any:
-    """
-    Ensure object is JSON-serializable by converting numpy types.
-    """
-    if isinstance(obj, dict):
-        return {k: JsonSafe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [JsonSafe(v) for v in obj]
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    return obj
