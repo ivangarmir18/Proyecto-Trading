@@ -1,3 +1,4 @@
+export PYTHONPATH=/opt/render/project/src:$PYTHONPATH
 #!/usr/bin/env bash
 # start.sh - entrypoint that starts either the Streamlit UI or the FastAPI API
 set -euo pipefail
