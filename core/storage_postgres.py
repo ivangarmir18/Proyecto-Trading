@@ -180,7 +180,7 @@ def make_storage_from_env() -> PostgresStorage:
         user=user,
         password=password,
     )
-
+    print(f"🔍 DEBUG: DATABASE_URL = {repr(url)}")
 
     # ---------------------
     # Candles IO
