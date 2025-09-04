@@ -109,3 +109,128 @@ def apply_indicators(
 
     return out_df
 
+# --- Inicio parche core/indicators.py: registrar ATR y wrapper robusto ---
+import inspect
+import pandas as pd
+from indicators.atr import atr as _atr  # registrar ATR si existe
+
+# registrar atr si no estaba ya
+try:
+    if "atr" not in _INDICATOR_FUNCS:
+        _INDICATOR_FUNCS["atr"] = _atr
+except Exception:
+    # si por alguna razón _INDICATOR_FUNCS no existe, no romper
+    pass
+
+def _name_for_scalar_indicator(name: str, params: dict) -> str:
+    """
+    Genera nombre de columna para indicadores que devuelven una sola serie.
+    Ej: ema period=14 -> 'ema_14'
+    """
+    if not params:
+        return name
+    # prefer 'period' param, si existe
+    p = params.get("period") or params.get("window") or params.get("length")
+    if p:
+        return f"{name}_{p}"
+    return name
+
+def _call_indicator_func(func, name, df: pd.DataFrame, **params):
+    """
+    Intenta varias firmas de llamada y normaliza la salida a DataFrame con columnas ya nombradas.
+    - intentos de llamada: func(series, **params) -> Series
+                       func(df, **params) -> Series/DataFrame/tuple
+                       func(close=series, **params)
+    - normaliza a DataFrame con nombres razonables.
+    """
+    # prefer close series for single-series indicators
+    close = None
+    if isinstance(df, pd.DataFrame) and "close" in df.columns:
+        close = df["close"]
+
+    # intentos de llamada ordenados
+    call_attempts = []
+    if close is not None:
+        call_attempts.append(lambda: func(close, **params))
+    call_attempts.append(lambda: func(df, **params))
+    call_attempts.append(lambda: func(**{"series": close, **params}) if close is not None else func(**params))
+    call_attempts.append(lambda: func(**params))
+
+    last_exc = None
+    out = None
+    for attempt in call_attempts:
+        try:
+            out = attempt()
+            break
+        except TypeError as e:
+            last_exc = e
+            continue
+        except Exception as e:
+            # si hay otro error, lo elevamos (indicador probablemente falló)
+            raise
+
+    if out is None:
+        raise RuntimeError(f"No se pudo ejecutar indicador {name}; último error: {last_exc}")
+
+    # normalizar salida
+    # 1) tuple (macd_line, signal_line, hist)
+    if isinstance(out, tuple) or isinstance(out, list):
+        # caso típico: macd -> (macd_line, signal, hist)
+        cols = {}
+        if len(out) >= 1:
+            cols[f"{name}_line"] = pd.Series(out[0], index=close.index if close is not None else None) if isinstance(out[0], (pd.Series, list)) else pd.Series(out[0])
+        if len(out) >= 2:
+            cols[f"{name}_signal"] = pd.Series(out[1], index=close.index if close is not None else None) if isinstance(out[1], (pd.Series, list)) else pd.Series(out[1])
+        if len(out) >= 3:
+            cols[f"{name}_hist"] = pd.Series(out[2], index=close.index if close is not None else None) if isinstance(out[2], (pd.Series, list)) else pd.Series(out[2])
+        return pd.DataFrame(cols)
+
+    # 2) pandas Series
+    if isinstance(out, pd.Series):
+        col_name = _name_for_scalar_indicator(name, params)
+        ser = out
+        ser.index = df.index if isinstance(df, pd.DataFrame) else ser.index
+        return pd.DataFrame({col_name: ser})
+
+    # 3) pandas DataFrame
+    if isinstance(out, pd.DataFrame):
+        # prefix columns with name if ambiguous
+        return out
+
+    # 4) numeric scalar (rare), broadcast to index
+    if isinstance(out, (int, float)):
+        col_name = _name_for_scalar_indicator(name, params)
+        idx = df.index if isinstance(df, pd.DataFrame) else None
+        return pd.DataFrame({col_name: pd.Series([out]*len(idx), index=idx)})
+
+    # fallback: intentar convertir a Series
+    try:
+        ser = pd.Series(out)
+        col_name = _name_for_scalar_indicator(name, params)
+        return pd.DataFrame({col_name: ser})
+    except Exception:
+        raise RuntimeError(f"Tipo de retorno no soportado por indicador {name}: {type(out)}")
+
+
+# Reemplazar la función calculate_indicator con una versión robusta si no está ya correctamente implementada
+try:
+    # solo reemplazar si la versión existente es corta o frágil; en cualquier caso adjuntamos la versión robusta
+    def calculate_indicator_safe(name: str, df: pd.DataFrame, **params) -> pd.DataFrame:
+        name = name.lower()
+        if name not in _INDICATOR_FUNCS:
+            raise ValueError(f"Indicador no soportado: {name}")
+        func = _INDICATOR_FUNCS[name]
+        # llamar y normalizar
+        out_df = _call_indicator_func(func, name, df, **params)
+        # asegurar que los índices coinciden con df
+        if isinstance(df, pd.DataFrame) and not out_df.empty:
+            out_df = out_df.reset_index(drop=True) if not out_df.index.equals(df.index) else out_df
+        return out_df
+
+    # override
+    calculate_indicator = calculate_indicator_safe
+except Exception:
+    # si falla, no rompemos la importación
+    pass
+
+# --- Fin parche core/indicators.py ---

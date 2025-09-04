@@ -481,3 +481,64 @@ def compute_stop_target_for_asset(adapter_obj, asset: str, interval: str = "1h",
     except Exception as e:
         logger.exception("compute_stop_target_for_asset failed for %s %s: %s", asset, interval, e)
         return {"error": str(e)}
+# --- Inicio parche core/score.py: persistencia fallback para scores ---
+import os
+import logging
+logger = logging.getLogger(__name__)
+
+def _persist_score_fallback(storage, asset: str, ts: int, score_val: float, components: dict, method: str = None):
+    """
+    Intentar persistir score con varias estrategias:
+     - storage.upsert_score(...) si existe
+     - si storage.get_conn() existe, usar SQL simple
+     - fallback a psycopg2 con DATABASE_URL
+    """
+    if storage is None:
+        logger.debug("No storage provided to persist score.")
+        return False
+
+    # 1) método directo
+    try:
+        if hasattr(storage, "upsert_score"):
+            return storage.upsert_score(asset, ts, score_val, components, method)
+    except Exception as e:
+        logger.exception("storage.upsert_score failed: %s", e)
+
+    # 2) intentar usar conexión propia de storage
+    try:
+        if hasattr(storage, "get_conn"):
+            conn = storage.get_conn()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO scores (asset, ts, score, method, components)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (asset, ts) DO UPDATE SET score = EXCLUDED.score, method = EXCLUDED.method, components = EXCLUDED.components
+                """, (asset, int(ts), float(score_val) if score_val is not None else None, method, json.dumps(components) if components else None))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.exception("Persist via storage.get_conn failed: %s", e)
+
+    # 3) fallback: psycopg2 + DATABASE_URL
+    try:
+        import psycopg2
+        dsn = os.getenv("DATABASE_URL")
+        if not dsn:
+            logger.debug("No DATABASE_URL for fallback")
+            return False
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO scores (asset, ts, score, method, components)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (asset, ts) DO UPDATE SET score = EXCLUDED.score, method = EXCLUDED.method, components = EXCLUDED.components
+                """, (asset, int(ts), float(score_val) if score_val is not None else None, method, json.dumps(components) if components else None))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.exception("Persist fallback via psycopg2 failed: %s", e)
+    return False
+
+# Attach to module so compute_and_persist_scores puede usarlo si storage.upsert_score falla.
+_persist_score = _persist_score_fallback
+# --- Fin parche core/score.py ---
