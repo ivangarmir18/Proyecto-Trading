@@ -98,7 +98,7 @@ def cmd_purge(cfg):
     retention = cfg.get("retention_days", {})
     # por cada interval, convertir días a ms y purge with before_ts_ms
     for interval, days in retention.items():
-        before = now_ms() - int(days) * 24 * 3600 * 1000
+        before = now_ms() - int(days) * 24 * 86400 * 1000
         deleted = storage.purge_old_data(before_ts_ms=before)
         logger.info("Purgado interval %s antes de %s -> deleted %d", interval, before, deleted)
     storage.close()

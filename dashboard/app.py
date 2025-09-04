@@ -621,6 +621,7 @@ with st.sidebar:
     if st.button("Forzar backfill ahora"):
         def _do_backfill():
             # try orchestrator or fetch.run_full_backfill
+            
             if orchestrator_mod and hasattr(orchestrator_mod, "run_full_backfill"):
                 try:
                     return orchestrator_mod.run_full_backfill()
@@ -689,7 +690,7 @@ with tab_watch:
     min_price = float(c2.number_input("Precio mínimo", value=0.0, step=0.01))
     max_rows = int(c3.selectbox("Mostrar filas", [10,25,50,100], index=1))
     if c4.button("Refrescar"):
-        st.experimental_rerun()
+        st.rerun()
 
     # build summary rows by reading last candle (non-blocking loop)
     rows = []
@@ -754,7 +755,7 @@ with tab_watch:
         cols[1].markdown(f"Precio: {rec.get('last_price') if rec.get('last_price') is not None else '—'}")
         if cols[2].button("Ver detalle", key=f"view_{s}"):
             st.session_state["selected_asset"] = s
-            st.experimental_rerun()
+            st.rerun()
         if cols[3].button("Backtest", key=f"bt_{s}"):
             def _bt_work(sym=s):
                 # prefer orchestrator_mod

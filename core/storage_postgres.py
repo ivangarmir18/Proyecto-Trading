@@ -344,3 +344,293 @@ def load_setting(key: str, default=None):
 
 # expose short aliases for compatibility imports like `from core.storage_postgres import save_candles`
 __all__ = list(globals().keys())
+
+# --- Inicio parche storage_postgres.py: backfill_status + prune helpers ---
+import os, time, logging
+
+logger = logging.getLogger(__name__)
+
+def _connect_psycopg2(dsn=None):
+    try:
+        import psycopg2
+    except Exception as e:
+        raise RuntimeError("psycopg2 no disponible: %s" % e)
+    dsn = dsn or os.getenv("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL no encontrada para conectar a Postgres")
+    return psycopg2.connect(dsn)
+
+def ensure_backfill_status_table(conn=None):
+    """
+    Crea tabla 'backfill_status' si no existe.
+    Campos: asset TEXT, interval TEXT, last_ts BIGINT, status TEXT, updated_at TIMESTAMP
+    """
+    close_conn = False
+    if conn is None:
+        conn = _connect_psycopg2()
+        close_conn = True
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS backfill_status (
+            asset TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            last_ts BIGINT,
+            status TEXT,
+            updated_at TIMESTAMP DEFAULT now(),
+            PRIMARY KEY (asset, interval)
+        )
+    """)
+    conn.commit()
+    if close_conn:
+        conn.close()
+
+def get_backfill_status(asset, interval, conn=None):
+    """
+    Retorna last_ts (int) o None si no hay registro.
+    """
+    close_conn = False
+    if conn is None:
+        conn = _connect_psycopg2()
+        close_conn = True
+    ensure_backfill_status_table(conn)
+    cur = conn.cursor()
+    cur.execute("SELECT last_ts, status, updated_at FROM backfill_status WHERE asset=%s AND interval=%s", (asset, interval))
+    row = cur.fetchone()
+    if close_conn:
+        conn.close()
+    return row[0] if row else None
+
+def update_backfill_status(asset, interval, last_ts, status="done", conn=None):
+    """
+    Inserta/actualiza el registro de backfill con last_ts (int).
+    """
+    close_conn = False
+    if conn is None:
+        conn = _connect_psycopg2()
+        close_conn = True
+    ensure_backfill_status_table(conn)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO backfill_status (asset, interval, last_ts, status, updated_at)
+        VALUES (%s, %s, %s, %s, now())
+        ON CONFLICT (asset, interval) DO UPDATE SET last_ts = EXCLUDED.last_ts, status = EXCLUDED.status, updated_at = now()
+    """, (asset, interval, int(last_ts) if last_ts is not None else None, status))
+    conn.commit()
+    if close_conn:
+        conn.close()
+
+def prune_old_candles_postgres(retention_map=None, conn=None, dry_run=True):
+    """
+    Ejecuta pruning en tabla 'prices' asumiendo columnas: asset, interval, ts (en segundos).
+    retention_map: dict interval -> days
+    dry_run=True solo cuenta filas.
+    """
+    if retention_map is None:
+        retention_map = {
+            "5m": 7,
+            "15m": 14,
+            "30m": 28,
+            "1h": 40,
+            "4h": 70,
+            "12h": 105,
+            "1d": 200
+        }
+    close_conn = False
+    if conn is None:
+        conn = _connect_psycopg2()
+        close_conn = True
+    cur = conn.cursor()
+    now_s = int(time.time())
+    results = {}
+    for interval, days in retention_map.items():
+        cutoff = now_s - int(days) * 86400  # segundos
+        if dry_run:
+            cur.execute("SELECT COUNT(*) FROM prices WHERE interval = %s AND ts < %s", (interval, cutoff))
+            cnt = cur.fetchone()[0]
+            results[interval] = cnt
+            logger.info("prune dry-run interval=%s days=%s -> rows=%s", interval, days, cnt)
+        else:
+            cur.execute("DELETE FROM prices WHERE interval = %s AND ts < %s", (interval, cutoff))
+            logger.info("prune executed interval=%s days=%s", interval, days)
+    if not dry_run:
+        conn.commit()
+    if close_conn:
+        conn.close()
+    return results
+
+# Opcional: si existe la clase PostgresStorage, adjuntamos métodos convenience
+try:
+    PostgresStorage  # type: ignore
+except Exception:
+    PostgresStorage = None
+
+if PostgresStorage is not None:
+    def _ps_get_backfill_status(self, asset, interval):
+        # intenta usar la conexión interna si existe, si no fallback a funciones arriba
+        conn = getattr(self, "conn", None)
+        return get_backfill_status(asset, interval, conn=conn)
+    def _ps_update_backfill_status(self, asset, interval, last_ts, status="done"):
+        conn = getattr(self, "conn", None)
+        return update_backfill_status(asset, interval, last_ts, status=status, conn=conn)
+    def _ps_prune_old_candles(self, retention_map=None, dry_run=True):
+        conn = getattr(self, "conn", None)
+        return prune_old_candles_postgres(retention_map=retention_map, conn=conn, dry_run=dry_run)
+    # Attach:
+    setattr(PostgresStorage, "get_backfill_status", _ps_get_backfill_status)
+    setattr(PostgresStorage, "update_backfill_status", _ps_update_backfill_status)
+    setattr(PostgresStorage, "prune_old_candles", _ps_prune_old_candles)
+
+# --- Fin parche storage_postgres.py ---
+
+# --- Inicio parche storage_postgres: watchlist, backfill request y upsert_score helpers ---
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+def _ensure_watchlist_table(conn):
+    sql = """
+    CREATE TABLE IF NOT EXISTS watchlist (
+        asset TEXT PRIMARY KEY,
+        meta JSONB,
+        added_by TEXT,
+        added_at TIMESTAMP DEFAULT now()
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+def _ensure_scores_table(conn):
+    sql = """
+    CREATE TABLE IF NOT EXISTS scores (
+        asset TEXT NOT NULL,
+        ts BIGINT NOT NULL,
+        score DOUBLE PRECISION,
+        method TEXT,
+        components JSONB,
+        created_at TIMESTAMP DEFAULT now(),
+        PRIMARY KEY (asset, ts)
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+# ----- Watchlist helpers as methods for PostgresStorage -----
+def _ps_add_watchlist_symbol(self, asset: str, asset_type: Optional[str]=None, added_by: Optional[str]=None):
+    """
+    Añade asset a la watchlist; crea registro en assets si hace falta.
+    """
+    with self.get_conn() as conn:
+        cur = conn.cursor()
+        _ensure_watchlist_table(conn)
+        # upsert into assets (best-effort)
+        try:
+            cur.execute("INSERT INTO assets (symbol, type, name) VALUES (%s, %s, %s) ON CONFLICT (symbol) DO NOTHING",
+                        (asset, asset_type or "crypto", None))
+        except Exception:
+            conn.rollback()
+        # insert/update watchlist
+        try:
+            cur.execute("INSERT INTO watchlist (asset, meta, added_by) VALUES (%s, %s, %s) ON CONFLICT (asset) DO UPDATE SET meta = EXCLUDED.meta, added_by = EXCLUDED.added_by",
+                        (asset, json.dumps({}), added_by))
+            conn.commit()
+            return True
+        except Exception as e:
+            conn.rollback()
+            logger.exception("add_watchlist_symbol failed: %s", e)
+            return False
+
+def _ps_list_watchlist(self):
+    with self.get_conn() as conn:
+        _ensure_watchlist_table(conn)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT asset, meta, added_by, added_at FROM watchlist ORDER BY added_at DESC")
+            rows = cur.fetchall()
+            return rows
+
+def _ps_remove_watchlist_symbol(self, asset: str):
+    with self.get_conn() as conn:
+        _ensure_watchlist_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM watchlist WHERE asset = %s", (asset,))
+            conn.commit()
+            return cur.rowcount > 0
+
+def _ps_update_watchlist_meta(self, asset: str, meta: dict):
+    with self.get_conn() as conn:
+        _ensure_watchlist_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("UPDATE watchlist SET meta = %s WHERE asset = %s", (json.dumps(meta), asset))
+            conn.commit()
+            return cur.rowcount > 0
+
+# ----- Backfill request (jobs) helper -----
+def _ps_add_backfill_request(self, asset: str, interval: Optional[str]=None, requested_by: Optional[str]=None):
+    """
+    Inserta una fila en la tabla jobs para que el worker la recoja.
+    Guarda: name='backfill', status='pending', details={'asset':..,'interval':..,'requested_by':..}
+    """
+    details = {"asset": asset, "interval": interval, "requested_by": requested_by}
+    sql = "INSERT INTO jobs (name, status, details) VALUES (%s, %s, %s) RETURNING id"
+    try:
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, ('backfill', 'pending', json.dumps(details)))
+                job_id = cur.fetchone()[0]
+            conn.commit()
+        return int(job_id)
+    except Exception as e:
+        logger.exception("add_backfill_request failed: %s", e)
+        return None
+
+# ----- upsert_score -----
+def _ps_upsert_score(self, asset: str, ts: int, score: float, components: dict, method: Optional[str] = None):
+    """
+    Inserta/actualiza un score en tabla 'scores'.
+    """
+    try:
+        with self.get_conn() as conn:
+            _ensure_scores_table(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO scores (asset, ts, score, method, components)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (asset, ts) DO UPDATE SET
+                        score = EXCLUDED.score,
+                        method = EXCLUDED.method,
+                        components = EXCLUDED.components,
+                        created_at = now()
+                    """,
+                    (asset, int(ts), float(score) if score is not None else None, method, json.dumps(components) if components else None)
+                )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.exception("upsert_score failed: %s", e)
+        return False
+
+# Attach methods to PostgresStorage class if present
+try:
+    PostgresStorage  # type: ignore
+except NameError:
+    PostgresStorage = None
+
+if PostgresStorage is not None:
+    # attach if missing (do not override existing implementations)
+    if not hasattr(PostgresStorage, "add_watchlist_symbol"):
+        setattr(PostgresStorage, "add_watchlist_symbol", _ps_add_watchlist_symbol)
+    if not hasattr(PostgresStorage, "list_watchlist"):
+        setattr(PostgresStorage, "list_watchlist", _ps_list_watchlist)
+    if not hasattr(PostgresStorage, "remove_watchlist_symbol"):
+        setattr(PostgresStorage, "remove_watchlist_symbol", _ps_remove_watchlist_symbol)
+    if not hasattr(PostgresStorage, "update_watchlist_meta"):
+        setattr(PostgresStorage, "update_watchlist_meta", _ps_update_watchlist_meta)
+    if not hasattr(PostgresStorage, "add_backfill_request"):
+        setattr(PostgresStorage, "add_backfill_request", _ps_add_backfill_request)
+    if not hasattr(PostgresStorage, "upsert_score"):
+        setattr(PostgresStorage, "upsert_score", _ps_upsert_score)
+
+# --- Fin parche storage_postgres ---

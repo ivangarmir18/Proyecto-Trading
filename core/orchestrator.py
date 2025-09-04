@@ -327,4 +327,59 @@ class Orchestrator:
                 logger.exception("list_watchlist failed")
                 return []
         return []
+# --- Inicio parche orchestrator.py: safe_backfill + helper ---
+import logging
+logger = logging.getLogger(__name__)
+
+def safe_backfill(self, asset, interval, start_ms, end_ms, batch_window_ms=6*3600*1000):
+    """
+    Envuelve la llamada a fetcher.backfill_range con comprobaciones y actualiza backfill_status si es posible.
+    Uso: reemplazar llamadas directas a self.fetcher.backfill_range(...) por self.safe_backfill(...)
+    """
+    if not hasattr(self, "fetcher"):
+        raise RuntimeError("Orchestrator no tiene fetcher configurado")
+    fetcher = self.fetcher
+    # si fetcher tiene backfill_range lo usamos
+    if hasattr(fetcher, "backfill_range"):
+        def _on_batch(batch):
+            # guardar batch en storage si existe
+            try:
+                if hasattr(self, "storage") and hasattr(self.storage, "save_candles"):
+                    # intentar extraer asset/interval desde batch si es DataFrame
+                    try:
+                        self.storage.save_candles(asset, interval, batch)
+                    except Exception:
+                        logger.exception("Fallo al guardar batch en storage")
+            except Exception:
+                logger.exception("Error en on_batch handler")
+
+        fetcher.backfill_range(asset, interval, start_ms, end_ms, batch_window_ms, callback=_on_batch)
+    else:
+        raise RuntimeError("Fetcher no implementa backfill_range; actualizar fetcher o adaptador")
+
+    # actualizar backfill_status si storage lo soporta (acepta ms o s; normalizamos a ms)
+    try:
+        last_ts = int(end_ms)
+        if hasattr(self, "storage") and hasattr(self.storage, "update_backfill_status"):
+            try:
+                self.storage.update_backfill_status(asset, interval, last_ts)
+            except Exception:
+                # si la storage espera segundos en vez de ms, intentar convertir
+                try:
+                    self.storage.update_backfill_status(asset, interval, int(last_ts / 1000))
+                except Exception:
+                    logger.exception("No se pudo actualizar backfill_status")
+    except Exception:
+        logger.exception("Error al intentar actualizar backfill_status")
+
+# adjuntar helper al objeto Orchestrator si existe
+try:
+    Orchestrator  # type: ignore
+except Exception:
+    Orchestrator = None
+
+if Orchestrator is not None and not hasattr(Orchestrator, "safe_backfill"):
+    setattr(Orchestrator, "safe_backfill", safe_backfill)
+
+# --- Fin parche orchestrator.py ---
 

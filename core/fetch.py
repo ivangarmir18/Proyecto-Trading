@@ -720,3 +720,65 @@ def run_full_backfill(symbols=None, per_symbol_limit:int=1000):
     out["finished_at"] = _dt.utcnow().isoformat()
     return out
 
+# --- Inicio parche fetch.py: backfill_range genérico ---
+import time, logging
+
+logger = logging.getLogger(__name__)
+
+def _default_backfill_range(self, asset, interval, start_ms, end_ms, batch_window_ms=6*3600*1000, callback=None):
+    """
+    Backfill por ventanas: intenta usar varios métodos de fetch disponibles:
+    - self.fetch_candles(asset, interval, start, end)
+    - self.get_candles(asset, interval, start, end)
+    - self._network_get_candles(asset, interval, start, end)
+    Los tiempos manejados son en ms.
+    callback(batch_df) será llamado con cada batch (pandas DataFrame o lista).
+    """
+    # preferir batch_window_ms en ms
+    cur = int(start_ms)
+    end_ms = int(end_ms)
+    # detect name of fetch function
+    fetch_fn = None
+    for name in ("fetch_candles", "get_candles", "_network_get_candles", "fetch_ohlcv", "fetch_range"):
+        if hasattr(self, name):
+            fetch_fn = getattr(self, name)
+            break
+    if fetch_fn is None:
+        raise RuntimeError("No fetch function found on fetcher (required for backfill_range)")
+
+    while cur < end_ms:
+        to_ms = min(cur + int(batch_window_ms), end_ms)
+        try:
+            # muchos fetchers usan start/end en ms, algunos usan seconds -> el fetch_fn debe aceptar ms en este proyecto
+            batch = fetch_fn(asset, interval, start=cur, end=to_ms)
+        except TypeError:
+            # intentar con otra firma: (asset, interval, cur, to_ms)
+            batch = fetch_fn(asset, interval, cur, to_ms)
+        except Exception as e:
+            logger.exception("Error fetching window %s-%s for %s: %s", cur, to_ms, asset, e)
+            raise
+        if callback:
+            callback(batch)
+        else:
+            # si no hay callback, intentar guardar en storage si existe
+            if hasattr(self, "storage") and hasattr(self.storage, "save_candles"):
+                try:
+                    self.storage.save_candles(asset, interval, batch)
+                except Exception:
+                    logger.exception("No se pudo guardar batch en storage")
+        # avanzar cursor
+        cur = to_ms
+        # respetar rate-limit básico
+        time.sleep(0.05)
+
+# attach to Fetcher class if exists
+try:
+    Fetcher  # type: ignore
+except Exception:
+    Fetcher = None
+
+if Fetcher is not None and not hasattr(Fetcher, "backfill_range"):
+    setattr(Fetcher, "backfill_range", _default_backfill_range)
+
+# --- Fin parche fetch.py ---
+

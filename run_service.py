@@ -178,6 +178,11 @@ if __name__ == "__main__":
 
     # storage + orchestrator
     storage = make_storage_from_env()
+    from core.run_service import start_retention_job  # si pegaste el parche al final de run_service.py; o usa: from scripts.start_retention import main as start_retention_job
+
+    # arrancar job de retención en modo seguro (solo cuenta lo que borraría)
+    start_retention_job(storage, dry_run=True, interval_hours=24)
+
     orch = Orchestrator(storage=storage)
 
     # try init db (idempotent)
@@ -221,3 +226,49 @@ if __name__ == "__main__":
         except Exception:
             logger.exception("Error closing storage")
         logger.info("Worker stopped cleanly.")
+
+# --- Inicio parche run_service/scheduler: start_retention_job ---
+import threading, time, logging
+
+logger = logging.getLogger(__name__)
+
+def start_retention_job(storage, retention_map=None, interval_hours=24, dry_run=False):
+    """
+    Lanza un hilo que ejecuta prune_old_candles diariamente.
+    Llamar a start_retention_job(storage) desde el main del servicio.
+    """
+    if retention_map is None:
+        retention_map = {
+            "5m": 7,
+            "15m": 14,
+            "30m": 28,
+            "1h": 40,
+            "4h": 70,
+            "12h": 105,
+            "1d": 200
+        }
+
+    def _job():
+        logger.info("Retention job started (interval_hours=%s)", interval_hours)
+        while True:
+            try:
+                # si storage tiene método prune_old_candles lo usamos
+                if hasattr(storage, "prune_old_candles"):
+                    storage.prune_old_candles(retention_map=retention_map, dry_run=dry_run)
+                else:
+                    # fallback a helper de storage_postgres si está presente
+                    try:
+                        from core.storage_postgres import prune_old_candles_postgres
+                        prune_old_candles_postgres(retention_map=retention_map, dry_run=dry_run)
+                    except Exception:
+                        logger.warning("No prune method available on storage and fallback failed.")
+            except Exception:
+                logger.exception("Error en retention job")
+            # dormir N horas
+            time.sleep(interval_hours * 3600)
+
+    t = threading.Thread(target=_job, daemon=True)
+    t.start()
+    return t
+
+# --- Fin parche run_service/scheduler ---
