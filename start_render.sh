@@ -1,11 +1,11 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # start_render.sh - robust start script for Render
 # (compatible con entornos donde 'set -o pipefail' pueda no estar disponible)
 
 # Hacer el script fallar en caso de error, pero manejar pipefail con fallback.
 set -e
 set -u
-# intentar activar pipefail, si no está disponible, ignorar el fallo
+# intentar activar pipefail, si no estÃ¡ disponible, ignorar el fallo
 set -o pipefail 2>/dev/null || true
 
 # Logs
@@ -31,3 +31,5 @@ echo "[start] Worker log: ${WORKER_LOG}"
 PORT="${PORT:-8501}"
 echo "[start] Arrancando Streamlit en puerto ${PORT}..."
 exec streamlit run dashboard/app.py --server.port "${PORT}" --server.address "0.0.0.0" --server.enableCORS false
+
+
