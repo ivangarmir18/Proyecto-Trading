@@ -32,7 +32,7 @@ except Exception:
     HAS_SUPABASE = False
 
 from core.storage_postgres import PostgresStorage
-import core.init_and_backfill as init_and_backfill
+import init_and_backfill as init_and_backfill
 from core.orchestrator import Orchestrator
 
 logger = logging.getLogger("dashboard.utils")
