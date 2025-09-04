@@ -373,4 +373,92 @@ class Adapter:
         return status
 
 # singleton
+# ----------------------------
+# Adapter compatibility shim: safe load_candles method for Adapter instances.
+# Append this at end to ensure Adapter has a robust method that tolerates backend signature differences.
+# ----------------------------
+import inspect
+import logging
+from typing import Optional
+
+_LOG = logging.getLogger(__name__)
+
+def _adapter_load_candles_compat(self, symbol: str, interval: Optional[str] = None, limit: int = 1000):
+    """
+    Robust Adapter.load_candles implementation:
+      - tries storage module's load_candles with a few signatures
+      - tries fetch module if needed
+      - falls back to CSV cache
+    """
+    try:
+        # If there is a storage backend object referenced as _storage in module scope, try it first.
+        _storage = globals().get("_storage")
+        _fetch = globals().get("_fetch")
+        # Try _storage if available
+        if _storage and hasattr(_storage, "load_candles"):
+            fn = getattr(_storage, "load_candles")
+            try:
+                sig = inspect.signature(fn)
+                params = sig.parameters
+                if "interval" in params:
+                    use_interval = interval or "1h"
+                    try:
+                        return fn(symbol, interval=use_interval, limit=limit)
+                    except TypeError:
+                        # try other pos/kw combos
+                        try:
+                            return fn(symbol, use_interval, None, limit)
+                        except Exception:
+                            return fn(symbol, use_interval, limit)
+                else:
+                    # backend expects (symbol, limit=...)
+                    try:
+                        return fn(symbol, limit=limit)
+                    except TypeError:
+                        return fn(symbol, limit)
+            except Exception:
+                # Last resort: attempt call with limit only
+                try:
+                    return fn(symbol, limit=limit)
+                except Exception:
+                    _LOG.exception("adapter: _storage.load_candles attempts failed")
+        # Try fetch module next (some fetchers expose load_candles)
+        if _fetch and hasattr(_fetch, "load_candles"):
+            try:
+                ffn = getattr(_fetch, "load_candles")
+                return ffn(symbol, interval=interval, limit=limit)
+            except Exception:
+                try:
+                    return ffn(symbol, limit=limit)
+                except Exception:
+                    _LOG.exception("adapter: _fetch.load_candles attempts failed")
+    except Exception:
+        _LOG.exception("adapter load_candles compatibility wrapper failed")
+
+    # CSV fallback (CACHE_DIR likely defined in the module)
+    try:
+        CACHE_DIR = globals().get("CACHE_DIR", None)
+        import os, pandas as _pd
+        if CACHE_DIR:
+            path_csv = os.path.join(CACHE_DIR, f"{symbol}.csv")
+            if os.path.exists(path_csv):
+                df = _pd.read_csv(path_csv)
+                return df
+    except Exception:
+        _LOG.exception("adapter CSV fallback failed for %s", symbol)
+
+    # final empty df
+    import pandas as _pd
+    return _pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+# Attach to Adapter class if it exists in module scope
+if "Adapter" in globals():
+    try:
+        Adapter.load_candles = _adapter_load_candles_compat
+        _LOG.info("Adapter.load_candles replaced with compatibility wrapper")
+    except Exception:
+        _LOG.exception("Could not attach load_candles compat to Adapter")
+else:
+    _LOG.info("Adapter class not found in adapter.py when attaching load_candles compat")
+
 adapter = Adapter()

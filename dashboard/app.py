@@ -1064,5 +1064,118 @@ else:
     lines = tail_file(log_choice, 200)
     st.code("\n".join(lines[-nlines:]))
 
+# ----------------------------
+# UI helpers: trigger backfill and show simple text logs
+# ----------------------------
+import logging
+import importlib
+from datetime import datetime
+
+_logger = logging.getLogger(__name__)
+
+def ui_trigger_backfill(symbols=None, per_symbol_limit=1000):
+    """
+    Called from the UI to trigger backfill. Uses orchestrator_mod or fetch_mod if available.
+    Returns a dict-like status.
+    """
+    try:
+        # prefer orchestrator if present
+        try:
+            orchestrator_mod = importlib.import_module("core.orchestrator")
+        except Exception:
+            orchestrator_mod = None
+        try:
+            fetch_mod = importlib.import_module("core.fetch")
+        except Exception:
+            fetch_mod = None
+
+        if orchestrator_mod and hasattr(orchestrator_mod, "run_full_backfill"):
+            try:
+                return orchestrator_mod.run_full_backfill(symbols=symbols, per_symbol_limit=per_symbol_limit)
+            except Exception:
+                _logger.exception("orchestrator.run_full_backfill failed")
+        if fetch_mod and hasattr(fetch_mod, "run_full_backfill"):
+            try:
+                return fetch_mod.run_full_backfill(symbols=symbols, per_symbol_limit=per_symbol_limit)
+            except Exception:
+                _logger.exception("fetch.run_full_backfill failed")
+        if fetch_mod and hasattr(fetch_mod, "safe_run_full_backfill"):
+            try:
+                return fetch_mod.safe_run_full_backfill(symbols=symbols, per_symbol_limit=per_symbol_limit)
+            except Exception:
+                _logger.exception("fetch.safe_run_full_backfill failed")
+    except Exception:
+        _logger.exception("ui_trigger_backfill failed")
+    return {"error": "no_backfill_available", "timestamp": datetime.utcnow().isoformat()}
+
+def tail_log_file(path: str, nlines: int = 200):
+    """
+    Small helper to tail a text file (best-effort). Returns list of lines.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            end = f.tell()
+            size = 1024
+            data = b""
+            while len(data.splitlines()) <= nlines and end > 0:
+                read_size = min(size, end)
+                f.seek(end - read_size)
+                chunk = f.read(read_size)
+                data = chunk + data
+                end -= read_size
+            lines = data.splitlines()[-nlines:]
+            return [l.decode("utf-8", errors="replace") for l in lines]
+    except Exception:
+        _logger.exception("tail_log_file failed for %s", path)
+        return []
+
+# ----------------------------
+# Compat: alias tail_file -> tail_log_file (backwards compatibility)
+# ----------------------------
+def tail_file(path: str, nlines: int = 200):
+    """
+    Backwards-compatible wrapper expected by older code.
+    - Si existe tail_log_file en este módulo lo reutiliza.
+    - Si no, hace un tail best-effort del fichero.
+    """
+    try:
+        # If tail_log_file exists and is callable, use it
+        if "tail_log_file" in globals() and callable(globals()["tail_log_file"]):
+            try:
+                return globals()["tail_log_file"](path, nlines)
+            except Exception:
+                # fall through to local fallback
+                pass
+    except Exception:
+        pass
+
+    # Best-effort fallback tail implementation (binary-safe)
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            block_size = 1024
+            data = b""
+            while file_size > 0 and len(data.splitlines()) <= nlines:
+                read_size = min(block_size, file_size)
+                f.seek(file_size - read_size)
+                chunk = f.read(read_size)
+                data = chunk + data
+                file_size -= read_size
+            lines = data.splitlines()[-nlines:]
+            return [l.decode("utf-8", errors="replace") for l in lines]
+    except FileNotFoundError:
+        # If file doesn't exist, return empty list (UI can handle)
+        return []
+    except Exception:
+        # last-resort: avoid raising to keep UI running
+        try:
+            return []
+        except Exception:
+            return []
+
 st.markdown("---")
+
+
 

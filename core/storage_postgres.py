@@ -634,3 +634,60 @@ if PostgresStorage is not None:
         setattr(PostgresStorage, "upsert_score", _ps_upsert_score)
 
 # --- Fin parche storage_postgres ---
+# ----------------------------
+# Compat layer: make load_candles accept (symbol, interval=None, limit=None)
+# This wrapper makes the Postgres storage tolerate callers that pass 'interval'.
+# It will override load_candles name in this module with a compatible wrapper.
+# ----------------------------
+import logging
+import inspect
+from typing import Optional
+
+_logger = logging.getLogger(__name__)
+
+def load_candles_compat(symbol: str, interval: Optional[str] = None, db_path: Optional[str] = None, limit: Optional[int] = None):
+    """
+    Backwards-compatible wrapper for load_candles.
+    Some modules expect signature (symbol, limit=...) and others (asset, interval, ...).
+    This wrapper will try to call the underlying implementation in a few sensible ways.
+    """
+    try:
+        # get original (module-level) function if present
+        orig = globals().get("load_candles")
+        if orig and orig is not load_candles_compat:
+            try:
+                sig = inspect.signature(orig)
+                params = sig.parameters
+                # If the original expects 'interval', call with it
+                if "interval" in params:
+                    # attempt keyword call
+                    return orig(symbol, interval=interval, db_path=db_path, limit=limit)
+                # else: try symbol + limit
+                if "limit" in params:
+                    if limit is not None:
+                        return orig(symbol, limit=limit)
+                    else:
+                        # call with default limit
+                        return orig(symbol)
+                # fallback to attempt calling with symbol only
+                return orig(symbol)
+            except TypeError:
+                # try positional fallback
+                try:
+                    if limit is not None:
+                        return orig(symbol, limit)
+                    else:
+                        return orig(symbol)
+                except Exception as e:
+                    _logger.exception("storage_postgres.orig call failed: %s", e)
+        # if no orig function found, return empty df
+    except Exception as e:
+        _logger.exception("load_candles_compat outer error: %s", e)
+
+    import pandas as _pd
+    return _pd.DataFrame(columns=["ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"])
+
+# Expose compatibility function under canonical name (override if necessary)
+globals()["load_candles"] = load_candles_compat
+_logger.info("storage_postgres: installed load_candles_compat wrapper")
+

@@ -382,4 +382,40 @@ if Orchestrator is not None and not hasattr(Orchestrator, "safe_backfill"):
     setattr(Orchestrator, "safe_backfill", safe_backfill)
 
 # --- Fin parche orchestrator.py ---
+# ----------------------------
+# Orchestrator shim: ensure there's a run_full_backfill entrypoint that calls core.fetch.run_full_backfill safely.
+# ----------------------------
+import logging
+import importlib
+
+_logger = logging.getLogger(__name__)
+
+def run_full_backfill_safe(symbols=None, per_symbol_limit=1000):
+    """
+    Orchestrator-level safe wrapper to invoke fetch.run_full_backfill or fallback to fetch.safe_run_full_backfill.
+    """
+    try:
+        fetch_mod = importlib.import_module("core.fetch")
+        if hasattr(fetch_mod, "run_full_backfill"):
+            try:
+                return fetch_mod.run_full_backfill(symbols=symbols, per_symbol_limit=per_symbol_limit)
+            except Exception:
+                _logger.exception("fetch.run_full_backfill raised; trying safe wrapper")
+        if hasattr(fetch_mod, "safe_run_full_backfill"):
+            return fetch_mod.safe_run_full_backfill(symbols=symbols, per_symbol_limit=per_symbol_limit)
+        # final fallback: attempt to call any available function name
+        for name in ("safe_run_full_backfill","run_full_backfill"):
+            if hasattr(fetch_mod, name):
+                try:
+                    return getattr(fetch_mod, name)(symbols=symbols, per_symbol_limit=per_symbol_limit)
+                except Exception:
+                    _logger.exception("fallback fetch function %s failed", name)
+    except Exception:
+        _logger.exception("orchestrator.run_full_backfill_safe failed")
+    return {"error": "no_fetch_available"}
+
+# Attach to module-level if missing (so dashboard/orchestrator_mod.run_full_backfill works)
+if "run_full_backfill" not in globals():
+    run_full_backfill = run_full_backfill_safe
+    _logger.info("Orchestrator: installed run_full_backfill_safe")
 

@@ -542,3 +542,110 @@ def _persist_score_fallback(storage, asset: str, ts: int, score_val: float, comp
 # Attach to module so compute_and_persist_scores puede usarlo si storage.upsert_score falla.
 _persist_score = _persist_score_fallback
 # --- Fin parche core/score.py ---
+# ----------------------------
+# Score helpers: normalize weights and safe compute wrapper
+# ----------------------------
+import logging
+from typing import Dict, Any
+import json
+
+_logger = logging.getLogger(__name__)
+
+def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
+    """
+    Normaliza un diccionario de pesos para que sumen 1.0 (si s>0)
+    """
+    try:
+        s = sum(float(v) for v in weights.values())
+        if s > 0:
+            return {k: float(v) / s for k, v in weights.items()}
+    except Exception as e:
+        _logger.exception("normalize_weights failed: %s", e)
+    # fallback: return original as floats
+    return {k: float(v) for k, v in weights.items()}
+
+def compute_score_safe(df, score_config: Dict[str, Any], weights_override: Dict[str, float] = None):
+    """
+    Safe wrapper to compute a score:
+      - If module defines compute_score(df, config) use it.
+      - Otherwise compute a simple weighted average over named component columns present in df.
+    score_config expected to contain 'components' mapping with names -> { weight: .., source: ... }
+    """
+    try:
+        # If a compute_score function exists above in the module, prefer it
+        if "compute_score" in globals() and callable(globals()["compute_score"]):
+            try:
+                return globals()["compute_score"](df, score_config)
+            except Exception:
+                _logger.exception("module compute_score failed, falling back to simple weighted calc")
+
+        # Build weights mapping
+        components = score_config.get("components", {}) if isinstance(score_config, dict) else {}
+        weights = {name: float(defn.get("weight", 0.0)) for name, defn in components.items()}
+        if weights_override:
+            # override or merge
+            for k,v in weights_override.items():
+                weights[k] = float(v)
+        weights = normalize_weights(weights)
+
+        # compute per-row simple weighted sum using columns that match component keys (if present)
+        import pandas as _pd
+        if df is None or not hasattr(df, "shape"):
+            return None
+        # prepare series for each weight; if column missing use 0
+        total = _pd.Series(0, index=df.index, dtype=float)
+        for comp, w in weights.items():
+            if comp in df.columns:
+                col = df[comp].astype(float).fillna(0.0)
+            else:
+                # try fallback: common mapping rsi->rsi_14, ema->ema_50, etc (very naive)
+                mapping = {
+                    "rsi": "rsi_14",
+                    "ema": "ema_50",
+                    "atr": "atr",
+                    "macd": "macd",
+                    "support": "support",
+                    "fibonacci": "fibonacci"
+                }
+                alt = mapping.get(comp)
+                col = df[alt].astype(float).fillna(0.0) if (alt and alt in df.columns) else _pd.Series(0.0, index=df.index)
+            total = total + col * float(w)
+        # keep 0..1 bounds
+        total = total.clip(lower=0.0, upper=1.0)
+        return total
+    except Exception:
+        _logger.exception("compute_score_safe failed")
+        return None
+
+# persistence helper: compute & persist last score for an asset (best-effort)
+def compute_and_persist_last_score(asset: str, df, score_config: Dict[str, Any], storage_module=None):
+    """
+    Computes the latest score for df using compute_score_safe and attempts to persist it
+    using a storage module if provided (expects storage_module.save_scores or storage upsert).
+    """
+    try:
+        series = compute_score_safe(df, score_config)
+        if series is None or len(series) == 0:
+            return False
+        last_val = float(series.iloc[-1])
+        ts = int(df.iloc[-1].get("ts") if "ts" in df.columns else 0)
+        # try to persist via score persistence function, if present
+        if storage_module:
+            try:
+                if hasattr(storage_module, "save_scores"):
+                    # assume save_scores(asset, df_of_scores) signature -- not guaranteed
+                    storage_module.save_scores(asset, series.to_frame(name="score"))
+                    return True
+            except Exception:
+                _logger.exception("Failed saving score via storage_module")
+        # otherwise try module-level _persist_score if exists
+        if "_persist_score" in globals() and callable(globals()["_persist_score"]):
+            try:
+                globals()["_persist_score"](asset, ts, float(last_val), method=score_config.get("method"))
+                return True
+            except Exception:
+                _logger.exception("_persist_score call failed")
+    except Exception:
+        _logger.exception("compute_and_persist_last_score failed")
+    return False
+
