@@ -1,89 +1,124 @@
 # core/storage_postgres.py
+"""
+Postgres-backed storage for Proyecto-Trading (implementación completa y compatible).
+
+Características:
+- Pool de conexiones (psycopg2 SimpleConnectionPool)
+- init_db() crea tablas: candles, scores, indicators, watchlist, backfill_status, models
+- save_candles / load_candles (batch + ON CONFLICT upsert)
+- save_scores / load_scores
+- save_model_record / get_latest_model_record
+- list_assets / list_intervals_for_asset / list_models_for_asset_interval
+- watchlist helpers: add/remove/list/get
+- health() para checks de conexión
+- make_storage_from_env() helper para creación conveniente
+
+Requiere:
+- psycopg2, pandas
+- DATABASE_URL o variables POSTGRES_HOST/PORT/DB/USER/PASSWORD
+
+Notas:
+- ts almacenado como BIGINT (epoch seconds). Si tus datos vienen en ms, la función convierte automáticamente.
+- Los DataFrames usados para save_* deben tener columnas mínimas indicadas en cada función.
+"""
+
 import os
-import json
-import threading
-from contextlib import contextmanager
-from typing import Optional, Dict, Any, List
+import logging
+import glob
+from typing import Optional, List, Dict, Any
+
 import pandas as pd
 import psycopg2
 from psycopg2 import pool
-import logging
-from datetime import datetime, timezone
-from urllib.parse import urlparse
+from psycopg2.extras import execute_values, Json
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(h)
 
 
 class PostgresStorage:
-    """
-    Postgres-backed storage (supports DATABASE_URL or separate env vars).
-    Env vars: DATABASE_URL OR POSTGRES_HOST/POSTGRES_PORT/POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD
-    """
-
     def __init__(self,
+                 database_url: Optional[str] = None,
                  host: Optional[str] = None,
                  port: Optional[int] = None,
                  dbname: Optional[str] = None,
                  user: Optional[str] = None,
                  password: Optional[str] = None,
                  minconn: int = 1,
-                 maxconn: int = 5):
+                 maxconn: int = 8):
+        """
+        Inicializa pool. Prioriza DATABASE_URL. Si no existe, usa POSTGRES_* env.
+        """
+        database_url = database_url or os.getenv("DATABASE_URL")
         self._minconn = minconn
         self._maxconn = maxconn
-        # Prefer DATABASE_URL if present (works with Supabase)
-        database_url = os.getenv("DATABASE_URL")
-        print("🔍 DEBUG: DATABASE_URL =", repr(database_url))
-        if database_url:
-            try:
-                self._pool = pool.SimpleConnectionPool(self._minconn, self._maxconn, dsn=database_url)
-                logger.info("PostgresStorage initialized via DATABASE_URL.")
-                return
-            except Exception as e:
-                logger.exception("Fallo al crear pool con DATABASE_URL: %s", e)
+        self._pool = None
+        self._database_url = database_url
 
-        # Fallback: individual env vars (or provided args)
-        self.host = host or os.getenv("POSTGRES_HOST", "localhost")
-        self.port = port or int(os.getenv("POSTGRES_PORT", "5432"))
-        self.dbname = dbname or os.getenv("POSTGRES_DB", "trading")
-        self.user = user or os.getenv("POSTGRES_USER", "postgres")
-        self.password = password or os.getenv("POSTGRES_PASSWORD", "")
+        self.host = host
+        self.port = port
+        self.dbname = dbname
+        self.user = user
+        self.password = password
 
+        # If no DATABASE_URL, build it from env / params later when needed
+        self._ensure_pool()
+
+    def _build_dsn_from_env(self) -> str:
+        host = self.host or os.getenv("POSTGRES_HOST", "localhost")
+        port = str(self.port or int(os.getenv("POSTGRES_PORT", "5432")))
+        db = self.dbname or os.getenv("POSTGRES_DB", "trading")
+        user = self.user or os.getenv("POSTGRES_USER", "postgres")
+        pwd = self.password or os.getenv("POSTGRES_PASSWORD", "")
+        # simple DSN for psycopg2
+        return f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+
+    def _ensure_pool(self):
+        if self._pool:
+            return
         try:
-            self._pool = pool.SimpleConnectionPool(
-                self._minconn,
-                self._maxconn,
-                host=self.host,
-                port=self.port,
-                dbname=self.dbname,
-                user=self.user,
-                password=self.password
-            )
-            logger.info("PostgresStorage initialized (host=%s db=%s user=%s)", self.host, self.dbname, self.user)
-        except Exception as e:
-            logger.exception("Error inicializando Postgres connection pool: %s", e)
+            dsn = self._database_url or self._build_dsn_from_env()
+            self._pool = pool.SimpleConnectionPool(self._minconn, self._maxconn, dsn)
+            logger.info("Postgres pool created (min=%s max=%s).", self._minconn, self._maxconn)
+        except Exception:
+            logger.exception("Failed creating Postgres pool with DSN.")
             raise
 
-        self._lock = threading.Lock()
+    def close(self):
+        if self._pool:
+            try:
+                self._pool.closeall()
+                logger.info("Closed Postgres pool")
+            except Exception:
+                logger.exception("Error closing pool")
 
-    @contextmanager
     def _get_conn(self):
-        conn = None
+        self._ensure_pool()
         try:
-            conn = self._pool.getconn()
-            yield conn
-        finally:
-            if conn:
-                try:
-                    self._pool.putconn(conn)
-                except Exception:
-                    pass
+            return self._pool.getconn()
+        except Exception:
+            logger.exception("Failed to get conn from pool")
+            raise
 
+    def _put_conn(self, conn):
+        if not conn:
+            return
+        try:
+            self._pool.putconn(conn)
+        except Exception:
+            logger.exception("Failed to return conn to pool")
+
+    # -------------------------
+    # Schema / Init
+    # -------------------------
     def init_db(self):
-        """Create minimal schema if not exists."""
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
+        """Create all tables + essential indexes if they don't exist."""
+        create_statements = [
+            """
             CREATE TABLE IF NOT EXISTS candles (
               ts BIGINT NOT NULL,
               timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -96,401 +131,564 @@ class PostgresStorage:
               interval TEXT NOT NULL,
               PRIMARY KEY (ts, asset, interval)
             );
-            """)
-            cur.execute("""
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_candles_asset_interval_ts ON candles (asset, interval, ts);",
+            """
+            CREATE TABLE IF NOT EXISTS scores (
+              id BIGSERIAL PRIMARY KEY,
+              ts BIGINT NOT NULL,
+              asset TEXT NOT NULL,
+              interval TEXT NOT NULL,
+              score JSONB,
+              created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_scores_asset_interval_ts ON scores (asset, interval, ts);",
+            """
             CREATE TABLE IF NOT EXISTS indicators (
-              id SERIAL PRIMARY KEY,
+              id BIGSERIAL PRIMARY KEY,
               ts BIGINT NOT NULL,
               asset TEXT NOT NULL,
               interval TEXT NOT NULL,
               indicators JSONB,
               created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
             );
-            """)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS scores (
-              id SERIAL PRIMARY KEY,
-              ts BIGINT NOT NULL,
-              asset TEXT NOT NULL,
-              interval TEXT NOT NULL,
-              model_id INTEGER,
-              score JSONB,
-              created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_indicators_asset_interval_ts ON indicators (asset, interval, ts);",
+            """
+            CREATE TABLE IF NOT EXISTS watchlist (
+              asset TEXT PRIMARY KEY,
+              meta JSONB
             );
-            """)
-            cur.execute("""
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS backfill_status (
+              asset TEXT PRIMARY KEY,
+              interval TEXT,
+              last_ts BIGINT,
+              updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            );
+            """,
+            """
             CREATE TABLE IF NOT EXISTS models (
-              id SERIAL PRIMARY KEY,
-              asset TEXT NOT NULL,
-              interval TEXT NOT NULL,
-              supabase_path TEXT NOT NULL,
-              filename TEXT,
-              meta JSONB,
+              id BIGSERIAL PRIMARY KEY,
+              name TEXT,
+              asset TEXT,
+              interval TEXT,
+              metadata JSONB,
               created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
             );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_candles_asset_interval ON candles(asset, interval);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_models_asset_interval ON models(asset, interval);")
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_models_asset_interval ON models (asset, interval);",
+        ]
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            for s in create_statements:
+                cur.execute(s)
             conn.commit()
             cur.close()
-        logger.info("Database schema ensured.")
+            logger.info("init_db: ensured tables and indexes")
+        except Exception:
+            logger.exception("init_db failed")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
 
-    # ---------------------
-    # Candles IO
-    # ---------------------
-    def save_candles(self, df: pd.DataFrame, batch: int = 500):
-        required_cols = {"ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"}
-        if not required_cols.issubset(set(df.columns)):
-            raise ValueError(f"DataFrame must contain columns {required_cols}")
-
-        rows = [
-            (
-                int(row["ts"]),
-                pd.to_datetime(row["timestamp"]).to_pydatetime(),
-                float(row["open"]),
-                float(row["high"]),
-                float(row["low"]),
-                float(row["close"]),
-                float(row.get("volume", 0.0)),
-                str(row["asset"]),
-                str(row["interval"])
-            )
-            for _, row in df.iterrows()
-        ]
-
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            sql_insert = """
-            INSERT INTO candles (ts, timestamp, open, high, low, close, volume, asset, interval)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (ts, asset, interval) DO UPDATE
-              SET open = EXCLUDED.open,
-                  high = EXCLUDED.high,
-                  low = EXCLUDED.low,
-                  close = EXCLUDED.close,
-                  volume = EXCLUDED.volume,
-                  timestamp = EXCLUDED.timestamp;
-            """
-            for i in range(0, len(rows), batch):
-                batch_rows = rows[i:i+batch]
-                cur.executemany(sql_insert, batch_rows)
-                conn.commit()
-            cur.close()
-        logger.info("Saved %d candle rows", len(rows))
-
-    def load_candles(self, asset: str, interval: str, start_ts: Optional[int] = None,
-                     end_ts: Optional[int] = None, limit: Optional[int] = None) -> pd.DataFrame:
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            base_q = "SELECT ts, timestamp, open, high, low, close, volume, asset, interval FROM candles WHERE asset=%s AND interval=%s"
-            params = [asset, interval]
-            if start_ts is not None:
-                base_q += " AND ts >= %s"
-                params.append(int(start_ts))
-            if end_ts is not None:
-                base_q += " AND ts <= %s"
-                params.append(int(end_ts))
-            base_q += " ORDER BY ts ASC"
-            if limit:
-                base_q += f" LIMIT {int(limit)}"
-            cur.execute(base_q, params)
-            rows = cur.fetchall()
-            cur.close()
-
-        if not rows:
-            return pd.DataFrame(columns=["ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"])
-
-        df = pd.DataFrame(rows, columns=["ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"])
-        df["ts"] = df["ts"].astype(int)
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+    # -------------------------
+    # Candles
+    # -------------------------
+    @staticmethod
+    def _ensure_ts(df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure ts column as epoch seconds ints and timestamp present."""
+        if df is None or df.empty:
+            return df
+        df = df.copy()
+        if 'ts' not in df.columns and 'timestamp' in df.columns:
+            df['ts'] = df['timestamp'].apply(lambda x: int(pd.to_datetime(x).timestamp()))
+        if 'timestamp' not in df.columns and 'ts' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['ts'], unit='s')
+        # convert ms to s if necessary
+        def _to_seconds(x):
+            try:
+                v = int(x)
+                if v > 1_000_000_000_000:
+                    return int(v / 1000)
+                return v
+            except Exception:
+                return int(pd.to_datetime(x).timestamp())
+        df['ts'] = df['ts'].apply(_to_seconds)
         return df
 
-    # ---------------------
-    # Scores IO
-    # ---------------------
-    def save_scores(self, df_scores: pd.DataFrame, batch: int = 500):
-        required_cols = {"ts", "asset", "interval", "score"}
-        if not required_cols.issubset(set(df_scores.columns)):
-            raise ValueError(f"df_scores must contain {required_cols}")
-
+    def save_candles(self, df: pd.DataFrame, asset: Optional[str] = None, interval: Optional[str] = None, batch_size: int = 1000) -> int:
+        """
+        Upsert candles. Returns number of rows processed.
+        Expects (or will create) columns: ts, timestamp, open, high, low, close, volume, asset, interval
+        """
+        if df is None or df.empty:
+            logger.debug("save_candles: empty df")
+            return 0
+        df = df.copy()
+        # Ensure ts/timestamp
+        df = self._ensure_ts(df)
+        # Fill missing columns
+        for c in ['open', 'high', 'low', 'close', 'volume']:
+            if c not in df.columns:
+                df[c] = None
+        if 'asset' not in df.columns:
+            if not asset:
+                raise ValueError("asset must be provided")
+            df['asset'] = asset
+        if 'interval' not in df.columns:
+            if not interval:
+                raise ValueError("interval must be provided")
+            df['interval'] = interval
+        # Drop rows without ts
+        df = df.dropna(subset=['ts'])
+        # deduplicate by ts/asset/interval keep latest
+        df = df.sort_values('timestamp').drop_duplicates(subset=['ts','asset','interval'], keep='last')
         rows = []
-        for _, row in df_scores.iterrows():
-            rows.append((int(row["ts"]), str(row["asset"]), str(row["interval"]),
-                         row.get("model_id"), json.dumps(row["score"])))
-
-        with self._get_conn() as conn:
+        for _, r in df.iterrows():
+            rows.append((int(r['ts']),
+                         pd.to_datetime(r['timestamp']),
+                         None if pd.isna(r.get('open')) else float(r.get('open')),
+                         None if pd.isna(r.get('high')) else float(r.get('high')),
+                         None if pd.isna(r.get('low')) else float(r.get('low')),
+                         None if pd.isna(r.get('close')) else float(r.get('close')),
+                         None if pd.isna(r.get('volume')) else float(r.get('volume')),
+                         str(r['asset']),
+                         str(r['interval'])))
+        insert_q = """
+        INSERT INTO candles (ts, timestamp, open, high, low, close, volume, asset, interval)
+        VALUES %s
+        ON CONFLICT (ts, asset, interval) DO UPDATE SET
+          open = EXCLUDED.open,
+          high = EXCLUDED.high,
+          low = EXCLUDED.low,
+          close = EXCLUDED.close,
+          volume = EXCLUDED.volume,
+          timestamp = EXCLUDED.timestamp
+        """
+        conn = None
+        total = 0
+        try:
+            conn = self._get_conn()
             cur = conn.cursor()
-            sql_insert = """
-            INSERT INTO scores (ts, asset, interval, model_id, score)
-            VALUES (%s,%s,%s,%s,%s)
-            ON CONFLICT DO NOTHING;
-            """
-            for i in range(0, len(rows), batch):
-                cur.executemany(sql_insert, rows[i:i+batch])
-                conn.commit()
-            cur.close()
-        logger.info("Saved %d score rows", len(rows))
-
-    def load_scores(self, asset: str, interval: str,
-                    start_ts: Optional[int] = None, end_ts: Optional[int] = None,
-                    model_id: Optional[int] = None) -> List[Dict[str, Any]]:
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            base_q = "SELECT ts, asset, interval, model_id, score, created_at FROM scores WHERE asset=%s AND interval=%s"
-            params = [asset, interval]
-            if start_ts is not None:
-                base_q += " AND ts >= %s"
-                params.append(int(start_ts))
-            if end_ts is not None:
-                base_q += " AND ts <= %s"
-                params.append(int(end_ts))
-            if model_id:
-                base_q += " AND model_id = %s"
-                params.append(int(model_id))
-            base_q += " ORDER BY ts ASC"
-            cur.execute(base_q, params)
-            rows = cur.fetchall()
-            cur.close()
-        results = []
-        for r in rows:
-            results.append({
-                "ts": int(r[0]),
-                "asset": r[1],
-                "interval": r[2],
-                "model_id": r[3],
-                "score": r[4],
-                "created_at": r[5].astimezone(timezone.utc).isoformat() if r[5] else None
-            })
-        return results
-
-    # ---------------------
-    # Model metadata
-    # ---------------------
-    def save_model_record(self, asset: str, interval: str,
-                          supabase_path: str, filename: str,
-                          meta: Dict[str, Any]) -> Dict[str, Any]:
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            sql_q = """
-            INSERT INTO models (asset, interval, supabase_path, filename, meta)
-            VALUES (%s,%s,%s,%s,%s)
-            RETURNING id, created_at
-            """
-            cur.execute(sql_q, (asset, interval, supabase_path, filename, json.dumps(meta)))
-            row = cur.fetchone()
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i+batch_size]
+                execute_values(cur, insert_q, batch, page_size=batch_size)
+                total += len(batch)
             conn.commit()
             cur.close()
-        if row:
-            return {"id": row[0], "created_at": row[1].isoformat()}
-        return {}
+            logger.info("save_candles: upserted %d rows", total)
+            return total
+        except Exception:
+            logger.exception("save_candles failed")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    def load_candles(self, asset: str, interval: str,
+                     start_ts: Optional[int] = None, end_ts: Optional[int] = None,
+                     limit: Optional[int] = None, ascending: bool = True) -> pd.DataFrame:
+        """
+        Load candles as DataFrame. Returns columns: ts,timestamp,open,high,low,close,volume,asset,interval
+        """
+        if not asset or not interval:
+            raise ValueError("asset & interval required")
+        conditions = ["asset = %s", "interval = %s"]
+        params = [asset, interval]
+        if start_ts is not None:
+            conditions.append("ts >= %s"); params.append(int(start_ts))
+        if end_ts is not None:
+            conditions.append("ts <= %s"); params.append(int(end_ts))
+        where = " AND ".join(conditions)
+        order = "ASC" if ascending else "DESC"
+        limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
+        q = f"SELECT ts, timestamp, open, high, low, close, volume, asset, interval FROM candles WHERE {where} ORDER BY ts {order} {limit_clause};"
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute(q, tuple(params))
+            rows = cur.fetchall()
+            cur.close()
+            if not rows:
+                return pd.DataFrame(columns=['ts','timestamp','open','high','low','close','volume','asset','interval'])
+            df = pd.DataFrame(rows, columns=['ts','timestamp','open','high','low','close','volume','asset','interval'])
+            df['ts'] = df['ts'].astype('int64')
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            return df
+        except Exception:
+            logger.exception("load_candles failed")
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    # -------------------------
+    # Scores
+    # -------------------------
+    def save_scores(self, df: pd.DataFrame) -> int:
+        """
+        Save scoring results.
+        Expected columns: ts, asset, interval, score (dict)
+        """
+        if df is None or df.empty:
+            return 0
+        df = df.copy()
+        if 'ts' not in df.columns:
+            raise ValueError("save_scores expects ts")
+        if 'asset' not in df.columns or 'interval' not in df.columns:
+            raise ValueError("save_scores expects asset and interval")
+        rows = []
+        for _, r in df.iterrows():
+            rows.append((int(r['ts']), str(r['asset']), str(r['interval']), Json(r.get('score') if 'score' in r else {})))
+        insert_q = "INSERT INTO scores (ts, asset, interval, score) VALUES %s"
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            execute_values(cur, insert_q, rows)
+            conn.commit()
+            cur.close()
+            logger.info("save_scores: inserted %d rows", len(rows))
+            return len(rows)
+        except Exception:
+            logger.exception("save_scores failed")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    def load_scores(self, asset: Optional[str] = None, interval: Optional[str] = None,
+                    start_ts: Optional[int] = None, end_ts: Optional[int] = None, limit: Optional[int] = None) -> pd.DataFrame:
+        conds = []
+        params = []
+        if asset:
+            conds.append("asset = %s"); params.append(asset)
+        if interval:
+            conds.append("interval = %s"); params.append(interval)
+        if start_ts is not None:
+            conds.append("ts >= %s"); params.append(int(start_ts))
+        if end_ts is not None:
+            conds.append("ts <= %s"); params.append(int(end_ts))
+        where = " AND ".join(conds) if conds else "TRUE"
+        limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
+        q = f"SELECT ts, asset, interval, score, created_at FROM scores WHERE {where} ORDER BY ts DESC {limit_clause};"
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute(q, tuple(params))
+            rows = cur.fetchall()
+            cur.close()
+            if not rows:
+                return pd.DataFrame(columns=['ts','asset','interval','score','created_at'])
+            df = pd.DataFrame(rows, columns=['ts','asset','interval','score','created_at'])
+            df['ts'] = df['ts'].astype('int64')
+            df['created_at'] = pd.to_datetime(df['created_at'])
+            return df
+        except Exception:
+            logger.exception("load_scores failed")
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    # -------------------------
+    # Models metadata
+    # -------------------------
+    def save_model_record(self, name: str, asset: str, interval: str, metadata: Dict[str, Any]) -> int:
+        """
+        Save a model record (metadata JSON). Returns id.
+        """
+        q = "INSERT INTO models (name, asset, interval, metadata) VALUES (%s,%s,%s,%s) RETURNING id;"
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute(q, (name, asset, interval, Json(metadata)))
+            new_id = cur.fetchone()[0]
+            conn.commit()
+            cur.close()
+            logger.info("save_model_record: id=%s", new_id)
+            return int(new_id)
+        except Exception:
+            logger.exception("save_model_record failed")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
 
     def get_latest_model_record(self, asset: str, interval: str) -> Optional[Dict[str, Any]]:
-        with self._get_conn() as conn:
+        q = "SELECT id, name, metadata, created_at FROM models WHERE asset = %s AND interval = %s ORDER BY created_at DESC LIMIT 1;"
+        conn = None
+        try:
+            conn = self._get_conn()
             cur = conn.cursor()
-            cur.execute("""
-            SELECT id, asset, interval, supabase_path, filename, meta, created_at
-            FROM models
-            WHERE asset=%s AND interval=%s
-            ORDER BY created_at DESC
-            LIMIT 1
-            """, (asset, interval))
+            cur.execute(q, (asset, interval))
             row = cur.fetchone()
             cur.close()
-        if not row:
-            return None
-        return {
-            "id": row[0],
-            "asset": row[1],
-            "interval": row[2],
-            "supabase_path": row[3],
-            "filename": row[4],
-            "meta": row[5],
-            "created_at": row[6].isoformat() if row[6] else None
-        }
-
-    # ---------------------
-    # Helpers for dashboard
-    # ---------------------
-    def list_assets(self) -> List[str]:
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT DISTINCT asset FROM candles ORDER BY asset;")
-            rows = cur.fetchall()
-            cur.close()
-        return [r[0] for r in rows] if rows else []
-
-    def list_intervals_for_asset(self, asset: str) -> List[str]:
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT DISTINCT interval FROM candles WHERE asset=%s ORDER BY interval;", (asset,))
-            rows = cur.fetchall()
-            cur.close()
-        return [r[0] for r in rows] if rows else []
-
-    def list_models_for_asset_interval(self, asset: str, interval: str, limit: int = 20) -> List[Dict[str, Any]]:
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-            SELECT id, filename, meta, created_at FROM models
-            WHERE asset=%s AND interval=%s
-            ORDER BY created_at DESC
-            LIMIT %s
-            """, (asset, interval, limit))
-            rows = cur.fetchall()
-            cur.close()
-        res = []
-        for r in rows:
-            res.append({
-                "id": r[0],
-                "filename": r[1],
-                "meta": r[2],
-                "created_at": r[3].isoformat() if r[3] else None
-            })
-        return res
-    # --- parche: añadir métodos watchlist dentro de class PostgresStorage ---
-    # (ponlo en la zona "Helpers for dashboard" o cerca de otros helpers)
-    
-    WATCHLIST_TABLE_SQL = """
-    CREATE TABLE IF NOT EXISTS watchlist (
-        id BIGSERIAL PRIMARY KEY,
-        user_id TEXT NOT NULL DEFAULT 'default',
-        asset TEXT NOT NULL,
-        asset_type TEXT,
-        interval TEXT,
-        metadata JSONB,
-        added_by TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE(user_id, asset)
-    );
-    """
-    
-    def _ensure_watchlist_table(self):
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(WATCHLIST_TABLE_SQL)
-            conn.commit()
-    
-    def add_watchlist_symbol(self, asset: str, asset_type: str = "crypto",
-                             interval: str = "1h", added_by: str = "dashboard",
-                             metadata: dict | None = None, user_id: str = "default") -> dict | None:
-        self._ensure_watchlist_table()
-        meta_json = json.dumps(metadata) if metadata is not None else None
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO watchlist (user_id, asset, asset_type, interval, metadata, added_by)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (user_id, asset) DO UPDATE
-                  SET asset_type = EXCLUDED.asset_type,
-                      interval = EXCLUDED.interval,
-                      metadata = COALESCE(EXCLUDED.metadata, watchlist.metadata),
-                      added_by = EXCLUDED.added_by,
-                      created_at = NOW()
-                RETURNING id, user_id, asset, asset_type, interval, metadata, added_by, created_at;
-                """,
-                (user_id, asset, asset_type, interval, meta_json, added_by),
-            )
-            row = cur.fetchone()
             if not row:
                 return None
-            # normalize returned dict
-            return {
-                "id": row[0],
-                "user_id": row[1],
-                "asset": row[2],
-                "asset_type": row[3],
-                "interval": row[4],
-                "metadata": row[5],
-                "added_by": row[6],
-                "created_at": row[7].isoformat() if row[7] else None,
-            }
-    
-    def list_watchlist(self, user_id: str = "default") -> list:
-        self._ensure_watchlist_table()
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT id, user_id, asset, asset_type, interval, metadata, added_by, created_at FROM watchlist WHERE user_id=%s ORDER BY created_at DESC;", (user_id,))
-            rows = cur.fetchall()
-        result = []
-        for r in rows:
-            result.append({
-                "id": r[0],
-                "user_id": r[1],
-                "asset": r[2],
-                "asset_type": r[3],
-                "interval": r[4],
-                "metadata": r[5],
-                "added_by": r[6],
-                "created_at": r[7].isoformat() if r[7] else None,
-            })
-        return result
-    
-    def get_watchlist(self, user_id: str = "default") -> list:
-        # alias
-        return self.list_watchlist(user_id=user_id)
-    
-    def remove_watchlist_symbol(self, asset: str, user_id: str = "default") -> bool:
-        self._ensure_watchlist_table()
-        with self._get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM watchlist WHERE user_id=%s AND asset=%s;", (user_id, asset))
-            return cur.rowcount > 0
-    # --- fin parche ---
+            return {"id": row[0], "name": row[1], "metadata": row[2], "created_at": row[3]}
+        except Exception:
+            logger.exception("get_latest_model_record failed")
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
 
-    # ---------------------
-    # Health
-    # ---------------------
-    def health(self) -> Dict[str, Any]:
+    # -------------------------
+    # Listing helpers
+    # -------------------------
+    def list_assets(self) -> List[str]:
+        """Return distinct assets from candles; fallback to watchlist / data/config/*.csv"""
+        conn = None
         try:
-            with self._get_conn() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT now();")
-                _ = cur.fetchone()
-                cur.close()
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT asset FROM candles;")
+            rows = cur.fetchall()
+            cur.close()
+            if rows:
+                return sorted([r[0] for r in rows])
+        except Exception:
+            logger.debug("list_assets query failed, falling back to watchlist/csv")
+        finally:
+            if conn:
+                self._put_conn(conn)
+        # fallback: watchlist
+        wl = self.list_watchlist()
+        if wl:
+            return wl
+        # fallback: data/config CSVs
+        assets = set()
+        try:
+            for p in glob.glob("data/config/*.csv"):
+                try:
+                    df = pd.read_csv(p)
+                    for c in ("asset","symbol","ticker"):
+                        if c in df.columns:
+                            assets.update(df[c].astype(str).tolist())
+                            break
+                except Exception:
+                    logger.debug("reading config csv %s failed", p)
+        except Exception:
+            logger.exception("list_assets fallback failed")
+        return sorted(list(assets))
+
+    def list_intervals_for_asset(self, asset: str) -> List[str]:
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT interval FROM candles WHERE asset = %s;", (asset,))
+            rows = cur.fetchall()
+            cur.close()
+            if rows:
+                return sorted([r[0] for r in rows])
+            return []
+        except Exception:
+            logger.exception("list_intervals_for_asset failed")
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    def list_models_for_asset_interval(self, asset: str, interval: str) -> List[Dict[str, Any]]:
+        q = "SELECT id, name, metadata, created_at FROM models WHERE asset = %s AND interval = %s ORDER BY created_at DESC;"
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute(q, (asset, interval))
+            rows = cur.fetchall()
+            cur.close()
+            return [{"id": r[0], "name": r[1], "metadata": r[2], "created_at": r[3]} for r in rows]
+        except Exception:
+            logger.exception("list_models_for_asset_interval failed")
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    # -------------------------
+    # Watchlist helpers
+    # -------------------------
+    def _ensure_watchlist_table(self):
+        # init_db should have created it, but be safe
+        try:
+            self.init_db()
+        except Exception:
+            logger.exception("Ensuring watchlist table via init_db failed")
+
+    def add_watchlist_symbol(self, asset: str, meta: Optional[Dict[str, Any]] = None):
+        self._ensure_watchlist_table()
+        conn = None
+        q = "INSERT INTO watchlist (asset, meta) VALUES (%s,%s) ON CONFLICT (asset) DO UPDATE SET meta = EXCLUDED.meta;"
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute(q, (asset, Json(meta or {})))
+            conn.commit()
+            cur.close()
+            logger.info("add_watchlist_symbol: %s", asset)
+        except Exception:
+            logger.exception("add_watchlist_symbol failed")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    def list_watchlist(self) -> List[str]:
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT asset FROM watchlist;")
+            rows = cur.fetchall()
+            cur.close()
+            if rows:
+                return [r[0] for r in rows]
+        except Exception:
+            logger.debug("watchlist table not available or empty")
+        finally:
+            if conn:
+                self._put_conn(conn)
+        # fallback to config CSVs
+        assets = set()
+        try:
+            for p in glob.glob("data/config/*.csv"):
+                try:
+                    df = pd.read_csv(p)
+                    for c in ("asset","symbol","ticker"):
+                        if c in df.columns:
+                            assets.update(df[c].astype(str).tolist())
+                            break
+                except Exception:
+                    logger.debug("reading config csv %s failed", p)
+        except Exception:
+            logger.exception("list_watchlist fallback failed")
+        return sorted(list(assets))
+
+    def get_watchlist(self) -> List[Dict[str, Any]]:
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT asset, meta FROM watchlist;")
+            rows = cur.fetchall()
+            cur.close()
+            return [{"asset": r[0], "meta": r[1]} for r in rows]
+        except Exception:
+            logger.exception("get_watchlist failed")
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    def remove_watchlist_symbol(self, asset: str):
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM watchlist WHERE asset = %s;", (asset,))
+            conn.commit()
+            cur.close()
+            logger.info("remove_watchlist_symbol: %s", asset)
+        except Exception:
+            logger.exception("remove_watchlist_symbol failed")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    # -------------------------
+    # Backfill status helpers
+    # -------------------------
+    def update_backfill_status(self, asset: str, interval: str, last_ts: int):
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO backfill_status (asset, interval, last_ts, updated_at) VALUES (%s,%s,%s,now()) "
+                "ON CONFLICT (asset) DO UPDATE SET last_ts = EXCLUDED.last_ts, interval = EXCLUDED.interval, updated_at = now();",
+                (asset, interval, int(last_ts))
+            )
+            conn.commit()
+            cur.close()
+        except Exception:
+            logger.exception("update_backfill_status failed")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    def get_backfill_status(self, asset: str) -> Optional[int]:
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT last_ts FROM backfill_status WHERE asset = %s;", (asset,))
+            row = cur.fetchone()
+            cur.close()
+            if row:
+                return int(row[0])
+            return None
+        except Exception:
+            logger.exception("get_backfill_status failed")
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+
+    # -------------------------
+    # Health / utils
+    # -------------------------
+    def health(self) -> Dict[str, Any]:
+        """
+        Return a dict with simple health info (can be extended)
+        """
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT 1;")
+            cur.fetchone()
+            cur.close()
             return {"ok": True}
-        except Exception as e:
-            logger.exception("DB health check failed: %s", e)
-            return {"ok": False, "error": str(e)}
+        except Exception:
+            logger.exception("health check failed")
+            return {"ok": False}
+        finally:
+            if conn:
+                self._put_conn(conn)
 
 
-def make_storage_from_env() -> PostgresStorage:
+# Convenience factory
+def make_storage_from_env(**kwargs) -> PostgresStorage:
     """
-    Factory helper: crea y devuelve PostgresStorage leyendo DATABASE_URL
-    o las variables POSTGRES_* individuales.
+    Helper that creates PostgresStorage reading DATABASE_URL or env variables.
+    Any kwargs override env.
     """
-    url = os.getenv("DATABASE_URL")
-    if url:
-        parsed = urlparse(url)
-        host = parsed.hostname
-        port = parsed.port
-        dbname = parsed.path.lstrip("/") if parsed.path else None
-        user = parsed.username
-        password = parsed.password
-        return PostgresStorage(
-            host=host,
-            port=int(port) if port else None,
-            dbname=dbname,
-            user=user,
-            password=password,
-        )
-
-    host = os.getenv("POSTGRES_HOST")
-    port = os.getenv("POSTGRES_PORT")
-    dbname = os.getenv("POSTGRES_DB")
-    user = os.getenv("POSTGRES_USER")
-    password = os.getenv("POSTGRES_PASSWORD")
-
-    if not (host and dbname and user):
-        raise RuntimeError(
-            "DATABASE_URL no está configurada y variables POSTGRES_* incompletas. "
-            "Define DATABASE_URL o POSTGRES_HOST/POSTGRES_DB/POSTGRES_USER."
-        )
-
-    return PostgresStorage(
-        host=host,
-        port=int(port) if port else None,
-        dbname=dbname,
-        user=user,
-        password=password,
-    )
+    return PostgresStorage(**kwargs)

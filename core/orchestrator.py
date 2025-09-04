@@ -1,161 +1,221 @@
-# dentro de class TradingOrchestrator (pegalo en la clase)
-# Sustituye la función _load_assets existente por esto
-from pathlib import Path
-import csv
+"""
+core/orchestrator.py
 
-def _load_assets(self) -> dict:
-    """
-    Load assets from config (self.config), then from CSVs data/config/cryptos.csv and actions.csv,
-    and finally include items from watchlist (storage) if available.
-    Returns: {"crypto": [...], "stocks": [...]}
-    """
-    cfg = getattr(self, "config", {}) or {}
-    crypto_set = set()
-    stocks_set = set()
+Coordinador central: cálculo de indicadores, scoring, entrenamiento ligero (metadata),
+persistencia de indicadores y scores, y ejecución de backtests.
 
-    # 1) From config dict (if present)
-    try:
-        conf_crypto = cfg.get("crypto", []) or []
-        conf_stocks = cfg.get("stocks", []) or []
-        for s in conf_crypto:
-            if s:
-                crypto_set.add(str(s).strip().upper())
-        for s in conf_stocks:
-            if s:
-                stocks_set.add(str(s).strip().upper())
-    except Exception:
-        # keep going even if config is malformed
-        pass
+Diseñado para:
+- Integrar PostgresStorage (guardar indicadores/scores/models)
+- Proveer API para la UI y scripts (compute_indicators_for, compute_and_store, compute_scores, train_model, run_backtest_for)
+- Ser extensible: si hay un módulo indicators.* con funciones avanzadas los usa; si no, cae a fallbacks.
+"""
+import logging
+from typing import Optional, Callable, Dict, Any, List
 
-    # 2) From CSV files (project-root/data/config/cryptos.csv and actions.csv)
-    try:
-        repo_root = Path(__file__).resolve().parents[1]  # core/.. => repo root
-        csv_dir = repo_root / "data" / "config"
-        cryptos_csv = csv_dir / "cryptos.csv"
-        actions_csv = csv_dir / "actions.csv"
-        if cryptos_csv.exists():
-            with cryptos_csv.open("r", encoding="utf-8") as fh:
-                rdr = csv.DictReader(fh)
-                # handle files with a 'symbol' column or single-column CSV
-                if "symbol" in (rdr.fieldnames or []):
-                    for r in rdr:
-                        val = r.get("symbol") or ""
-                        if val:
-                            crypto_set.add(str(val).strip().upper())
-                else:
-                    fh.seek(0)
-                    for row in fh:
-                        val = row.strip()
-                        if val:
-                            crypto_set.add(val.upper())
-        if actions_csv.exists():
-            with actions_csv.open("r", encoding="utf-8") as fh:
-                rdr = csv.DictReader(fh)
-                if "symbol" in (rdr.fieldnames or []):
-                    for r in rdr:
-                        val = r.get("symbol") or ""
-                        if val:
-                            stocks_set.add(str(val).strip().upper())
-                else:
-                    fh.seek(0)
-                    for row in fh:
-                        val = row.strip()
-                        if val:
-                            stocks_set.add(val.upper())
-    except Exception:
-        # no hard fail here
-        pass
+import pandas as pd
+import numpy as np
 
-    # 3) From storage/watchlist if available
-    try:
-        if hasattr(self, "storage") and self.storage is not None:
-            # prefer explicit list_assets / list_watchlist if available
-            if hasattr(self.storage, "list_assets"):
-                try:
-                    # expected to return list of strings
-                    assets = self.storage.list_assets() or []
-                    for a in assets:
-                        # storage.list_assets might return "BTCUSDT" or dicts — handle both
-                        if isinstance(a, dict):
-                            s = a.get("asset") or a.get("symbol") or ""
-                        else:
-                            s = a
-                        if s:
-                            crypto_set.add(str(s).strip().upper())
-                except Exception:
-                    pass
-            # fallback: a watchlist with asset_type
-            if hasattr(self.storage, "list_watchlist"):
-                try:
-                    wl = self.storage.list_watchlist() or []
-                    for item in wl:
-                        asset = item.get("asset") if isinstance(item, dict) else str(item)
-                        asset_type = item.get("asset_type", "crypto") if isinstance(item, dict) else "crypto"
-                        if asset:
-                            if asset_type == "stock" or asset_type == "stocks":
-                                stocks_set.add(str(asset).strip().upper())
-                            else:
-                                crypto_set.add(str(asset).strip().upper())
-                except Exception:
-                    pass
-    except Exception:
-        pass
+from core.storage_postgres import PostgresStorage
 
-    # Finalize - sort for stable order
-    crypto_list = sorted(list(crypto_set))
-    stocks_list = sorted(list(stocks_set))
-    return {"crypto": crypto_list, "stocks": stocks_list}
+logger = logging.getLogger("orchestrator")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Optional imports from project's indicators/score modules
+try:
+    from indicators import fibonacci as fib_module  # type: ignore
+except Exception:
+    fib_module = None
+
+try:
+    from core import score as core_score  # type: ignore
+except Exception:
+    core_score = None
 
 
-def backfill_asset(self, asset: str, interval: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Try to run a backfill for a single asset (called by worker when processing backfill_request).
-    Uses fetcher.backfill_range if available or falls back to repeated fetch calls.
-    Returns a dict with status.
-    """
-    logger.info("Starting backfill for %s (interval=%s)", asset, interval)
-    try:
-        if not self.fetcher:
-            raise RuntimeError("No fetcher configured in orchestrator")
+class Orchestrator:
+    def __init__(self, storage: Optional[PostgresStorage] = None):
+        self.storage = storage or PostgresStorage()
+        self.storage.init_db()
 
-        # Try to call backfill_range if fetcher provides it
-        if hasattr(self.fetcher, "backfill_range"):
-            # best-effort: pass interval if provided, otherwise let fetcher choose defaults
-            try:
-                if interval:
-                    res = self.fetcher.backfill_range(asset, interval=interval, save_callback=self.storage.save_candles)
-                else:
-                    res = self.fetcher.backfill_range(asset, save_callback=self.storage.save_candles)
-                return {"ok": True, "detail": res}
-            except TypeError:
-                # different signature; try common alternative param names
-                try:
-                    res = self.fetcher.backfill_range(asset)
-                    return {"ok": True, "detail": res}
-                except Exception as e:
-                    raise
-
-        # Fallback: attempt to fetch manual ranges (best-effort)
-        # We'll try to fetch latest and then request older pages in a loop (simplified).
-        logger.info("Fetcher does not expose backfill_range; running manual fallback (may be slow).")
-        latest = self.fetcher.fetch_latest(asset, limit=1) if hasattr(self.fetcher, "fetch_latest") else None
-        if latest is None:
-            return {"ok": False, "error": "fetch_latest not supported by fetcher"}
-        # Attempt to save the fetched candle(s)
+    # ---------------------
+    # Indicators
+    # ---------------------
+    def compute_indicators_for(self, asset: str, interval: str, lookback: int = 1000) -> Dict[str, Any]:
+        """
+        Compute a set of indicators for asset/interval using stored candles.
+        Returns a dict with computed indicators (ema, rsi, fibonacci if available).
+        """
+        df = self.storage.load_candles(asset, interval, limit=lookback, ascending=True)
+        if df.empty:
+            logger.warning("No candles for %s %s", asset, interval)
+            return {}
+        res: Dict[str, Any] = {}
         try:
-            if isinstance(latest, dict) or hasattr(latest, "to_dict"):
-                # convert to DataFrame if needed
-                import pandas as pd
-                if isinstance(latest, dict):
-                    df = pd.DataFrame([latest])
-                else:
-                    df = latest
-                self.storage.save_candles(df)
-            else:
-                logger.warning("Unknown latest format from fetcher for backfill.")
+            # EMAs
+            res["ema_12"] = float(df["close"].ewm(span=12, adjust=False).mean().iloc[-1])
+            res["ema_26"] = float(df["close"].ewm(span=26, adjust=False).mean().iloc[-1])
+            # SMA 50/200
+            res["sma_50"] = float(df["close"].rolling(window=50, min_periods=1).mean().iloc[-1])
+            res["sma_200"] = float(df["close"].rolling(window=200, min_periods=1).mean().iloc[-1])
+            # RSI
+            res["rsi_14"] = float(self._rsi(df["close"], 14).iloc[-1])
         except Exception:
-            logger.exception("Failed saving latest backfill fetch result.")
-        return {"ok": True, "detail": "fallback_done"}
-    except Exception as e:
-        logger.exception("Backfill for asset %s failed: %s", asset, e)
-        return {"ok": False, "error": str(e)}
+            logger.exception("Basic indicators computation failed")
+        # Fibonacci / custom indicators
+        if fib_module and hasattr(fib_module, "compute_fibonacci_levels"):
+            try:
+                res["fibonacci"] = fib_module.compute_fibonacci_levels(df)
+            except Exception:
+                logger.exception("Fibonacci computation failed")
+        # Return indicators; caller can persist with save_indicators_to_db
+        return res
+
+    def save_indicators_to_db(self, asset: str, interval: str, ts: int, indicators: Dict[str, Any]) -> int:
+        """
+        Save indicators as a JSONB entry in indicators table (with ts).
+        """
+        try:
+            df = pd.DataFrame([{"ts": int(ts), "asset": asset, "interval": interval, "indicators": indicators}])
+            # Insert manually using storage's models? Storage currently doesn't have save_indicators method,
+            # so we use 'indicators' table via save_scores-like insertion for simplicity.
+            # We'll implement insertion here using storage._get_conn for integrity.
+            conn = self.storage._get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO indicators (ts, asset, interval, indicators) VALUES (%s,%s,%s,%s);",
+                (int(ts), asset, interval, JsonSafe(indicators))
+            )
+            conn.commit()
+            cur.close()
+            self.storage._put_conn(conn)
+            return 1
+        except Exception:
+            logger.exception("save_indicators_to_db failed")
+            try:
+                self.storage._put_conn(conn)
+            except Exception:
+                pass
+            raise
+
+    # ---------------------
+    # Scoring
+    # ---------------------
+    def compute_scores_for(self, asset: str, interval: str, persist: bool = False) -> Dict[str, Any]:
+        """
+        Compute a score for the current latest state of an asset.
+        - Uses core.score.score_from_indicators if available, else a fallback deterministic logic.
+        - If persist=True, writes a row to scores table.
+        """
+        indicators = self.compute_indicators_for(asset, interval, lookback=500)
+        if not indicators:
+            return {}
+        score_obj: Dict[str, Any]
+        if core_score and hasattr(core_score, "score_from_indicators"):
+            try:
+                score_obj = core_score.score_from_indicators(indicators)
+            except Exception:
+                logger.exception("Project score function failed — using fallback")
+                score_obj = self._fallback_score(indicators)
+        else:
+            score_obj = self._fallback_score(indicators)
+        # Add metadata
+        score_obj = {"score": score_obj.get("score"), "meta": score_obj.get("meta", indicators)}
+        if persist:
+            try:
+                now_ts = int(pd.Timestamp.utcnow().timestamp())
+                df = pd.DataFrame([{"ts": now_ts, "asset": asset, "interval": interval, "score": score_obj}])
+                self.storage.save_scores(df)
+            except Exception:
+                logger.exception("Failed to persist score for %s", asset)
+        return score_obj
+
+    # ---------------------
+    # Backtest orchestration
+    # ---------------------
+    def run_backtest_for(self,
+                         asset: str,
+                         interval: str,
+                         strategy_fn: Callable,
+                         lookback: int = 2000,
+                         initial_capital: float = 1000.0,
+                         fee: float = 0.0005,
+                         save_scores: bool = False) -> Dict[str, Any]:
+        """
+        Load history and run backtest using core.backtest.run_backtest.
+        Returns the backtest result dict and optionally persists summary to scores.
+        """
+        from core.backtest import run_backtest  # local import to avoid cycles
+        df = self.storage.load_candles(asset, interval, limit=lookback, ascending=True)
+        if df.empty:
+            return {"error": "no_data"}
+        result = run_backtest(df, lambda r, i, d, ctx=None: strategy_fn(r, i, d), initial_capital=initial_capital, fee=fee)
+        if save_scores:
+            # Persist a summary row into scores table
+            now_ts = int(pd.Timestamp.utcnow().timestamp())
+            summary = {"final_value": result.get("final_value"), "returns": result.get("returns"), "n_trades": result.get("n_trades")}
+            dfscore = pd.DataFrame([{"ts": now_ts, "asset": asset, "interval": interval, "score": summary}])
+            self.storage.save_scores(dfscore)
+        return result
+
+    # ---------------------
+    # Training placeholder (IA)
+    # ---------------------
+    def train_model(self, asset: str, interval: str, model_name: str, training_meta: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Placeholder for training. Implement your own training pipeline and call storage.save_model_record with metadata.
+        Here we just persist a metadata record so UI can show model entries.
+        """
+        try:
+            mid = self.storage.save_model_record(model_name, asset, interval, training_meta)
+            return {"id": mid, "status": "saved_metadata"}
+        except Exception:
+            logger.exception("train_model failed")
+            raise
+
+    # ---------------------
+    # Utilities
+    # ---------------------
+    @staticmethod
+    def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+        delta = series.diff()
+        up = delta.clip(lower=0)
+        down = -1 * delta.clip(upper=0)
+        ma_up = up.rolling(period).mean()
+        ma_down = down.rolling(period).mean()
+        rs = ma_up / ma_down
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def _fallback_score(indicators: Dict[str, Any]) -> Dict[str, Any]:
+        score = 0
+        ema12 = indicators.get("ema_12")
+        ema26 = indicators.get("ema_26")
+        rsi = indicators.get("rsi_14")
+        if ema12 is not None and ema26 is not None:
+            score += 1 if ema12 > ema26 else -1
+        if rsi is not None:
+            if rsi > 70:
+                score += 1
+            elif rsi < 30:
+                score -= 1
+        return {"score": score, "meta": indicators}
+
+
+# JSON adapter for insertion (fallback)
+def JsonSafe(obj: Any) -> Any:
+    """
+    Ensure object is JSON-serializable by converting numpy types.
+    """
+    if isinstance(obj, dict):
+        return {k: JsonSafe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [JsonSafe(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    return obj

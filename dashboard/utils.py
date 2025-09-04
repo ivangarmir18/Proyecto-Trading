@@ -1,426 +1,346 @@
 """
 dashboard/utils.py
-------------------
-Utilities optimizados para Postgres (Supabase) orientados al dashboard.
 
-Objetivos:
- - Usar exclusivamente Postgres cuando DATABASE_URL esté presente
- - Conexiones seguras y parametrizadas
- - Retornar pandas.DataFrame listos para el front-end (streamlit)
- - TTL cache en memoria para consultas frecuentes (configurable)
- - Helpers para comprobar/escalar esquema (migraciones simples)
- - Logging claro y manejo de errores informativo
+Funciones utilitarias pensadas para Streamlit / UI:
+ - conexión a storage Postgres (PostgresStorage)
+ - listado paginado de ficheros de backfill (local o Supabase)
+ - listado paginado de estados de backfill (tabla backfill_status)
+ - wrappers safe para obtener assets, candles, indicadores y scores
+ - trigger_backfill: iniciar backfill en background (thread) y obtener handle
+ - upload_backfill_file_to_supabase: helper para subir archivos de backfill
 
-Notas:
- - Usa psycopg2 si está disponible; si no, intenta reutilizar PostgresStorage
-   (core.storage_postgres.PostgresStorage) cuando exista.
- - Todas las funciones aceptan timestamps como strings ISO / ints; se normalizan
-   internamente a pandas.Timestamp.
-
+IMPORTANTE:
+ - Si defines SUPABASE_URL, SUPABASE_KEY y SUPABASE_BUCKET en env, usará Supabase Storage.
+ - Si no, usa archivos locales en data/backfill_sources.
+ - La paginación usa 'cursor' como offset entero (0, page_size, 2*page_size ...).
 """
-from __future__ import annotations
 
 import os
-import time
 import logging
-from typing import Optional, List, Dict, Any, Tuple
+import threading
+import math
+from typing import Optional, Tuple, List, Dict, Any
 
-try:
-    import pandas as pd
-except Exception as e:
-    raise ImportError("pandas es requerido para dashboard.utils") from e
+import pandas as pd
 
-# Prefer psycopg2 for raw SQL access
+# optional supabase client
 try:
-    import psycopg2
-    import psycopg2.extras as pex
-    PSYCOPG2_AVAILABLE = True
+    from supabase import create_client  # type: ignore
+    HAS_SUPABASE = True
 except Exception:
-    PSYCOPG2_AVAILABLE = False
+    create_client = None  # type: ignore
+    HAS_SUPABASE = False
 
-# Fallback: if the project exposes PostgresStorage, we'll use it
-_POSTGRES_STORAGE_AVAILABLE = False
-PostgresStorage = None
-try:
-    from core.storage_postgres import PostgresStorage as _PS
-except Exception:
-    try:
-        # intenta import relativo si estructura de paquetes distinta
-        from .core.storage_postgres import PostgresStorage as _PS  # type: ignore
-    except Exception:
-        _PS = None
+from core.storage_postgres import PostgresStorage
+import core.init_and_backfill as init_and_backfill
+from core.orchestrator import Orchestrator
 
-
-if _PS is not None:
-    PostgresStorage = _PS
-    _POSTGRES_STORAGE_AVAILABLE = True
-
-# Logger
 logger = logging.getLogger("dashboard.utils")
-logger.setLevel(os.getenv("DASHBOARD_UTILS_LOG_LEVEL", "INFO"))
+logger.setLevel(logging.INFO)
 if not logger.handlers:
     ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     logger.addHandler(ch)
 
-# Default cache TTL in seconds (configurable via env)
-DEFAULT_TTL = int(os.getenv("DASHBOARD_CACHE_TTL", "10"))
-
-# Helper: small TTL cache for DataFrames / results
-class TTLCache:
-    """Cache key->(timestamp, value) with TTL in seconds."""
-
-    def __init__(self, ttl: int = DEFAULT_TTL):
-        self.ttl = ttl
-        self._store: Dict[Any, Tuple[float, Any]] = {}
-
-    def get(self, key: Any):
-        entry = self._store.get(key)
-        if not entry:
-            return None
-        ts, value = entry
-        if (time.time() - ts) > self.ttl:
-            # expired
-            try:
-                del self._store[key]
-            except KeyError:
-                pass
-            return None
-        return value
-
-    def set(self, key: Any, value: Any):
-        self._store[key] = (time.time(), value)
-
-    def clear(self):
-        self._store.clear()
-
-# module-level cache
-_cache = TTLCache()
+# singleton storage
+_storage: Optional[PostgresStorage] = None
 
 
-# Connection helper class using psycopg2
-class PostgresDB:
-    """Lightweight Postgres helper for SELECT queries returning pandas.DataFrame.
+def storage() -> PostgresStorage:
+    global _storage
+    if _storage is None:
+        _storage = PostgresStorage()
+    return _storage
 
-    Usage:
-        db = PostgresDB()  # lee DATABASE_URL
-        df = db.fetch_df(sql, params=(...))
 
-    Elimina la dependencia de una implementación concreta del proyecto y permite
-    inspeccionar / migrar esquema.
+# ----------------------
+# Supabase client factory
+# ----------------------
+_supabase_client = None
+
+
+def supabase_client():
     """
-
-    def __init__(self, dsn: Optional[str] = None, connect_timeout: int = 5):
-        self.dsn = dsn or os.getenv("DATABASE_URL")
-        if not self.dsn:
-            raise RuntimeError("DATABASE_URL no definido en el entorno. No puedo conectar a Postgres.")
-        self.connect_timeout = connect_timeout
-
-    def _connect(self):
-        if PSYCOPG2_AVAILABLE:
-            # usa RealDictCursor para facilitar conversion a df
-            conn = psycopg2.connect(self.dsn, connect_timeout=self.connect_timeout)
-            return conn
-        else:
-            # si no hay psycopg2, intenta usar PostgresStorage si está disponible
-            if _POSTGRES_STORAGE_AVAILABLE:
-                raise RuntimeError("psycopg2 no está instalado en el entorno; usa PostgresStorage wrapper en su lugar.")
-            raise RuntimeError("psycopg2 no disponible y PostgresStorage no encontrado.")
-
-    def fetch_df(self, sql: str, params: Optional[tuple] = None, parse_dates: Optional[List[str]] = None) -> pd.DataFrame:
-        """Ejecuta SQL y devuelve pandas.DataFrame. Parametrizado (seguro).
-
-        - sql: query con placeholders %s
-        - params: tuple de parámetros
-        - parse_dates: lista de columnas que deben convertirse a datetime
-        """
-        logger.debug("fetch_df SQL: %s | params=%s", sql, params)
-        conn = self._connect()
-        try:
-            cur = conn.cursor(cursor_factory=pex.RealDictCursor)
-            cur.execute(sql, params or ())
-            rows = cur.fetchall()
-            df = pd.DataFrame(rows)
-            if df.empty:
-                # asegurar columnas vacías conocidas no fallen en front
-                return df
-            # Normalizar timestamps si existen
-            if parse_dates:
-                for c in parse_dates:
-                    if c in df.columns:
-                        df[c] = pd.to_datetime(df[c], utc=True)
-            else:
-                # si existe una columna ts -> parséala por defecto
-                if "ts" in df.columns:
-                    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-            return df
-        finally:
-            try:
-                cur.close()
-            except Exception:
-                pass
-            conn.close()
-
-    def execute(self, sql: str, params: Optional[tuple] = None) -> None:
-        """Ejecuta una sentencia no-query (DDL/ALTER/INSERT/UPDATE)."""
-        logger.debug("execute SQL: %s | params=%s", sql, params)
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, params or ())
-            conn.commit()
-        finally:
-            try:
-                cur.close()
-            except Exception:
-                pass
-            conn.close()
-
-
-# High-level helpers que el dashboard necesitará
-
-def _normalize_ts(value: Optional[Any]) -> Optional[pd.Timestamp]:
-    if value is None:
+    Return a supabase client if env vars present; else None.
+    """
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+    if not url or not key or not HAS_SUPABASE:
+        logger.debug("Supabase not configured or client not installed")
         return None
-    try:
-        return pd.to_datetime(value, utc=True)
-    except Exception:
-        # si es float/int -> timestamp unix
-        try:
-            return pd.to_datetime(int(value), unit="s", utc=True)
-        except Exception:
-            raise ValueError(f"No se pudo convertir a timestamp: {value}")
+    _supabase_client = create_client(url, key)
+    return _supabase_client
 
 
-def ensure_db_connection() -> bool:
-    """Chequea que se puede conectar a la DB. Retorna True si OK, False si no."""
-    try:
-        db = PostgresDB()
-        # pequeña query rápida
-        db.fetch_df("SELECT 1 as ok LIMIT 1")
-        logger.info("Conexión a Postgres OK")
-        return True
-    except Exception as e:
-        logger.error("No se pudo conectar a Postgres: %s", e)
-        return False
+def supabase_bucket_name() -> Optional[str]:
+    return os.getenv("SUPABASE_BUCKET")
 
 
-def list_assets() -> List[str]:
-    """Lista assets únicos en la tabla scores.
-
-    Resultado cacheado (TTL configurable).
+# ----------------------
+# Assets / Candles / Indicators / Scores
+# ----------------------
+def get_assets() -> List[str]:
     """
-    cache_key = ("list_assets",)
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    db = PostgresDB()
-    sql = "SELECT DISTINCT asset FROM public.scores ORDER BY asset"
+    Return list of assets: prefer DB candles distinct, then watchlist, then config CSVs.
+    """
     try:
-        df = db.fetch_df(sql)
-        assets = df["asset"].astype(str).tolist() if not df.empty else []
-        _cache.set(cache_key, assets)
-        return assets
-    except Exception as e:
-        logger.exception("Error listando assets: %s", e)
+        return storage().list_assets()
+    except Exception:
+        logger.exception("get_assets failed")
         return []
 
 
-def get_scores_df(asset: str, interval: str, start_ts: Optional[Any] = None, end_ts: Optional[Any] = None, limit: Optional[int] = None, use_cache: bool = True) -> pd.DataFrame:
-    """Obtiene un DataFrame con filas de scores para el asset+interval en el rango [start_ts, end_ts].
-
-    - Asset/interval son exactos (no LIKE)
-    - start_ts/end_ts pueden ser datetimes, iso-strings o unix timestamps
-    - El resultado se cachea por defecto (TTL)
-
-    Retorna DataFrame con columna ts parseada como datetime UTC.
-    """
-    if not asset or not interval:
-        raise ValueError("asset e interval son obligatorios")
-
-    s_ts = _normalize_ts(start_ts)
-    e_ts = _normalize_ts(end_ts)
-
-    cache_key = ("scores_df", asset, interval, str(s_ts), str(e_ts), limit)
-    if use_cache:
-        cached = _cache.get(cache_key)
-        if cached is not None:
-            logger.debug("Cache hit scores_df %s %s", asset, interval)
-            return cached
-
-    # Construir query parametrizada
-    sql = ["SELECT ts, score, range_min, range_max, stop, target, p_ml, signal_quality, ai_confidence, signal FROM public.scores WHERE asset = %s AND interval = %s"]
-    params: List[Any] = [asset, interval]
-
-    if s_ts is not None:
-        sql.append("AND ts >= %s")
-        params.append(s_ts)
-    if e_ts is not None:
-        sql.append("AND ts <= %s")
-        params.append(e_ts)
-
-    sql.append("ORDER BY ts ASC")
-    if limit is not None and isinstance(limit, int) and limit > 0:
-        sql.append("LIMIT %s")
-        params.append(limit)
-
-    full_sql = " ".join(sql)
-
-    db = PostgresDB()
+def get_intervals_for_asset(asset: str) -> List[str]:
     try:
-        df = db.fetch_df(full_sql, tuple(params), parse_dates=["ts"])
-        # Normalizaciones prácticas para el dashboard (evitar NaN problemáticos)
-        if not df.empty:
-            # Asegurar columnas esperadas existan
-            expected_cols = ["ts", "score", "range_min", "range_max", "stop", "target", "p_ml", "signal_quality", "ai_confidence", "signal"]
-            for c in expected_cols:
-                if c not in df.columns:
-                    df[c] = pd.NA
-            # ordenar y reset index
-            df = df.sort_values("ts").reset_index(drop=True)
-        if use_cache:
-            _cache.set(cache_key, df)
-        return df
+        return storage().list_intervals_for_asset(asset)
     except Exception:
-        logger.exception("Error al cargar scores para %s %s", asset, interval)
-        # devolver DataFrame vacío con esquema mínimo para evitar errores de front
-        cols = ["ts", "score", "range_min", "range_max", "stop", "target", "p_ml", "signal_quality", "ai_confidence", "signal"]
-        return pd.DataFrame(columns=cols)
+        logger.exception("get_intervals_for_asset failed for %s", asset)
+        return []
 
 
-def get_latest_score(asset: str, interval: str) -> Optional[Dict[str, Any]]:
-    """Devuelve la fila más reciente (como dict) para asset/interval.
-
-    Útil para badges / valores rápidos en el dashboard.
+def get_latest_candles(asset: str, interval: str, limit: int = 500) -> pd.DataFrame:
     """
-    sql = "SELECT * FROM public.scores WHERE asset = %s AND interval = %s ORDER BY ts DESC LIMIT 1"
-    db = PostgresDB()
+    Load latest `limit` candles for asset/interval, return ascending by ts.
+    """
     try:
-        df = db.fetch_df(sql, (asset, interval))
+        df = storage().load_candles(asset, interval, limit=limit, ascending=False)
         if df.empty:
-            return None
-        row = df.iloc[0].to_dict()
-        # convertir ts a ISO string con timezone
-        if "ts" in row and pd.notna(row["ts"]):
-            row["ts"] = pd.to_datetime(row["ts"]).isoformat()
-        return row
+            return df
+        return df.sort_values("ts").reset_index(drop=True)
     except Exception:
-        logger.exception("Error obteniendo latest score para %s %s", asset, interval)
-        return None
+        logger.exception("get_latest_candles error")
+        return pd.DataFrame(columns=["ts", "timestamp", "open", "high", "low", "close", "volume", "asset", "interval"])
 
 
-def ensure_signal_columns() -> None:
-    """Asegura que las columnas signal_quality y ai_confidence existen (migración idempotente).
-
-    Ejecuta ALTER TABLE IF NOT EXISTS ... (Postgres soporta IF NOT EXISTS para columnas
-    a partir de versiones modernas; si no, se hace chequeo previo).
+def get_indicators_for_ui(asset: str, interval: str) -> Dict[str, Any]:
     """
-    db = PostgresDB()
-    # Postgres soporta 'ADD COLUMN IF NOT EXISTS' desde 9.6+ (y versiones modernas de supabase)
-    sql = (
-        "ALTER TABLE public.scores ADD COLUMN IF NOT EXISTS signal_quality double precision,"
-        " ADD COLUMN IF NOT EXISTS ai_confidence double precision;"
-    )
-    try:
-        db.execute(sql)
-        logger.info("Aseguradas columnas signal_quality y ai_confidence (si faltaban)")
-    except Exception:
-        logger.exception("Fallo al asegurar columnas signal_quality/ai_confidence")
-        raise
-
-
-def inspect_scores_schema() -> Dict[str, str]:
-    """Devuelve un dict column_name->data_type de la tabla public.scores. Útil para debug.
-
-    No cacheado deliberadamente (queremos siempre info fresca si se acaba de migrar).
+    Lightweight wrapper that computes/returns indicators using Orchestrator.
     """
-    sql = "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'scores' AND table_schema = 'public'"
-    db = PostgresDB()
     try:
-        df = db.fetch_df(sql)
-        return {r["column_name"]: r["data_type"] for _, r in df.iterrows()} if not df.empty else {}
+        orch = Orchestrator(storage())
+        return orch.compute_indicators_for(asset, interval)
     except Exception:
-        logger.exception("Error inspeccionando esquema de scores")
+        logger.exception("get_indicators_for_ui failed")
         return {}
 
 
-# Helper utility para invalidar cache (por ejemplo tras insertar filas)
-def invalidate_cache() -> None:
-    _cache.clear()
+def get_scores_for_ui(asset: str, interval: str, limit: int = 100) -> pd.DataFrame:
+    try:
+        return storage().load_scores(asset=asset, interval=interval, limit=limit)
+    except Exception:
+        logger.exception("get_scores_for_ui failed")
+        return pd.DataFrame(columns=["ts", "asset", "interval", "score", "created_at"])
 
 
-# Exportar interfaz pública limpia para el dashboard
-__all__ = [
-    "ensure_db_connection",
-    "ensure_signal_columns",
-    "inspect_scores_schema",
-    "list_assets",
-    "get_scores_df",
-    "get_latest_score",
-    "invalidate_cache",
-]
-
-# core/utils_watchlist.py
-from pathlib import Path
-import pandas as pd
-import json
-from typing import List, Dict, Optional
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]  # ajusta según donde lo pongas
-CACHE_DIR = PROJECT_ROOT / "data" / "cache"
-WATCHLIST_DIR = PROJECT_ROOT / "data" / "watchlists"
-WATCHLIST_DIR.mkdir(parents=True, exist_ok=True)
-
-def load_assets_from_cache() -> pd.DataFrame:
+# ----------------------
+# Backfill files listing (paginated) - supports local and Supabase
+# ----------------------
+def _list_local_backfill_files(folder: str = "data/backfill_sources") -> List[Dict[str, Any]]:
     """
-    Escanea data/cache/*_{interval}*.csv y construye un DataFrame con columnas:
-    asset, asset_type ('crypto' o 'stock' o 'other'), intervals (set/list)
+    Return list of files metadata sorted by mtime descending.
+    Each item: {'name','path','size','updated_at'}
     """
-    rows = {}
-    for f in CACHE_DIR.glob("**/*.csv"):
-        name = f.stem  # ejemplo BTCUSDT_1h
-        # heurística: separa por _ para extraer asset e interval
-        parts = name.split("_")
-        if len(parts) >= 2:
-            asset = "_".join(parts[:-1])
-            interval = parts[-1]
-        else:
-            asset = name
-            interval = ""
-        # guess asset type from file name or folder
-        parent = f.parent.name.lower()
-        asset_type = "crypto" if "usdt" in asset.lower() or "crypto" in parent else ("stock" if any(c.isalpha() for c in asset) and ('.' in str(f) or parent in ("actions","acciones","stocks")) else "other")
-        key = asset.upper()
-        if key not in rows:
-            rows[key] = {"asset": key, "asset_type": asset_type, "intervals": set()}
-        rows[key]["intervals"].add(interval)
-    # normalize intervals to comma-separated string for display
     out = []
-    for v in rows.values():
-        out.append({"asset": v["asset"], "asset_type": v["asset_type"], "intervals": ",".join(sorted([i for i in v["intervals"] if i]))})
-    df = pd.DataFrame(out)
-    if df.empty:
-        return pd.DataFrame(columns=["asset","asset_type","intervals"])
-    return df.sort_values("asset").reset_index(drop=True)
+    if not os.path.isdir(folder):
+        return out
+    entries = []
+    for root, _, files in os.walk(folder):
+        for fn in files:
+            if not fn.lower().endswith(".csv"):
+                continue
+            full = os.path.join(root, fn)
+            try:
+                st = os.stat(full)
+                entries.append((st.st_mtime, full, st.st_size))
+            except Exception:
+                continue
+    # sort newest first
+    entries.sort(reverse=True)
+    for mtime, full, size in entries:
+        out.append({"name": os.path.basename(full), "path": full, "size": size, "updated_at": float(mtime)})
+    return out
 
-def user_watchlist_path(user_id: str) -> Path:
-    safe = str(user_id).replace("/", "_").replace("..", "")
-    return WATCHLIST_DIR / f"{safe}.csv"
 
-def load_user_watchlist_csv(user_id: str = "default") -> List[Dict]:
-    p = user_watchlist_path(user_id)
-    if not p.exists():
+def _list_supabase_backfill_files(bucket: str, prefix: str = "") -> List[Dict[str, Any]]:
+    """
+    List files in supabase storage bucket (flat listing). 
+    Note: supabase-py storage.list may return dicts; adapt accordingly.
+    """
+    client = supabase_client()
+    if not client:
         return []
     try:
-        df = pd.read_csv(p)
-        return df.to_dict(orient="records")
+        # supabase storage API: client.storage.from_(bucket).list(path, limit, offset)
+        # We'll request large list and rely on server-side pagination if needed.
+        items = client.storage.from_(bucket).list(prefix, limit=10000)  # try large limit
+        out = []
+        for it in items:
+            # item likely has 'name','updated_at','size' depending on supabase version
+            name = it.get("name") if isinstance(it, dict) else getattr(it, "name", None)
+            size = it.get("size") if isinstance(it, dict) else getattr(it, "size", None)
+            updated_at = it.get("updated_at") if isinstance(it, dict) else getattr(it, "updated_at", None)
+            out.append({"name": name, "path": name, "size": size, "updated_at": updated_at})
+        # sort newest first by updated_at if present
+        out.sort(key=lambda x: x.get("updated_at") or 0, reverse=True)
+        return out
     except Exception:
+        logger.exception("Supabase listing failed")
         return []
 
-def save_user_watchlist_csv(symbols: List[str], user_id: str = "default") -> None:
-    p = user_watchlist_path(user_id)
-    df = pd.DataFrame([{"asset": s.strip().upper()} for s in symbols])
-    df.to_csv(p, index=False)
 
-# Fin del fichero
+def list_backfill_files(page_size: int = 50, cursor: Optional[int] = 0, source: str = "auto", prefix: str = "") -> Dict[str, Any]:
+    """
+    Paginated listing of backfill source files.
+    - page_size: number of items per page
+    - cursor: offset integer (0 = start). Returned next_cursor = None when no more pages.
+    - source: 'auto'|'local'|'supabase'
+    Returns: {'files': [...], 'next_cursor': int|None, 'total': int}
+    """
+    # decide source
+    if source == "auto":
+        cli = supabase_client()
+        if cli and supabase_bucket_name():
+            source = "supabase"
+        else:
+            source = "local"
+    items = []
+    if source == "supabase":
+        bucket = supabase_bucket_name()
+        if not bucket:
+            source = "local"
+        else:
+            items = _list_supabase_backfill_files(bucket, prefix=prefix)
+    if source == "local":
+        items = _list_local_backfill_files()
+    total = len(items)
+    # handle cursor slicing
+    try:
+        start = int(cursor or 0)
+    except Exception:
+        start = 0
+    end = start + int(page_size)
+    page = items[start:end]
+    next_cursor = end if end < total else None
+    return {"files": page, "next_cursor": next_cursor, "total": total, "source": source}
+
+
+# ----------------------
+# Backfill status (table pagination)
+# ----------------------
+def list_backfill_status(page_size: int = 50, cursor: Optional[int] = 0) -> Dict[str, Any]:
+    """
+    Paginate over backfill_status table rows. Returns list of dicts and next_cursor (offset).
+    """
+    conn = None
+    res = {"rows": [], "next_cursor": None, "total": 0}
+    try:
+        s = storage()
+        # do count and select with offset-limit
+        conn = s._get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM backfill_status;")
+        total = cur.fetchone()[0] or 0
+        res["total"] = int(total)
+        # select rows ordered by updated_at desc
+        start = int(cursor or 0)
+        cur.execute("SELECT asset, interval, last_ts, updated_at FROM backfill_status ORDER BY updated_at DESC OFFSET %s LIMIT %s;", (start, page_size))
+        rows = cur.fetchall()
+        cur.close()
+        out = []
+        for r in rows:
+            out.append({"asset": r[0], "interval": r[1], "last_ts": int(r[2]) if r[2] is not None else None, "updated_at": r[3]})
+        res["rows"] = out
+        res["next_cursor"] = start + len(out) if (start + len(out) < total) else None
+    except Exception:
+        logger.exception("list_backfill_status failed")
+    finally:
+        if conn:
+            try:
+                storage()._put_conn(conn)
+            except Exception:
+                pass
+    return res
+
+
+# ----------------------
+# Trigger backfill (backgroundable)
+# ----------------------
+class BackgroundTaskHandle:
+    def __init__(self, thread: threading.Thread):
+        self.thread = thread
+
+    def is_alive(self) -> bool:
+        return self.thread.is_alive()
+
+    def join(self, timeout: Optional[float] = None):
+        return self.thread.join(timeout)
+
+
+def trigger_backfill_background(concurrency: int = 4, chunk_hours: int = 168, local_folder: str = "data/backfill_sources",
+                                default_days: int = 365, assets_override: Optional[List[Dict[str, str]]] = None) -> BackgroundTaskHandle:
+    """
+    Start backfill in a background thread and return a handle.
+    Useful in Streamlit to avoid blocking main thread.
+    """
+    def _runner():
+        try:
+            init_and_backfill.run_backfill(concurrency=concurrency, chunk_hours=chunk_hours, local_folder=local_folder, default_days=default_days, assets_override=assets_override)
+        except Exception:
+            logger.exception("Background backfill crashed")
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    return BackgroundTaskHandle(t)
+
+
+# ----------------------
+# Upload utility (optional)
+# ----------------------
+def upload_backfill_file_to_supabase(local_path: str, dest_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Upload a local file to Supabase Storage under SUPABASE_BUCKET.
+    Returns status dict; raises on failure.
+    """
+    client = supabase_client()
+    bucket = supabase_bucket_name()
+    if not client or not bucket:
+        raise RuntimeError("Supabase not configured")
+    dest = dest_path or os.path.basename(local_path)
+    try:
+        with open(local_path, "rb") as f:
+            res = client.storage.from_(bucket).upload(dest, f)
+        logger.info("Uploaded %s to supabase bucket %s as %s", local_path, bucket, dest)
+        return {"ok": True, "path": dest}
+    except Exception:
+        logger.exception("Supabase upload failed")
+        raise
+
+
+# ----------------------
+# Misc helpers
+# ----------------------
+def get_backfill_progress_summary() -> Dict[str, Any]:
+    """
+    Quick summary: number of assets in backfill_status, total candles count.
+    """
+    s = storage()
+    try:
+        conn = s._get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM backfill_status;")
+        assets = cur.fetchone()[0] or 0
+        cur.execute("SELECT count(*) FROM candles;")
+        candles = cur.fetchone()[0] or 0
+        cur.close()
+        s._put_conn(conn)
+        return {"backfill_assets": int(assets), "candles_total": int(candles)}
+    except Exception:
+        logger.exception("get_backfill_progress_summary failed")
+        try:
+            s._put_conn(conn)
+        except Exception:
+            pass
+        return {"backfill_assets": 0, "candles_total": 0}

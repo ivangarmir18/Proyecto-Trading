@@ -1,442 +1,569 @@
+# core/score.py
 """
-core/score.py - Sistema de scoring mejorado con integración de IA
-Características:
-- Scoring híbrido (heurístico + IA)
-- Cálculo automático de stop/target optimizados
-- Integración con modelos de ML entrenados
-- Métricas de confianza para cada señal
+Módulo de Scoring / IA para Proyecto-Trading
+
+Objetivo:
+- Calcular indicadores (EMA, ATR, RSI, Fibonacci, momentum, vol)
+- Generar features para ML
+- Entrenar modelos (sklearn / LightGBM opcional) para predecir retornos futuros o señales
+- Hacer inferencia (scores) en tiempo real / batch y persistir en DB
+- Guardar metadatos del modelo en la tabla `models` (via PostgresStorage.save_model_record)
+- Evaluación y backtest helpers
+
+Diseño:
+- Clase principal: ScoreEngine(storage)
+- Métodos relevantes:
+    - compute_indicators(df)
+    - features_from_candles(df, lookback,...)
+    - make_target(df, horizon, method='future_return')
+    - train_model(asset, interval, df, features, target, params)
+    - predict_scores(df, model)
+    - save_model_to_storage(...)
+    - evaluate_model(...) (cross-val / walk-forward)
+    - backtest_signals(...) (usa core.backtest runner)
+
+Dependencias sugeridas:
+- pandas, numpy, scikit-learn, joblib, lightgbm (opcional), shap (opcional para explainability)
+
+Ejemplo rápido de uso:
+    from core.score import ScoreEngine
+    s = ScoreEngine()
+    s.train_and_persist(asset='BTCUSDT', interval='1m', horizon=60, model_type='lgbm')
+
 """
 
-from __future__ import annotations
 import logging
 import os
+import time
+import math
+from typing import Dict, Any, Optional, List, Tuple, Sequence
+
 import numpy as np
 import pandas as pd
-import joblib
-import json
-from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime
-from pathlib import Path
+
+# try optional deps
+try:
+    import lightgbm as lgb  # type: ignore
+    HAS_LGB = True
+except Exception:
+    HAS_LGB = False
+
+try:
+    import joblib
+except Exception:
+    joblib = None
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error, r2_score
+
+# Storage integration
+from core.storage_postgres import PostgresStorage
 
 logger = logging.getLogger("core.score")
+logger.setLevel(logging.INFO)
 if not logger.handlers:
     ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     logger.addHandler(ch)
-logger.setLevel(os.getenv("SCORE_LOG_LEVEL", "INFO"))
 
-# Default weights (configurables desde config.json)
-DEFAULT_WEIGHTS = {
-    "trend": 0.25,
-    "support": 0.20,
-    "momentum": 0.15,
-    "volatility": 0.10,
-    "volume": 0.10,
-    "ai_confidence": 0.20
-}
 
-DEFAULT_AI_CONFIG = {
-    "model_dir": "models",
-    "default_confidence": 0.5,
-    "min_confidence_threshold": 0.6,
-    "confidence_multiplier": 1.5
-}
+# --------------------
+# Utilities
+# --------------------
+def _ensure_numeric_series(s) -> pd.Series:
+    s = s.copy()
+    s = pd.to_numeric(s, errors="coerce")
+    return s
 
-class AIScoringSystem:
-    """Sistema de scoring con integración de IA"""
-    
-    def __init__(self, storage, config: Optional[Dict[str, Any]] = None):
-        self.storage = storage
-        self.config = config or {}
-        self.ai_config = {**DEFAULT_AI_CONFIG, **self.config.get("ai", {})}
-        self.weights = {**DEFAULT_WEIGHTS, **self.config.get("weights", {})}
-        
-        # Cargar modelos de IA si existen
-        self.ai_models = {}
-        self.load_ai_models()
-    
-    def load_ai_models(self):
-        """Carga todos los modelos de IA disponibles"""
-        model_dir = Path(self.ai_config["model_dir"])
-        if not model_dir.exists():
-            logger.warning("Directorio de modelos no encontrado: %s", model_dir)
-            return
-        
-        for model_file in model_dir.glob("*.model"):
-            try:
-                asset_interval = model_file.stem.rsplit('_', 2)[0]  # formato: ASSET_INTERVAL_TIMESTAMP
-                asset, interval = asset_interval.split('_', 1)
-                
-                # Cargar modelo
-                model = joblib.load(model_file)
-                
-                # Cargar scaler
-                scaler_file = model_file.with_suffix('.scaler')
-                scaler = joblib.load(scaler_file) if scaler_file.exists() else None
-                
-                # Cargar metadata
-                meta_file = model_file.with_suffix('.meta')
-                metadata = {}
-                if meta_file.exists():
-                    with open(meta_file, 'r') as f:
-                        metadata = json.load(f)
-                
-                self.ai_models[f"{asset}_{interval}"] = {
-                    'model': model,
-                    'scaler': scaler,
-                    'metadata': metadata,
-                    'last_used': datetime.now()
-                }
-                
-                logger.info("Modelo cargado para %s %s", asset, interval)
-                
-            except Exception as e:
-                logger.error("Error cargando modelo %s: %s", model_file.name, e)
-    
-    def get_ai_model(self, asset: str, interval: str) -> Optional[Dict[str, Any]]:
-        """Obtiene el modelo de IA para un asset e intervalo específicos"""
-        model_key = f"{asset}_{interval}"
-        return self.ai_models.get(model_key)
-    
-    def calculate_ai_confidence(self, df: pd.DataFrame, asset: str, interval: str) -> pd.Series:
-        """Calcula la confianza de IA para cada fila del DataFrame"""
-        model_info = self.get_ai_model(asset, interval)
-        if not model_info:
-            return pd.Series([self.ai_config["default_confidence"]] * len(df), index=df.index)
-        
-        try:
-            # Preparar features para el modelo
-            feature_columns = model_info['metadata'].get('feature_columns', [])
-            available_features = [col for col in feature_columns if col in df.columns]
-            
-            if not available_features:
-                logger.warning("No hay features disponibles para el modelo de IA")
-                return pd.Series([self.ai_config["default_confidence"]] * len(df), index=df.index)
-            
-            X = df[available_features].copy()
-            
-            # Escalar features si hay scaler
-            if model_info['scaler']:
-                X_scaled = model_info['scaler'].transform(X)
-            else:
-                X_scaled = X.values
-            
-            # Predecir probabilidades
-            if hasattr(model_info['model'], 'predict_proba'):
-                probabilities = model_info['model'].predict_proba(X_scaled)
-                confidence = probabilities[:, 1]  # Probabilidad de clase positiva
-            else:
-                predictions = model_info['model'].predict(X_scaled)
-                confidence = predictions  # Usar predicciones directas
-            
-            # Ajustar confianza basado en el threshold mínimo
-            min_threshold = self.ai_config["min_confidence_threshold"]
-            confidence = np.where(confidence < min_threshold, 
-                                confidence * 0.5,  # Reducir confianza para predicciones débiles
-                                confidence)
-            
-            return pd.Series(confidence, index=df.index, name='ai_confidence')
-            
-        except Exception as e:
-            logger.error("Error calculando confianza de IA: %s", e)
-            return pd.Series([self.ai_config["default_confidence"]] * len(df), index=df.index)
-    
-    def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calcula indicadores técnicos para scoring"""
-        df = df.copy()
-        
-        # 1. Trend Strength (Fuerza de tendencia)
-        if 'ema9' in df.columns and 'ema40' in df.columns:
-            price = df['close']
-            ema9 = df['ema9']
-            ema40 = df['ema40']
-            
-            # Tendencia alcista si precio > EMA40
-            trend_direction = np.where(price > ema40, 1.0, 
-                                     np.where(price < ema9, 0.0, 0.5))
-            
-            # Fuerza de tendencia basada en distancia a EMAs
-            ema_distance = (price - ema40) / (ema40 + 1e-9)
-            trend_strength = np.tanh(ema_distance * 10) * 0.5 + 0.5  # Normalizar a 0-1
-            
-            df['trend_score'] = trend_direction * trend_strength
-        
-        # 2. Support/Resistance Proximity
-        if 'support' in df.columns and 'resistance' in df.columns and 'atr' in df.columns:
-            price = df['close']
-            support = df['support']
-            resistance = df['resistance']
-            atr = df['atr']
-            
-            # Proximidad a soporte (0-1, 1 = muy cerca del soporte)
-            support_distance = (price - support) / (atr + 1e-9)
-            support_proximity = np.exp(-np.abs(support_distance) / 3)
-            
-            # Proximidad a resistencia
-            resistance_distance = (resistance - price) / (atr + 1e-9)
-            resistance_proximity = np.exp(-np.abs(resistance_distance) / 3)
-            
-            # Mejor proximidad (maximizar entrada cerca de soporte)
-            df['support_proximity_score'] = support_proximity
-        
-        # 3. Momentum Indicators
-        if 'rsi' in df.columns:
-            # RSI normalizado y suavizado
-            rsi = df['rsi'].clip(20, 80)  # Evitar extremos
-            rsi_score = (rsi - 20) / 60  # Normalizar 20-80 → 0-1
-            df['momentum_score'] = rsi_score
-        
-        if 'macd_hist' in df.columns:
-            # MACD histogram strength
-            macd_strength = np.tanh(df['macd_hist'] / (df['atr'] + 1e-9) * 10) * 0.5 + 0.5
-            df['momentum_score'] = df.get('momentum_score', 0.5) * 0.5 + macd_strength * 0.5
-        
-        # 4. Volatility Analysis
-        if 'atr' in df.columns:
-            # Volatilidad normalizada (0-1, 1 = alta volatilidad)
-            volatility = df['atr'] / df['close']
-            volatility_score = 1 - np.tanh(volatility * 100)  # Invertir: menor volatilidad = mejor
-            df['volatility_score'] = volatility_score
-        
-        # 5. Volume Analysis
-        if 'volume' in df.columns:
-            # Volume relative to average
-            volume_ma = df['volume'].rolling(20).mean()
-            volume_ratio = df['volume'] / (volume_ma + 1e-9)
-            volume_score = np.tanh(volume_ratio - 1) * 0.5 + 0.5  # Normalizar
-            df['volume_score'] = volume_score
-        
-        return df
-    
-    def calculate_composite_score(self, df: pd.DataFrame, asset: str, interval: str) -> pd.DataFrame:
-        """Calcula el score compuesto (técnico + IA)"""
-        df = df.copy()
-        
-        # Calcular scores técnicos
-        df = self.calculate_technical_indicators(df)
-        
-        # Calcular confianza de IA
-        ai_confidence = self.calculate_ai_confidence(df, asset, interval)
-        df['ai_confidence'] = ai_confidence
-        
-        # Inicializar score compuesto
-        df['composite_score'] = 0.0
-        
-        # Componentes del score con pesos
-        components = {
-            'trend_score': self.weights.get('trend', 0.25),
-            'support_proximity_score': self.weights.get('support', 0.20),
-            'momentum_score': self.weights.get('momentum', 0.15),
-            'volatility_score': self.weights.get('volatility', 0.10),
-            'volume_score': self.weights.get('volume', 0.10),
-            'ai_confidence': self.weights.get('ai_confidence', 0.20)
-        }
-        
-        # Calcular score ponderado
-        total_weight = 0
-        for component, weight in components.items():
-            if component in df.columns:
-                # Rellenar valores missing con neutral (0.5)
-                component_values = df[component].fillna(0.5)
-                df['composite_score'] += component_values * weight
-                total_weight += weight
-        
-        # Normalizar si algún componente faltó
-        if total_weight > 0:
-            df['composite_score'] /= total_weight
-        
-        # Asegurar rango 0-1
-        df['composite_score'] = df['composite_score'].clip(0, 1)
-        
-        return df
-    
-    def calculate_optimal_stop_target(self, df: pd.DataFrame, asset: str, interval: str) -> pd.DataFrame:
-        """Calcula stop y target optimizados basados en score y volatilidad"""
-        df = df.copy()
-        
-        # Multiplicadores base de ATR
-        base_stop_multiplier = self.config.get('atr_multipliers', {}).get('stop', 1.3)
-        base_target_multiplier = self.config.get('atr_multipliers', {}).get('target', 2.5)
-        
-        # Ajustar multiplicadores basado en confianza de IA
-        if 'ai_confidence' in df.columns and 'atr' in df.columns:
-            confidence_multiplier = self.ai_config.get("confidence_multiplier", 1.5)
-            
-            # Ajustar target multiplier basado en confianza
-            target_multipliers = base_target_multiplier * (
-                1 + (df['ai_confidence'] - 0.5) * (confidence_multiplier - 1)
-            )
-            
-            # Ajustar stop multiplier (más conservador con alta confianza)
-            stop_multipliers = base_stop_multiplier * (
-                1 - (df['ai_confidence'] - 0.5) * 0.5  # Reducir stop con alta confianza
-            )
-            
-            # Calcular stop y target
-            df['stop'] = df['support'] - stop_multipliers * df['atr']
-            df['target'] = df['resistance'] + target_multipliers * df['atr']
-            
-            # Asegurar stop < price < target
-            df['stop'] = np.minimum(df['stop'], df['close'] * 0.99)
-            df['target'] = np.maximum(df['target'], df['close'] * 1.01)
-        
-        else:
-            # Fallback a cálculo básico
-            df['stop'] = df.get('support', df['close'] * 0.95) - base_stop_multiplier * df.get('atr', 0)
-            df['target'] = df.get('resistance', df['close'] * 1.05) + base_target_multiplier * df.get('atr', 0)
-        
-        return df
-    
-    def generate_scores(self, df: pd.DataFrame, asset: str, interval: str) -> pd.DataFrame:
-        """Genera scores completos con stop/target optimizados"""
-        if df is None or df.empty:
-            return pd.DataFrame()
-        
-        df = df.copy()
-        
-        # Calcular score compuesto
-        df = self.calculate_composite_score(df, asset, interval)
-        
-        # Calcular stop/target optimizados
-        df = self.calculate_optimal_stop_target(df, asset, interval)
-        
-        # Rangos para visualización
-        df['range_min'] = df.get('support', df['close'] * 0.95)
-        df['range_max'] = df.get('resistance', df['close'] * 1.05)
-        
-        # Métricas de calidad de señal
-        df['signal_quality'] = self.calculate_signal_quality(df)
-        
-        return df
-    
-    def calculate_signal_quality(self, df: pd.DataFrame) -> pd.Series:
-        """Calcula métricas de calidad de señal"""
-        quality = pd.Series(0.5, index=df.index, name='signal_quality')
-        
-        # Factores de calidad
-        factors = []
-        
-        if 'ai_confidence' in df.columns:
-            factors.append(df['ai_confidence'])
-        
-        if 'trend_score' in df.columns:
-            factors.append(df['trend_score'])
-        
-        if 'atr' in df.columns and 'close' in df.columns:
-            # Baja volatilidad relativa → mejor calidad
-            volatility = df['atr'] / df['close']
-            vol_quality = 1 - np.tanh(volatility * 100)
-            factors.append(vol_quality)
-        
-        if len(factors) > 0:
-            # Promedio de factores de calidad
-            quality = sum(factors) / len(factors)
-        
-        return quality
-    
-    def save_scores_to_db(self, df_scores: pd.DataFrame, asset: str, interval: str) -> int:
-        """Guarda scores en la base de datos"""
-        if df_scores is None or df_scores.empty:
-            return 0
-        
-        required_columns = ['ts', 'composite_score', 'range_min', 'range_max', 
-                          'stop', 'target', 'ai_confidence', 'signal_quality']
-        
-        # Verificar columnas requeridas
-        for col in required_columns:
-            if col not in df_scores.columns:
-                df_scores[col] = np.nan
-        
-        # Preparar datos para inserción
-        df_db = df_scores[required_columns].copy()
-        df_db['asset'] = asset
-        df_db['interval'] = interval
-        df_db['created_at'] = int(datetime.now().timestamp() * 1000)
-        
-        # Convertir timestamp a ms
-        if pd.api.types.is_datetime64_any_dtype(df_db["ts"]):
-            df_db["ts_ms"] = (df_db["ts"].astype("int64") // 1_000_000).astype("int64")
-        else:
-            df_db["ts_ms"] = df_db["ts"].astype("int64")
-        
-        # Insertar en base de datos
-        try:
-            with self.storage.get_conn() as conn:
-                with conn.cursor() as cur:
-                    # UPSERT para scores
-                    upsert_sql = """
-                    INSERT INTO scores 
-                    (asset, interval, ts, score, range_min, range_max, stop, target, 
-                     p_ml, multiplier, created_at, signal_quality)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (asset, interval, ts) 
-                    DO UPDATE SET
-                        score = EXCLUDED.score,
-                        range_min = EXCLUDED.range_min,
-                        range_max = EXCLUDED.range_max,
-                        stop = EXCLUDED.stop,
-                        target = EXCLUDED.target,
-                        p_ml = EXCLUDED.p_ml,
-                        multiplier = EXCLUDED.multiplier,
-                        created_at = EXCLUDED.created_at,
-                        signal_quality = EXCLUDED.signal_quality
-                    """
-                    
-                    rows = []
-                    for _, row in df_db.iterrows():
-                        rows.append((
-                            asset, interval, int(row["ts_ms"]),
-                            float(row["composite_score"]),
-                            float(row["range_min"]) if not pd.isna(row["range_min"]) else None,
-                            float(row["range_max"]) if not pd.isna(row["range_max"]) else None,
-                            float(row["stop"]) if not pd.isna(row["stop"]) else None,
-                            float(row["target"]) if not pd.isna(row["target"]) else None,
-                            float(row["ai_confidence"]) if not pd.isna(row["ai_confidence"]) else None,
-                            float(row["signal_quality"]) if not pd.isna(row["signal_quality"]) else None,
-                            int(row["created_at"]),
-                            float(row["signal_quality"]) if not pd.isna(row["signal_quality"]) else None
-                        ))
-                    
-                    # Insertar en lotes
-                    batch_size = 100
-                    inserted = 0
-                    for i in range(0, len(rows), batch_size):
-                        batch = rows[i:i + batch_size]
-                        cur.executemany(upsert_sql, batch)
-                        inserted += cur.rowcount
-                    
-                    conn.commit()
-                    logger.info("Insertados %d scores para %s %s", inserted, asset, interval)
-                    return inserted
-                    
-        except Exception as e:
-            logger.exception("Error guardando scores en BD: %s", e)
-            return 0
 
-# Función de conveniencia para uso externo
-def compute_and_save_scores(storage, asset: str, interval: str, 
-                          lookback_bars: int = 500, config: Optional[Dict[str, Any]] = None) -> int:
+def _safe_div(a, b):
+    try:
+        return a / b
+    except Exception:
+        return np.nan
+
+
+# --------------------
+# Indicators
+# --------------------
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window=window, min_periods=1).mean()
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.rolling(period, min_periods=1).mean()
+    ma_down = down.rolling(period, min_periods=1).mean()
+    rs = ma_up / (ma_down.replace(0, np.nan))
+    rsi_series = 100 - (100 / (1 + rs))
+    return rsi_series.fillna(50)
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    # df must have high, low, close
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=1).mean()
+
+
+def momentum(series: pd.Series, window: int = 10) -> pd.Series:
+    return series.pct_change(periods=window)
+
+
+def volatility(series: pd.Series, window: int = 20) -> pd.Series:
+    return series.pct_change().rolling(window=window, min_periods=1).std()
+
+
+def fibonacci_levels(df: pd.DataFrame, lookback: int = 100) -> Dict[str, float]:
     """
-    Función principal para calcular y guardar scores
+    Compute simple Fibonacci levels (0%, 23.6, 38.2, 50, 61.8, 100%) on last lookback bars.
+    Returns a dict of levels based on min/max in window.
     """
-    # Obtener datos
-    df = storage.get_ohlcv(asset, interval, limit=lookback_bars)
     if df is None or df.empty:
-        logger.warning("No hay datos para %s %s", asset, interval)
-        return 0
-    
-    # Obtener indicadores si no están en los datos
-    if 'ema9' not in df.columns or 'atr' not in df.columns:
+        return {}
+    window = df.tail(lookback)
+    high = float(window["high"].max())
+    low = float(window["low"].min())
+    diff = high - low
+    if diff == 0:
+        return {"high": high, "low": low}
+    levels = {
+        "high": high,
+        "low": low,
+        "0.0": low,
+        "0.236": high - 0.236 * diff,
+        "0.382": high - 0.382 * diff,
+        "0.5": high - 0.5 * diff,
+        "0.618": high - 0.618 * diff,
+        "1.0": high,
+    }
+    return levels
+
+
+# --------------------
+# Feature engineering
+# --------------------
+def features_from_candles(df: pd.DataFrame, feature_cfg: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    """
+    Given df with ts,timestamp,open,high,low,close,volume, generate features:
+      - ema_{12,26,50}
+      - sma_{50,200}
+      - rsi_14
+      - atr_14
+      - momentum_{5,10}
+      - vol_{20}
+      - returns_{1,5,10}
+      - fib levels (as distances to current close)
+    Returns a DataFrame with index aligned to input df (same length).
+    """
+    cfg = feature_cfg or {}
+    df = df.copy().reset_index(drop=True)
+    close = _ensure_numeric_series(df["close"])
+    high = _ensure_numeric_series(df["high"])
+    low = _ensure_numeric_series(df["low"])
+    vol = _ensure_numeric_series(df["volume"]) if "volume" in df.columns else pd.Series(np.nan, index=df.index)
+
+    features = pd.DataFrame(index=df.index)
+    # EMAs
+    for s in (12, 26, 50):
+        features[f"ema_{s}"] = ema(close, s)
+    # SMAs
+    for w in (50, 200):
+        features[f"sma_{w}"] = sma(close, w)
+    # RSI
+    features["rsi_14"] = rsi(close, 14)
+    # ATR
+    features["atr_14"] = atr(df, 14)
+    # momentum
+    for w in (5, 10):
+        features[f"mom_{w}"] = momentum(close, w)
+    # volatility
+    features["vol_20"] = volatility(close, 20)
+    # returns
+    features["ret_1"] = close.pct_change(1)
+    features["ret_5"] = close.pct_change(5)
+    features["ret_10"] = close.pct_change(10)
+    # price ratios
+    features["close_over_ema12"] = _safe_div(close, features["ema_12"])
+    features["close_over_sma50"] = _safe_div(close, features["sma_50"])
+    # fib levels relative distances
+    try:
+        fib = fibonacci_levels(df, lookback=cfg.get("fib_lookback", 100))
+        for k, v in fib.items():
+            # distance to level normalized by price
+            features[f"dist_to_fib_{k}"] = (v - close) / close
+    except Exception:
+        logger.exception("fibonacci feature generation failed")
+    # time features if timestamp exists
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"])
+        features["hour"] = ts.dt.hour
+        features["dayofweek"] = ts.dt.dayofweek
+    # fill inf / nan sensibly
+    features = features.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(0.0)
+    return features
+
+
+# --------------------
+# Target creation
+# --------------------
+def make_target(df: pd.DataFrame, horizon: int = 60, method: str = "future_return") -> pd.Series:
+    """
+    Create a regression target:
+      - future_return: (close_{t+h} / close_t) - 1  (float)
+      - future_sign: sign(future_return) (-1/0/1) if method == 'sign'
+    horizon: number of bars ahead (depending on your interval).
+    """
+    close = _ensure_numeric_series(df["close"])
+    future = close.shift(-horizon)
+    fut_ret = (future / close) - 1
+    if method == "future_return":
+        return fut_ret
+    elif method == "sign":
+        return np.sign(fut_ret).fillna(0).astype(int)
+    else:
+        raise ValueError("Unknown method for make_target")
+
+
+# --------------------
+# Model helpers
+# --------------------
+def _train_sklearn_regressor(X: pd.DataFrame, y: pd.Series, random_state: int = 42, **kwargs):
+    """
+    Train a RandomForestRegressor by default (fast to run locally). Returns fitted model.
+    """
+    model = RandomForestRegressor(n_estimators=200, random_state=random_state, n_jobs=-1, **kwargs)
+    model.fit(X, y)
+    return model
+
+
+def _train_lightgbm(X: pd.DataFrame, y: pd.Series, params: Optional[dict] = None):
+    if not HAS_LGB:
+        raise RuntimeError("lightgbm not available")
+    dtrain = lgb.Dataset(X, label=y)
+    p = params or {"objective": "regression", "metric": "rmse", "verbose": -1}
+    model = lgb.train(p, dtrain, num_boost_round=200)
+    return model
+
+
+def _save_model_file(model, path: str):
+    if joblib is None:
+        raise RuntimeError("joblib required to save model files (pip install joblib)")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    joblib.dump(model, path)
+    logger.info("Model saved to %s", path)
+
+
+def _load_model_file(path: str):
+    if joblib is None:
+        raise RuntimeError("joblib required to load model files")
+    return joblib.load(path)
+
+
+# --------------------
+# ScoreEngine
+# --------------------
+class ScoreEngine:
+    def __init__(self, storage: Optional[PostgresStorage] = None, model_dir: str = "models"):
+        self.storage = storage or PostgresStorage()
+        self.model_dir = model_dir
+        self.storage.init_db()
+        os.makedirs(self.model_dir, exist_ok=True)
+
+    # Indicator / features helpers
+    def compute_indicators(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Returns a dict of scalar indicators for last bar (useful for UI).
+        """
+        res = {}
         try:
-            from core.score import compute_basic_indicators
-            df = compute_basic_indicators(df)
-        except Exception as e:
-            logger.warning("Error calculando indicadores básicos: %s", e)
-    
-    # Calcular scores
-    scoring_system = AIScoringSystem(storage, config)
-    df_scores = scoring_system.generate_scores(df, asset, interval)
-    
-    # Guardar en BD
-    inserted = scoring_system.save_scores_to_db(df_scores, asset, interval)
-    return inserted
+            last_window = df.tail(200)
+            res["ema_12"] = float(ema(last_window["close"], 12).iloc[-1])
+            res["ema_26"] = float(ema(last_window["close"], 26).iloc[-1])
+            res["sma_50"] = float(sma(last_window["close"], 50).iloc[-1])
+            res["sma_200"] = float(sma(last_window["close"], 200).iloc[-1])
+            res["rsi_14"] = float(rsi(last_window["close"], 14).iloc[-1])
+            res["atr_14"] = float(atr(last_window, 14).iloc[-1])
+            res["fib"] = fibonacci_levels(last_window, lookback=100)
+        except Exception:
+            logger.exception("compute_indicators failed")
+        return res
+
+    def features_from_candles(self, df: pd.DataFrame, feature_cfg: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+        return features_from_candles(df, feature_cfg)
+
+    # Training / eval
+    def train_model(self,
+                    asset: str,
+                    interval: str,
+                    df_candles: pd.DataFrame,
+                    horizon: int = 60,
+                    model_type: str = "lgbm",
+                    feature_cfg: Optional[Dict[str, Any]] = None,
+                    save_to_storage: bool = True,
+                    model_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        End-to-end train:
+        - compute features from df_candles
+        - create target (future_return) with horizon
+        - split by time (TimeSeriesSplit) and train model
+        - save model file and register metadata in storage.models table
+        Returns dict with metrics and model path & id.
+        """
+        if df_candles is None or df_candles.empty:
+            raise ValueError("df_candles empty")
+        df_candles = df_candles.sort_values("ts").reset_index(drop=True)
+        features = self.features_from_candles(df_candles, feature_cfg)
+        target = make_target(df_candles, horizon=horizon, method="future_return")
+        # align
+        X = features.iloc[:-horizon].reset_index(drop=True)
+        y = target.iloc[:-horizon].reset_index(drop=True).fillna(0.0)
+        # drop any NaNs
+        X = X.fillna(0.0)
+        # simple time-series split CV for metrics
+        tscv = TimeSeriesSplit(n_splits=3)
+        metrics = {"folds": []}
+        fold = 0
+        models = []
+        for train_idx, test_idx in tscv.split(X):
+            fold += 1
+            X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
+            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
+            # train
+            if model_type == "lgbm" and HAS_LGB:
+                model = _train_lightgbm(X_tr, y_tr)
+            else:
+                model = _train_sklearn_regressor(X_tr, y_tr)
+            # predict
+            if model_type == "lgbm" and HAS_LGB:
+                y_pred = model.predict(X_te)
+            else:
+                y_pred = model.predict(X_te)
+            rmse = float(math.sqrt(mean_squared_error(y_te, y_pred)))
+            r2 = float(r2_score(y_te, y_pred))
+            metrics["folds"].append({"fold": fold, "rmse": rmse, "r2": r2})
+            models.append(model)
+        # retrain on full data
+        if model_type == "lgbm" and HAS_LGB:
+            final_model = _train_lightgbm(X, y)
+        else:
+            final_model = _train_sklearn_regressor(X, y)
+        # save model to disk
+        timestamp = int(time.time())
+        model_name = model_name or f"{asset}_{interval}_{model_type}_{timestamp}.pkl"
+        model_path = os.path.join(self.model_dir, model_name)
+        if joblib is None:
+            logger.warning("joblib not installed - model won't be saved to disk")
+            model_saved = None
+        else:
+            _save_model_file(final_model, model_path)
+            model_saved = model_path
+        # persist model metadata in DB
+        model_id = None
+        if save_to_storage:
+            try:
+                metadata = {
+                    "asset": asset, "interval": interval, "model_type": model_type,
+                    "model_path": model_saved, "trained_at": timestamp,
+                    "metrics": metrics
+                }
+                model_id = self.storage.save_model_record(model_name, asset, interval, metadata)
+            except Exception:
+                logger.exception("Failed to save model record in DB")
+        return {"model_name": model_name, "model_path": model_saved, "model_id": model_id, "metrics": metrics}
+
+    def load_model(self, model_path: str):
+        if joblib is None:
+            raise RuntimeError("joblib required to load models")
+        return _load_model_file(model_path)
+
+    def infer(self,
+              asset: str,
+              interval: str,
+              df_candles: pd.DataFrame,
+              model: Any,
+              horizon: int = 60,
+              feature_cfg: Optional[Dict[str, Any]] = None,
+              output_raw_scores: bool = True) -> pd.DataFrame:
+        """
+        Given a candles DF and a fitted model, compute features and produce a DataFrame with:
+          ts, timestamp, score (predicted future_return), meta fields.
+        The predicted score aligns with current bar predicting future horizon.
+        """
+        if df_candles is None or df_candles.empty:
+            return pd.DataFrame()
+        df = df_candles.sort_values("ts").reset_index(drop=True)
+        feats = self.features_from_candles(df, feature_cfg)
+        feats = feats.fillna(0.0)
+        # remove last horizon rows that cannot have target if we had target
+        X = feats
+        # predict - if lightgbm model object predict same way as sklearn
+        try:
+            preds = model.predict(X)
+        except Exception:
+            # handle lgb Booster where predict expects np.array
+            try:
+                preds = model.predict(X.values)
+            except Exception:
+                logger.exception("Model prediction failed")
+                preds = np.zeros(len(X))
+        out = pd.DataFrame({
+            "ts": df["ts"].astype(int),
+            "timestamp": df["timestamp"],
+            "score_raw": preds
+        })
+        # normalize/scale raw score to a bounded [-3,3] or probability-like score
+        out["score"] = _normalize_score(out["score_raw"])
+        # attach indicators snapshot for UI convenience
+        try:
+            ind = self.compute_indicators(df)
+            # broadcast
+            for k, v in ind.items():
+                out[f"ind_{k}"] = str(v)  # store as string to avoid heavy JSON here
+        except Exception:
+            logger.exception("attach indicators failed")
+        # Optionally persist scores to DB
+        return out
+
+    def predict_and_persist(self, asset: str, interval: str, df_candles: pd.DataFrame, model_path: Optional[str] = None, model_obj: Optional[Any] = None, persist: bool = True, horizon: int = 60):
+        """
+        Convenience: load model (if path given), run infer and persist scores in DB via storage.save_scores
+        """
+        if model_obj is None and model_path is None:
+            # get latest model for this asset/interval from storage
+            rec = self.storage.get_latest_model_record(asset, interval)
+            if rec and rec.get("metadata") and rec["metadata"].get("model_path"):
+                model_path = rec["metadata"]["model_path"]
+        if model_obj is None:
+            if model_path is None:
+                raise ValueError("No model path or model object provided")
+            model_obj = self.load_model(model_path)
+        df_scores = self.infer(asset, interval, df_candles, model_obj, horizon=horizon)
+        if df_scores is None or df_scores.empty:
+            return None
+        # prepare for DB: keep last N rows (e.g., all)
+        df_db = df_scores[["ts", "timestamp", "score"]].copy()
+        # storage.save_scores expects column 'score' to be serializable; wrap in dict for traceability
+        df_db["asset"] = asset
+        df_db["interval"] = interval
+        df_db["score"] = df_db["score"].apply(lambda s: {"score": float(s)})
+        # cast ts to int
+        df_db["ts"] = df_db["ts"].astype(int)
+        # persist
+        if persist:
+            try:
+                # save in batches via storage.save_scores
+                self.storage.save_scores(df_db)
+            except Exception:
+                logger.exception("Failed to persist scores to DB")
+        return df_scores
+
+    # --------------------
+    # Evaluation & backtest
+    # --------------------
+    def evaluate_model(self, asset: str, interval: str, df_candles: pd.DataFrame, model_type: str = "lgbm", horizon: int = 60, n_splits: int = 3) -> Dict[str, Any]:
+        """
+        Walk-forward evaluation: trains model on each fold and returns aggregated metrics.
+        Uses TimeSeriesSplit.
+        """
+        df_candles = df_candles.sort_values("ts").reset_index(drop=True)
+        features = self.features_from_candles(df_candles)
+        target = make_target(df_candles, horizon=horizon, method="future_return")
+        X_full = features.iloc[:-horizon].fillna(0.0)
+        y_full = target.iloc[:-horizon].fillna(0.0)
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        metrics = []
+        for train_idx, test_idx in tscv.split(X_full):
+            X_tr, X_te = X_full.iloc[train_idx], X_full.iloc[test_idx]
+            y_tr, y_te = y_full.iloc[train_idx], y_full.iloc[test_idx]
+            if model_type == "lgbm" and HAS_LGB:
+                model = _train_lightgbm(X_tr, y_tr)
+                y_pred = model.predict(X_te)
+            else:
+                model = _train_sklearn_regressor(X_tr, y_tr)
+                y_pred = model.predict(X_te)
+            rmse = float(math.sqrt(mean_squared_error(y_te, y_pred)))
+            r2 = float(r2_score(y_te, y_pred))
+            metrics.append({"rmse": rmse, "r2": r2})
+        # aggregate
+        avg_rmse = float(np.mean([m["rmse"] for m in metrics])) if metrics else None
+        avg_r2 = float(np.mean([m["r2"] for m in metrics])) if metrics else None
+        return {"folds": metrics, "avg_rmse": avg_rmse, "avg_r2": avg_r2}
+
+    def backtest_signals(self, asset: str, interval: str, df_candles: pd.DataFrame, model_obj: Any, horizon: int = 60, threshold: float = 0.0, **backtest_kwargs) -> Dict[str, Any]:
+        """
+        Convert model predictions into simple buy/sell signals and run backtest using core.backtest.run_backtest.
+        Strategy used:
+          - buy when predicted future_return > threshold
+          - sell when predicted future_return <= threshold (or stronger logic)
+        Returns backtest result dict.
+        """
+        from core.backtest import run_backtest
+        # infer scores
+        df_scores = self.infer(asset, interval, df_candles, model_obj, horizon=horizon)
+        if df_scores is None or df_scores.empty:
+            return {"error": "no_scores"}
+        # strategy function
+        def strategy_fn(row, idx, df_all, state=None):
+            # row is a row from df_candles in backtest loop; align by ts
+            ts = int(row["ts"])
+            # find corresponding score row (exact ts)
+            sr = df_scores[df_scores["ts"] == ts]
+            if sr.empty:
+                return None
+            score_val = float(sr.iloc[0]["score_raw"])
+            # simple: buy if predicted return > threshold
+            if score_val > threshold:
+                return "buy"
+            elif score_val < -threshold:
+                return "sell"
+            return None
+        # pass df_candles to backtest.run_backtest
+        result = run_backtest(df_candles, strategy_fn, **backtest_kwargs)
+        return result
+
+
+# --------------------
+# Helpers
+# --------------------
+def _normalize_score(arr: Sequence[float], method: str = "tanh_scale") -> np.ndarray:
+    """
+    Normalize raw predictions into bounded scores.
+    Default: tanh scaling to [-1,1], then multiply by 3 to map to [-3,3] (like previous behavior).
+    """
+    arr = np.asarray(arr, dtype=float)
+    if method == "tanh_scale":
+        # guard against big outliers
+        scaled = np.tanh(arr / (np.std(arr) + 1e-9))
+        return (scaled * 3.0)
+    else:
+        # simple clipping
+        mx = np.nanmax(np.abs(arr)) if len(arr) > 0 else 1.0
+        mx = mx if mx != 0 else 1.0
+        return np.clip(arr / mx * 3.0, -3.0, 3.0)
+
+
+# --------------------
+# convenience top-level functions
+# --------------------
+def train_and_persist(storage: Optional[PostgresStorage], asset: str, interval: str, df_candles: pd.DataFrame, horizon: int = 60, model_type: str = "lgbm", save_to_storage: bool = True):
+    se = ScoreEngine(storage=storage)
+    return se.train_model(asset, interval, df_candles, horizon=horizon, model_type=model_type, save_to_storage=save_to_storage)
+
+
+def infer_and_persist(storage: Optional[PostgresStorage], asset: str, interval: str, df_candles: pd.DataFrame, model_path: Optional[str] = None, horizon: int = 60):
+    se = ScoreEngine(storage=storage)
+    return se.predict_and_persist(asset, interval, df_candles, model_path=model_path, horizon=horizon)
+
