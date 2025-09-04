@@ -21,3 +21,4 @@ echo "[start] Worker log: /tmp/watchlist_logs/worker.log"
 
 echo "[start] Arrancando Streamlit en puerto 10000..."
 exec streamlit run dashboard/app.py --server.port 10000 --server.address 0.0.0.0
+
