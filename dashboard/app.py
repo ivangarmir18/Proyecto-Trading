@@ -1,34 +1,12 @@
 """
-Dashboard completo y exhaustivo para Proyecto-Trading
+Dashboard completo y exhaustivo para Proyecto-Trading (VERSIÓN CORREGIDA)
 =================================
-Objetivo: exponer TODO lo que ofrece el proyecto desde la UI — sin "simplificar". Si el módulo
-central está implementado, cada botón / acción llamará a la función correspondiente.
 
-Características incluidas:
-- Navegación por pestañas: Overview, Watchlist, Backfill, Scores, Assets, Models, Train/Infer, Backtest, IA, Settings, Logs
-- Gestión completa de watchlist: añadir, editar meta, eliminar, importar/exportar CSV, sincronizar con DB
-- Backfill: ver solicitudes pendientes, crear request (add_backfill_request), marcar processed (update_backfill_status), lanzar backfill inmediato (si existe init_and_backfill/orchestrator hook)
-- Scores & Indicators: ver últimos scores, listar históricos, expandir JSON, recalcular indicadores (si orchestrator.compute_indicators_for disponible)
-- Assets inspector: listar activos, ver intervals, cargar velas con parámetros (start/end/limit), mostrar chart de velas + indicadores (si hay funciones indicadoras en core.score)
-- Model registry: listar modelos, ver metadata, descargar ruta, eliminar (si se desea)
-- Entrenamiento IA: trigger a core.ai_train.train_ai_model (con opciones de hiperparams mínimas), ver progreso (spinner) y registro en storage.models
-- Inferencia: trigger a core.score.infer_and_persist para un asset/interval
-- Backtest: lanzar backtest sincronamente con core.backtest.run_backtest_for y mostrar métricas y equity curve
-- IA (OpenAI): sección opcional que llama a core.ai_interference if available; muestra fallbacks y plantilla de prompt
-- Health & Logs: checks de storage.health(), fetcher.now_ms() (si existe), ver últimos logs en /tmp/watchlist_logs
-- Settings: instrucciones para setear vars de entorno, botones para reinicializar DB (llama storage.init_db())
+Esta versión corrige la pestaña Watchlist: ahora lee la watchlist desde archivos
+locales del proyecto (p. ej. data/config, data/actions.csv, data/cryptos.csv,
+data/cache/assets_*.json) y ofrece sincronización con storage (DB).
 
-Principios de diseño:
-- Cada acción envuelve llamadas en try/except y muestra mensajes claros. No hay suposiciones: si una función falta, el botón mostrará instrucción y no romperá la app.
-- Uso intensivo de st.spinner y st.success/error para UX.
-- No se ejecuta trabajo en background automáticamente; el usuario debe pulsar botones para acciones que toman tiempo (backfill, train, backtest).
-- Mantener compatibilidad con la interfaz de PostgresStorage creada anteriormente.
-
-NOTA: este archivo es "granular": expone TODO. Si alguna función no existe en tu core, verás mensajes que te dicen qué añadir.
-
-Uso:
-    streamlit run dashboard/app_full.py
-
+Pega este archivo en dashboard/app_full.py (sobrescribe) y reinicia Streamlit.
 """
 from __future__ import annotations
 
@@ -36,6 +14,8 @@ import os
 import json
 import logging
 import tempfile
+import glob
+from pathlib import Path
 from typing import Optional, Any, Dict, List, Tuple
 from datetime import datetime
 
@@ -153,6 +133,183 @@ def get_orchestrator(_storage: Optional[PostgresStorage] = None, _config: Option
         return None
 
 # ---------------------------
+# Utilities específicas para watchlist desde archivos
+# ---------------------------
+
+def _read_json_file(path: Path):
+    try:
+        content = path.read_text(encoding='utf-8')
+        data = json.loads(content)
+        return data
+    except Exception:
+        return None
+
+def _read_csv_file(path: Path):
+    try:
+        df = pd.read_csv(path)
+        return df
+    except Exception:
+        return None
+
+def load_watchlist_from_repo_files(base_dirs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    Busca y carga la watchlist desde varios ficheros comunes en el repo:
+      - data/actions.csv
+      - data/cryptos.csv
+      - data/watchlist.csv
+      - data/config.json
+      - data/cache/assets_*.json
+      - data/config/*.json
+      - data/actions/*.csv
+    Devuelve lista de dicts: [{ "asset": "BTCUSDT", "meta": {...} }, ...]
+    """
+    base_dirs = base_dirs or ['data', 'data/config', 'data/actions']
+    candidates = []
+    # explicit candidate filenames
+    explicit = [
+        "data/actions.csv",
+        "data/cryptos.csv",
+        "data/watchlist.csv",
+        "data/config.json",
+        "data/watchlist.json",
+    ]
+    for p in explicit:
+        candidates.append(Path(p))
+    # glob patterns
+    candidates += [Path(p) for p in glob.glob("data/cache/assets_*.json")]
+    candidates += [Path(p) for p in glob.glob("data/config/*.json")]
+    candidates += [Path(p) for p in glob.glob("data/actions/*.csv")]
+    candidates += [Path(p) for p in glob.glob("data/*.csv")]
+
+    seen_assets = set()
+    out: List[Dict[str, Any]] = []
+
+    for p in candidates:
+        if not p.exists():
+            continue
+        # JSON handling
+        if p.suffix.lower() in ('.json',):
+            data = _read_json_file(p)
+            if data is None:
+                continue
+            # accept various shapes
+            if isinstance(data, dict):
+                # maybe {"watchlist": [...]} or {"assets": [...]}
+                possible = []
+                for key in ('watchlist', 'assets', 'data'):
+                    if key in data and isinstance(data[key], list):
+                        possible = data[key]
+                        break
+                if not possible:
+                    # if dict with string keys mapping to meta, convert
+                    # e.g. {"BTCUSDT": {...}, "ETHUSDT": {...}}
+                    arr = []
+                    for k, v in data.items():
+                        if isinstance(k, str):
+                            arr.append({"asset": k, "meta": v})
+                    possible = arr
+                for item in possible:
+                    if isinstance(item, str):
+                        a = item.strip()
+                        if a and a not in seen_assets:
+                            seen_assets.add(a)
+                            out.append({"asset": a, "meta": {"source": str(p)}})
+                    elif isinstance(item, dict) and item.get("asset"):
+                        a = str(item.get("asset")).strip()
+                        if a and a not in seen_assets:
+                            seen_assets.add(a)
+                            out.append({"asset": a, "meta": item.get("meta") or {"source": str(p)}})
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, str):
+                        a = item.strip()
+                        if a and a not in seen_assets:
+                            seen_assets.add(a)
+                            out.append({"asset": a, "meta": {"source": str(p)}})
+                    elif isinstance(item, dict) and item.get("asset"):
+                        a = str(item.get("asset")).strip()
+                        if a and a not in seen_assets:
+                            seen_assets.add(a)
+                            out.append({"asset": a, "meta": item.get("meta") or {"source": str(p)}})
+            continue
+
+        # CSV handling
+        if p.suffix.lower() in ('.csv',):
+            df = _read_csv_file(p)
+            if df is None:
+                continue
+            # look for column names
+            if 'asset' in df.columns:
+                for v in df['asset'].dropna().astype(str).str.strip().unique():
+                    if v and v not in seen_assets:
+                        seen_assets.add(v)
+                        # gather meta columns if exist
+                        meta = {}
+                        for c in df.columns:
+                            if c != 'asset' and df[c].notna().any():
+                                meta[c] = df.loc[df['asset'].astype(str).str.strip() == v, c].iloc[0] if not df.loc[df['asset'].astype(str).str.strip() == v, c].empty else None
+                        out.append({"asset": v, "meta": {"source": str(p), **meta}})
+            else:
+                # fallback: assume first column contains asset codes
+                try:
+                    first_col = df.columns[0]
+                    for v in df[first_col].dropna().astype(str).str.strip().unique():
+                        if v and v not in seen_assets:
+                            seen_assets.add(v)
+                            out.append({"asset": v, "meta": {"source": str(p)}})
+                except Exception:
+                    continue
+            continue
+
+    # Final: if no files found, try to read data/cache/assets_*.json again as last resort
+    if not out:
+        for p in glob.glob("data/cache/assets_*.json"):
+            try:
+                j = _read_json_file(Path(p))
+                if isinstance(j, list):
+                    for item in j:
+                        if isinstance(item, dict) and item.get('asset'):
+                            a = str(item.get('asset')).strip()
+                            if a and a not in seen_assets:
+                                seen_assets.add(a)
+                                out.append({"asset": a, "meta": {"source": p}})
+                        elif isinstance(item, str):
+                            a = item.strip()
+                            if a and a not in seen_assets:
+                                seen_assets.add(a)
+                                out.append({"asset": a, "meta": {"source": p}})
+            except Exception:
+                continue
+
+    return out
+
+def sync_watchlist_to_storage(storage: Any, watchlist: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Sincroniza la lista `watchlist` (lista de dicts {asset,meta}) con storage.
+    Añade cada símbolo con storage.add_watchlist_symbol si existe.
+    Devuelve resumen.
+    """
+    results = {"added": [], "failed": []}
+    if storage is None:
+        return {"error": "storage not available"}
+    for item in watchlist:
+        asset = item.get("asset")
+        meta = item.get("meta") or {}
+        try:
+            storage.add_watchlist_symbol(asset, asset_type=meta.get("type") if isinstance(meta, dict) else None, added_by=meta.get("added_by") if isinstance(meta, dict) else None)
+            # optionally update meta if storage supports update_watchlist_meta
+            if hasattr(storage, "update_watchlist_meta"):
+                try:
+                    storage.update_watchlist_meta(asset, meta or {})
+                except Exception:
+                    # not critical
+                    logger.exception("update_watchlist_meta failed for %s", asset)
+            results["added"].append(asset)
+        except Exception as e:
+            results["failed"].append({"asset": asset, "error": str(e)})
+    return results
+
+# ---------------------------
 # UI small components
 # ---------------------------
 
@@ -199,63 +356,76 @@ def overview_tab(storage: Optional[PostgresStorage]):
 
 
 def watchlist_tab(storage: Optional[PostgresStorage]):
-    st.title('Watchlist')
-    st.markdown('Gestiona la watchlist: añadir, editar meta, eliminar, importar/exportar CSV')
+    st.title('Watchlist (desde archivos del repo)')
+    st.markdown('Esta watchlist **no** se importa por uploader. Se lee desde los ficheros del repositorio (p. ej. `data/actions.csv`, `data/cryptos.csv`, `data/config/*.json`, `data/cache/assets_*.json`). Si quieres sincronizar con la DB, usa el botón "Sincronizar con DB".')
+
     col1, col2 = st.columns([2,1])
     with col1:
-        if storage:
-            try:
-                wl = storage.list_watchlist()
-            except Exception as e:
-                logger.exception('list_watchlist')
-                wl = []
-        else:
-            wl = []
-        df = pd.DataFrame(wl) if wl else pd.DataFrame(columns=['asset','meta'])
-        st.dataframe(df)
-        # export
-        if not df.empty:
-            csv = download_df_as_csv(df)
-            st.download_button('Exportar watchlist CSV', csv, file_name='watchlist.csv')
-    with col2:
-        st.subheader('Añadir / Editar')
-        with st.form('add_watchlist'):
-            asset = st.text_input('Asset (símbolo)')
-            asset_type = st.selectbox('Tipo', ['crypto','stock','other'])
-            added_by = st.text_input('Added by', value=os.getenv('USER','dashboard'))
-            submit = st.form_submit_button('Añadir a watchlist')
-            if submit:
-                if not asset:
-                    st.error('Especifica un asset')
-                elif not storage:
-                    st.error('Storage no disponible')
-                else:
-                    try:
-                        res = storage.add_watchlist_symbol(asset.strip(), asset_type, added_by)
-                        st.success(f"Añadido: {res.get('asset')}")
-                    except Exception as e:
-                        st.error(f'Error añadiendo: {e}')
-        st.markdown('---')
-        st.subheader('Importar watchlist (CSV)')
-        up = st.file_uploader('Sube CSV con columna `asset`', type=['csv'])
-        if up:
-            try:
-                df_in = pd.read_csv(up)
-                if 'asset' not in df_in.columns:
-                    st.error('CSV debe tener columna asset')
-                else:
-                    added = []
-                    failed = []
-                    for a in df_in['asset'].dropna().astype(str).str.strip().unique():
-                        try:
-                            storage.add_watchlist_symbol(a, 'import', os.getenv('USER','csv'))
-                            added.append(a)
-                        except Exception as e:
-                            failed.append((a,str(e)))
-                    st.success(f'Añadidos: {len(added)}. Fallos: {len(failed)}')
-            except Exception as e:
-                st.error(f'Error leyendo CSV: {e}')
+        # mostrar qué archivos se encontraron y su contenido
+        st.subheader('Ficheros detectados y activos')
+        # localizar y mostrar las rutas encontradas
+        found_files = []
+        candidates = [
+            Path("data/actions.csv"),
+            Path("data/cryptos.csv"),
+            Path("data/watchlist.csv"),
+            Path("data/config.json"),
+        ]
+        candidates += [Path(p) for p in glob.glob("data/cache/assets_*.json")]
+        candidates += [Path(p) for p in glob.glob("data/config/*.json")]
+        candidates += [Path(p) for p in glob.glob("data/actions/*.csv")]
+        candidates += [Path(p) for p in glob.glob("data/*.csv")]
 
+        for p in candidates:
+            if p.exists():
+                found_files.append(str(p))
+
+        if not found_files:
+            st.info("No se detectaron ficheros de watchlist en rutas esperadas (data/*). Revisa tu repo.")
+        else:
+            st.write("Ficheros encontrados:")
+            for fpath in found_files:
+                st.text(f"- {fpath}")
+
+        st.markdown("---")
+        st.subheader("Watchlist combinada desde archivos")
+        wl = load_watchlist_from_repo_files()
+        if not wl:
+            st.info("No se encontraron assets en los ficheros. Asegúrate de que existen archivos en data/ (actions.csv, cryptos.csv, data/config/*.json, data/cache/assets_*.json, etc.)")
+        else:
+            df = pd.DataFrame(wl)
+            # mostrar asset + source (si existe)
+            if 'meta' in df.columns:
+                df['source'] = df['meta'].apply(lambda m: (m.get('source') if isinstance(m, dict) else str(m)) if m else '')
+            st.dataframe(df[['asset','source']].rename(columns={'asset':'Asset','source':'Source'}), use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Sincronizar con DB (añadir símbolos a la watchlist en storage)")
+        if st.button("Sincronizar watchlist desde archivos → DB"):
+            if not storage:
+                st.error("Storage no disponible — no puedo sincronizar con la base de datos.")
+            else:
+                if not wl:
+                    st.warning("No hay assets detectados para sincronizar.")
+                else:
+                    with st.spinner("Sincronizando..."):
+                        res = sync_watchlist_to_storage(storage, wl)
+                    if res.get("error"):
+                        st.error(f"Error: {res['error']}")
+                    else:
+                        st.success(f"Sincronizados: {len(res.get('added',[]))}. Fallos: {len(res.get('failed',[]))}")
+                        if res.get('failed'):
+                            st.json(res.get('failed'))
+
+    with col2:
+        st.subheader('Acciones locales (solo lectura de archivos)')
+        st.markdown('Si necesitas editar la watchlist localmente, edita los ficheros en `data/` en tu repo y vuelve a desplegar / refrescar.')
+        st.markdown('---')
+        st.write('Acciones rápidas:')
+        if st.button('Recargar vista de archivos'):
+            st.experimental_rerun()
+        st.markdown('---')
+        st.info('La importación por uploader se ha desactivado en favor de la lectura directa desde los ficheros del proyecto.')
 
 def backfill_tab(storage: Optional[PostgresStorage], orchestrator: Optional[Orchestrator]):
     st.title('Backfill')
@@ -330,7 +500,6 @@ def backfill_tab(storage: Optional[PostgresStorage], orchestrator: Optional[Orch
                 except Exception as e:
                     st.error(f'Backfill falló: {e}')
 
-
 def scores_tab(storage: Optional[PostgresStorage]):
     st.title('Scores & Indicators')
     col1, col2 = st.columns([1,2])
@@ -368,7 +537,6 @@ def scores_tab(storage: Optional[PostgresStorage]):
                         st.error(f'Inferencia fallo: {e}')
                 else:
                     st.error('Modulo score/infer_and_persist no disponible — implementa core.score.infer_and_persist')
-
 
 def assets_tab(storage: Optional[PostgresStorage]):
     st.title('Assets Inspector')
@@ -417,7 +585,6 @@ def assets_tab(storage: Optional[PostgresStorage]):
             except Exception as e:
                 st.error(f'Error cargando velas: {e}')
 
-
 def models_tab(storage: Optional[PostgresStorage]):
     st.title('Models Registry')
     st.markdown('Lista y gestión de modelos guardados en storage.models')
@@ -446,7 +613,6 @@ def models_tab(storage: Optional[PostgresStorage]):
                     st.dataframe(pd.DataFrame(rows))
             except Exception as e:
                 st.error(f'Error listando modelos: {e}')
-
 
 def train_infer_tab(storage: Optional[PostgresStorage]):
     st.title('Train / Infer')
@@ -490,7 +656,6 @@ def train_infer_tab(storage: Optional[PostgresStorage]):
                     st.success('Inferencia guardada')
                 except Exception as e:
                     st.error(f'Inferencia falló: {e}')
-
 
 def backtest_tab(storage: Optional[PostgresStorage]):
     st.title('Backtest')
@@ -539,7 +704,6 @@ def backtest_tab(storage: Optional[PostgresStorage]):
             except Exception as e:
                 st.error(f'Backtest falló: {e}')
 
-
 def ai_tab(storage: Optional[PostgresStorage]):
     st.title('IA — OpenAI / Interference')
     if not os.getenv('OPENAI_API_KEY'):
@@ -562,14 +726,12 @@ def ai_tab(storage: Optional[PostgresStorage]):
     else:
         st.info('core.ai_interference.explain_scores no disponible — implementa para habilitar')
 
-
 def settings_tab(storage: Optional[PostgresStorage]):
     st.title('Settings')
     st.markdown('Variables de entorno y configuración de despliegue')
     envs = {k: bool(os.getenv(k)) for k in ['DATABASE_URL','OPENAI_API_KEY']}
     st.json(envs)
     st.markdown('Instrucciones para ambiente: export DATABASE_URL="postgresql://user:pass@host:5432/db"')
-
 
 def logs_tab():
     st.title('Logs')
@@ -587,7 +749,6 @@ def logs_tab():
             st.code(data)
         except Exception as e:
             st.error(f'Error leyendo log: {e}')
-
 
 # ---------------------------
 # Main
