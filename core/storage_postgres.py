@@ -347,6 +347,96 @@ class PostgresStorage:
                 "created_at": r[3].isoformat() if r[3] else None
             })
         return res
+    # --- parche: añadir métodos watchlist dentro de class PostgresStorage ---
+    # (ponlo en la zona "Helpers for dashboard" o cerca de otros helpers)
+    
+    WATCHLIST_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS watchlist (
+        id BIGSERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL DEFAULT 'default',
+        asset TEXT NOT NULL,
+        asset_type TEXT,
+        interval TEXT,
+        metadata JSONB,
+        added_by TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(user_id, asset)
+    );
+    """
+    
+    def _ensure_watchlist_table(self):
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(WATCHLIST_TABLE_SQL)
+            conn.commit()
+    
+    def add_watchlist_symbol(self, asset: str, asset_type: str = "crypto",
+                             interval: str = "1h", added_by: str = "dashboard",
+                             metadata: dict | None = None, user_id: str = "default") -> dict | None:
+        self._ensure_watchlist_table()
+        meta_json = json.dumps(metadata) if metadata is not None else None
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO watchlist (user_id, asset, asset_type, interval, metadata, added_by)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, asset) DO UPDATE
+                  SET asset_type = EXCLUDED.asset_type,
+                      interval = EXCLUDED.interval,
+                      metadata = COALESCE(EXCLUDED.metadata, watchlist.metadata),
+                      added_by = EXCLUDED.added_by,
+                      created_at = NOW()
+                RETURNING id, user_id, asset, asset_type, interval, metadata, added_by, created_at;
+                """,
+                (user_id, asset, asset_type, interval, meta_json, added_by),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            # normalize returned dict
+            return {
+                "id": row[0],
+                "user_id": row[1],
+                "asset": row[2],
+                "asset_type": row[3],
+                "interval": row[4],
+                "metadata": row[5],
+                "added_by": row[6],
+                "created_at": row[7].isoformat() if row[7] else None,
+            }
+    
+    def list_watchlist(self, user_id: str = "default") -> list:
+        self._ensure_watchlist_table()
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id, user_id, asset, asset_type, interval, metadata, added_by, created_at FROM watchlist WHERE user_id=%s ORDER BY created_at DESC;", (user_id,))
+            rows = cur.fetchall()
+        result = []
+        for r in rows:
+            result.append({
+                "id": r[0],
+                "user_id": r[1],
+                "asset": r[2],
+                "asset_type": r[3],
+                "interval": r[4],
+                "metadata": r[5],
+                "added_by": r[6],
+                "created_at": r[7].isoformat() if r[7] else None,
+            })
+        return result
+    
+    def get_watchlist(self, user_id: str = "default") -> list:
+        # alias
+        return self.list_watchlist(user_id=user_id)
+    
+    def remove_watchlist_symbol(self, asset: str, user_id: str = "default") -> bool:
+        self._ensure_watchlist_table()
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM watchlist WHERE user_id=%s AND asset=%s;", (user_id, asset))
+            return cur.rowcount > 0
+    # --- fin parche ---
 
     # ---------------------
     # Health

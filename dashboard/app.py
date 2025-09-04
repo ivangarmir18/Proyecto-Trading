@@ -42,6 +42,8 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 import numpy as np
+from dashboard.utils import load_assets_from_cache, load_user_watchlist_csv, save_user_watchlist_csv
+
 
 # Optional AI integration
 OPENAI_AVAILABLE = False
@@ -265,19 +267,74 @@ def page_watchlist(storage):
                             st.rerun()
                     except Exception as e:
                         st.exception(e)
+                        
+    # -----------------------------
+    # Catálogo desde CSV (data/cache) y añadir seleccionados
+    # -----------------------------
+    st.markdown("---")
+    st.subheader("Añadir desde catálogo CSV (data/cache)")
+    try:
+        assets_df = load_assets_from_cache()
+    except Exception:
+        assets_df = None
+    
+    if assets_df is None or assets_df.empty:
+        st.info("No se han encontrado CSV en data/cache/ — si tienes candles en disco, revisa su ruta.")
+        assets_list = []
+    else:
+        st.write(f"{len(assets_df)} activos detectados en data/cache")
+        tipo_sel = st.selectbox("Tipo", options=["all", "crypto", "stock", "other"], index=0)
+        if tipo_sel != "all":
+            shown_df = assets_df[assets_df["asset_type"] == tipo_sel]
+        else:
+            shown_df = assets_df
+        assets_list = shown_df["asset"].astype(str).tolist()
+        selected_assets = st.multiselect("Selecciona activos para añadir a tu watchlist", options=assets_list, default=[])
+    
+    if st.button("Añadir seleccionados"):
+        if not assets_list or not selected_assets:
+            st.warning("Selecciona primero los activos que quieres añadir.")
+        else:
+            user_id = st.session_state.get("user_id", "default")
+            successes, failures = [], []
+            for a in selected_assets:
+                # Intentar añadir vía storage si está disponible
+                res = safe_call(storage, "add_watchlist_symbol", a, "auto", "1h", "dashboard", default=None) \
+                      or safe_call(storage, "add_watchlist_symbol", asset=a, asset_type="auto", interval="1h", added_by="dashboard", default=None)
+                if res is None:
+                    # Fallback CSV
+                    try:
+                        existing = [r["asset"] for r in load_user_watchlist_csv(user_id)]
+                        new_set = sorted(set(existing) | set([a.upper()]))
+                        save_user_watchlist_csv(new_set, user_id=user_id)
+                        successes.append(a)
+                    except Exception as e:
+                        failures.append((a, str(e)))
+                else:
+                    successes.append(a)
+            if successes:
+                st.success(f"Añadidos: {', '.join(successes)}")
+                st.experimental_rerun()
+            if failures:
+                st.error(f"Fallos: {failures}")
 
     with right:
         st.subheader("Watchlist — Tabla y filtros")
 
         # Load watchlist (try get_watchlist or list_watchlist)
-        raw_wl = safe_call(storage, "get_watchlist", default=None)
-        if raw_wl is None:
-            raw_wl = safe_call(storage, "list_watchlist", default=None)
-
-        df = df_from_list_of_dicts(raw_wl)
-        if df.empty:
-            st.info("La watchlist está vacía o storage no provee get_watchlist()/list_watchlist(). Añade símbolos en la izquierda.")
-            return
+        # Load watchlist (DB storage first, then CSV fallback)
+    raw_wl = safe_call(storage, "get_watchlist", default=None) or safe_call(storage, "list_watchlist", default=None)
+    if not raw_wl:
+        user_id = st.session_state.get("user_id", "default")
+        try:
+            raw_wl = load_user_watchlist_csv(user_id)
+        except Exception:
+            raw_wl = None
+    
+    df = df_from_list_of_dicts(raw_wl)
+    if df.empty:
+        st.info("La watchlist está vacía. Añade símbolos desde el catálogo a la izquierda o usa la UI para crear tu selección personal.")
+        return
 
         # Ensure consistent columns
         if "asset" not in df.columns and "symbol" in df.columns:

@@ -361,4 +361,66 @@ __all__ = [
     "invalidate_cache",
 ]
 
+# core/utils_watchlist.py
+from pathlib import Path
+import pandas as pd
+import json
+from typing import List, Dict, Optional
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # ajusta según donde lo pongas
+CACHE_DIR = PROJECT_ROOT / "data" / "cache"
+WATCHLIST_DIR = PROJECT_ROOT / "data" / "watchlists"
+WATCHLIST_DIR.mkdir(parents=True, exist_ok=True)
+
+def load_assets_from_cache() -> pd.DataFrame:
+    """
+    Escanea data/cache/*_{interval}*.csv y construye un DataFrame con columnas:
+    asset, asset_type ('crypto' o 'stock' o 'other'), intervals (set/list)
+    """
+    rows = {}
+    for f in CACHE_DIR.glob("**/*.csv"):
+        name = f.stem  # ejemplo BTCUSDT_1h
+        # heurística: separa por _ para extraer asset e interval
+        parts = name.split("_")
+        if len(parts) >= 2:
+            asset = "_".join(parts[:-1])
+            interval = parts[-1]
+        else:
+            asset = name
+            interval = ""
+        # guess asset type from file name or folder
+        parent = f.parent.name.lower()
+        asset_type = "crypto" if "usdt" in asset.lower() or "crypto" in parent else ("stock" if any(c.isalpha() for c in asset) and ('.' in str(f) or parent in ("actions","acciones","stocks")) else "other")
+        key = asset.upper()
+        if key not in rows:
+            rows[key] = {"asset": key, "asset_type": asset_type, "intervals": set()}
+        rows[key]["intervals"].add(interval)
+    # normalize intervals to comma-separated string for display
+    out = []
+    for v in rows.values():
+        out.append({"asset": v["asset"], "asset_type": v["asset_type"], "intervals": ",".join(sorted([i for i in v["intervals"] if i]))})
+    df = pd.DataFrame(out)
+    if df.empty:
+        return pd.DataFrame(columns=["asset","asset_type","intervals"])
+    return df.sort_values("asset").reset_index(drop=True)
+
+def user_watchlist_path(user_id: str) -> Path:
+    safe = str(user_id).replace("/", "_").replace("..", "")
+    return WATCHLIST_DIR / f"{safe}.csv"
+
+def load_user_watchlist_csv(user_id: str = "default") -> List[Dict]:
+    p = user_watchlist_path(user_id)
+    if not p.exists():
+        return []
+    try:
+        df = pd.read_csv(p)
+        return df.to_dict(orient="records")
+    except Exception:
+        return []
+
+def save_user_watchlist_csv(symbols: List[str], user_id: str = "default") -> None:
+    p = user_watchlist_path(user_id)
+    df = pd.DataFrame([{"asset": s.strip().upper()} for s in symbols])
+    df.to_csv(p, index=False)
+
 # Fin del fichero
