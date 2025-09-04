@@ -1,492 +1,570 @@
 # core/fetch.py
 """
-Fetcher robusto para Proyecto-Trading.
-
-Objetivos:
-- Proveer `fetch_ohlcv(symbol, interval, start_ms=None, end_ms=None)` -> pd.DataFrame
-  con columnas: ts (ms, int), open, high, low, close, volume
-- `backfill_range(symbol, interval, start_ms, end_ms, callback=None)` que itera por ventanas y llama a save/ callback.
-- Soporte multi-fuente: Binance (ccxt) para cripto, Finnhub (API) o yfinance para acciones.
-- Rotación de keys para Finnhub, control de rate limit simple, retries y backoff.
-- Normalización de símbolos (ej: BTCUSDT -> BTC/USDT para ccxt).
-- Utilidades: ms_from_iso, now_ms.
-- Diseño: configurable por dict `config` o leyendo config.json si existe.
-
-Nota: el código hace uso de ccxt, yfinance y requests. Asegúrate de instalar:
-    pip install ccxt yfinance requests pandas numpy
-
+core/fetch.py — implementación robusta y compatible del módulo de adquisición.
+Soporta:
+ - Finnhub (si FINNHUB_API_KEY presente y cliente instalado)
+ - Binance (via ccxt, si instalado y claves en env)
+ - yfinance (fallback para acciones, si instalado)
+ - Postgres storage via core.storage_postgres.PostgresStorage (si existe)
+ - CSV fallback en data/cache/
+ - Rate limiting (token-bucket) por proveedor con backoff/retries
+ - Funciones públicas:
+    - list_watchlist_assets()
+    - get_candles(symbol, limit=..., timeframe=...)
+    - fetch_candles(...)  (alias)
+    - get_latest_candles(...) (alias)
+    - run_full_backfill(symbols=None, per_symbol_limit=1000)
+    - fetch_multi(symbols, ...)
+    - set_rate_limits(dict)
+    - health_check()
+Design goals: backward-compatible, fail-soft, logs útiles para Render.
 """
-from __future__ import annotations
 
-import json
-import logging
+from __future__ import annotations
 import os
+import sys
 import time
+import json
 import math
-from typing import Optional, Dict, Any, List, Callable, Tuple
+import logging
+import threading
+from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime, timedelta
 
 import pandas as pd
 import numpy as np
 import requests
 
-# opcionales: ccxt y yfinance
+# Optional libs
 try:
-    import ccxt
+    import finnhub  # type: ignore
+except Exception:
+    finnhub = None
+try:
+    import ccxt  # type: ignore
 except Exception:
     ccxt = None
-
 try:
-    import yfinance as yf
+    import yfinance as yf  # type: ignore
 except Exception:
     yf = None
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+# Try to import Postgres storage if exists
+PgStorage = None
+pg = None
+try:
+    mod = __import__("core.storage_postgres", fromlist=["PostgresStorage"])
+    if hasattr(mod, "PostgresStorage"):
+        PgStorage = getattr(mod, "PostgresStorage")
+        try:
+            pg = PgStorage()
+        except Exception:
+            pg = None
+except Exception:
+    pg = None
 
-# Default interval mapping for ccxt/timeframes (común)
-_CCXT_INTERVALS = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h",
-    "2h": "2h",
-    "4h": "4h",
-    "6h": "6h",
-    "8h": "8h",
-    "12h": "12h",
-    "1d": "1d",
-    "3d": "3d",
-    "1w": "1w",
-    "1M": "1M",
+# Paths
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_DIR = os.path.join(ROOT, "data")
+CACHE_DIR = os.path.join(DATA_DIR, "cache")
+CONF_DIR = os.path.join(DATA_DIR, "config")
+DB_DIR = os.path.join(DATA_DIR, "db")
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CONF_DIR, exist_ok=True)
+os.makedirs(DB_DIR, exist_ok=True)
+
+# Logging
+logger = logging.getLogger("core.fetch")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(ch)
+
+# ENV keys
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip() or None
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip() or None
+BINANCE_API_SECRET = os.getenv("BINANCE_SECRET", "").strip() or None
+
+# Default rate limits (per minute)
+DEFAULT_RATE_LIMITS = {
+    "finnhub": 240,   # per minute (as you mentioned)
+    "binance": 1200,  # per minute for fetches
+    "yfinance": 3000, # effectively unconstrained locally, but keep high
+    "requests": 6000  # generic HTTP requests per minute allowance
 }
 
-# Helper util
-def now_ms() -> int:
-    return int(time.time() * 1000)
+# Token-bucket rate limiter implementation (thread-safe)
+class TokenBucket:
+    def __init__(self, rate_per_minute: int, capacity: Optional[int] = None):
+        self.rate_per_minute = max(1, int(rate_per_minute))
+        # tokens per second
+        self._rate_per_sec = self.rate_per_minute / 60.0
+        self.capacity = capacity or max(1, self.rate_per_minute)
+        self._tokens = float(self.capacity)
+        self._last = time.time()
+        self._lock = threading.Lock()
 
-
-def ms_from_iso(iso: str) -> int:
-    """Convierte 'YYYY-mm-dd' o timestamp iso a ms"""
-    try:
-        return int(pd.to_datetime(iso, utc=True).value // 10 ** 6)
-    except Exception:
-        raise
-
-
-class RateLimiter:
-    """
-    Rate limiter muy simple: permite N requests por ventana de segundos.
-    No es extremadamente preciso, pero evita picos brutales.
-    """
-
-    def __init__(self, max_requests: int = 100, per_seconds: int = 60):
-        self.max_requests = max_requests
-        self.per_seconds = per_seconds
-        self._timestamps: List[float] = []
-
-    def wait(self):
-        now = time.time()
-        window_start = now - self.per_seconds
-        # limpiar timestamps viejos
-        self._timestamps = [t for t in self._timestamps if t >= window_start]
-        if len(self._timestamps) >= self.max_requests:
-            earliest = self._timestamps[0]
-            sleep_for = (earliest + self.per_seconds) - now
-            if sleep_for > 0:
-                logger.debug("RateLimiter sleeping %.2fs", sleep_for)
-                time.sleep(sleep_for)
-        self._timestamps.append(time.time())
-
-
-class FinnhubKeyManager:
-    """
-    Rotación simple de keys para Finnhub (lista). Devuelve key round-robin.
-    """
-
-    def __init__(self, keys: Optional[List[str]] = None):
-        self.keys = keys or []
-        self._i = 0
-
-    def next_key(self) -> Optional[str]:
-        if not self.keys:
-            return None
-        key = self.keys[self._i % len(self.keys)]
-        self._i += 1
-        return key
-
-
-class Fetcher:
-    """
-    Clase principal.
-
-    Constructor:
-        Fetcher(storage=None, config=None)
-
-    config: dict opcional con estructura muy simple:
-        {
-            "api": {
-                "binance": {"api_key": "", "api_secret": "", "rate_limit_per_min": 1200},
-                "finnhub": {"keys": ["k1", "k2"], "rate_limit_per_min": 60}
-            },
-            "default_data_source": "binance"  # o "finnhub" o "yfinance"
-        }
-
-    Métodos principales:
-        fetch_ohlcv(symbol, interval, start_ms=None, end_ms=None) -> pd.DataFrame
-        backfill_range(symbol, interval, start_ms, end_ms, callback=None)
-        now_ms(), ms_from_iso()
-    """
-
-    def __init__(self, storage: Optional[Any] = None, config: Optional[Dict[str, Any]] = None):
-        self.storage = storage
-        self.config = config or {}
-        # try load config.json from repo root if present and config is empty
-        if not config:
-            cfg_path = os.getenv("PROJECT_CONFIG_PATH", "config.json")
-            if os.path.exists(cfg_path):
-                try:
-                    with open(cfg_path, "r", encoding="utf-8") as f:
-                        cfg_json = json.load(f)
-                        self.config.update(cfg_json)
-                except Exception:
-                    logger.exception("Error leyendo config.json, ignorando")
-
-        # Setup finnhub key manager
-        fin_cfg = self.config.get("api", {}).get("finnhub", {})
-        fin_keys = fin_cfg.get("keys") if isinstance(fin_cfg, dict) else None
-        self.finnhub_keys = FinnhubKeyManager(fin_keys)
-
-        # Rate limiters
-        bin_rate = self.config.get("api", {}).get("binance", {}).get("rate_limit_per_min", 1200)
-        fin_rate = self.config.get("api", {}).get("finnhub", {}).get("rate_limit_per_min", 60)
-        self.binance_limiter = RateLimiter(max_requests=max(1, bin_rate), per_seconds=60)
-        self.finnhub_limiter = RateLimiter(max_requests=max(1, fin_rate), per_seconds=60)
-
-        # Init ccxt binance exchange lazily
-        self._ccxt_exchange = None
-        self._maybe_init_ccxt()
-
-    # -------------------------
-    # Helpers
-    # -------------------------
-    def _maybe_init_ccxt(self):
-        if ccxt is None:
-            return
-        if self._ccxt_exchange is not None:
-            return
-        bin_cfg = self.config.get("api", {}).get("binance", {})
-        api_key = bin_cfg.get("api_key") if isinstance(bin_cfg, dict) else None
-        api_secret = bin_cfg.get("api_secret") if isinstance(bin_cfg, dict) else None
-        try:
-            exchange = ccxt.binance({
-                "enableRateLimit": True,
-                "apiKey": api_key,
-                "secret": api_secret,
-                "options": {"defaultType": "spot"},
-            })
-            self._ccxt_exchange = exchange
-        except Exception:
-            logger.exception("No se pudo inicializar ccxt.binance")
-
-    @staticmethod
-    def normalize_symbol(symbol: str) -> str:
-        """Normaliza símbolos simples (quita espacios, mayúsculas)."""
-        return symbol.strip().upper()
-
-    @staticmethod
-    def _is_crypto(symbol: str) -> bool:
-        """Heurística: si acaba en USDT o contiene 'USD' o mezcla mayúsculas sin punto -> crypto."""
-        s = symbol.upper()
-        if s.endswith("USDT") or s.endswith("BTC") or s.endswith("ETH"):
-            return True
-        # si contiene slash (p.e. 'BTC/USDT') lo consideramos crypto
-        if "/" in s:
-            return True
-        # simple fallback: si contiene '.' o '-' lo consideramos stock (p.e. IBE.MC)
-        if "." in s or "-" in s:
-            return False
-        # otherwise, assume stock if shorter than 5? (heurística)
-        if len(s) <= 5:
-            # pero si incluye 'USD' treat as crypto
-            if "USD" in s:
+    def consume(self, tokens: float = 1.0) -> bool:
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last
+            self._last = now
+            self._tokens = min(self.capacity, self._tokens + elapsed * self._rate_per_sec)
+            if self._tokens >= tokens:
+                self._tokens -= tokens
                 return True
-            return True
+            return False
+
+    def wait_for(self, tokens: float = 1.0, timeout: float = 10.0):
+        """Block (polling) until tokens available or timeout. Returns True if consumed."""
+        deadline = time.time() + timeout
+        while time.time() <= deadline:
+            if self.consume(tokens):
+                return True
+            time.sleep(0.05)
         return False
 
-    @staticmethod
-    def _ccxt_symbol(symbol: str) -> str:
-        """Convierte 'BTCUSDT' -> 'BTC/USDT' para ccxt si hace falta."""
-        s = symbol.strip().upper()
-        if "/" in s:
-            return s
-        # heurística simple: split last 3 or 4 chars as quote (USDT->4, USD->3)
-        # prefer common suffixes
-        common_quotes = ["USDT", "BUSD", "USDC", "USD"]
-        for q in common_quotes:
-            if s.endswith(q):
-                base = s[: -len(q)]
-                return f"{base}/{q}"
-        # fallback: last 3 chars:
-        if len(s) > 6:
-            return f"{s[:-3]}/{s[-3:]}"
-        # as last fallback, return s
-        return s
+# Global rate buckets per-provider
+_rate_buckets_lock = threading.Lock()
+_rate_buckets: Dict[str, TokenBucket] = {}
 
-    # -------------------------
-    # Fetchers por fuente
-    # -------------------------
-    def _fetch_binance_ohlcv(self, symbol: str, interval: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None) -> pd.DataFrame:
-        """Usa ccxt para obtener OHLCV desde Binance. Devuelve df con ts (ms) y columnas OHLCV."""
-        if ccxt is None:
-            raise RuntimeError("ccxt no está instalado")
+def init_rate_buckets(custom_limits: Optional[Dict[str, int]] = None):
+    with _rate_buckets_lock:
+        lims = dict(DEFAULT_RATE_LIMITS)
+        if custom_limits:
+            lims.update(custom_limits)
+        for k, v in lims.items():
+            _rate_buckets[k] = TokenBucket(rate_per_minute=int(v), capacity=int(max(1, v)))
 
-        self._maybe_init_ccxt()
-        if self._ccxt_exchange is None:
-            raise RuntimeError("ccxt exchange no inicializado (ver config)")
+# initialize defaults
+init_rate_buckets()
 
-        tf = _CCXT_INTERVALS.get(interval, interval)
-        symbol_ccxt = self._ccxt_symbol(symbol)
-        limit_per_fetch = 1000  # ccxt límite por llamada (aprox)
-        all_rows = []
+def set_rate_limits(limits: Dict[str, int]):
+    """Update rate limits at runtime. limits: {'finnhub':240, 'binance':1200}"""
+    init_rate_buckets(limits or {})
 
-        # ccxt uses milliseconds since epoch for since param.
-        since = int(start_ms) if start_ms else None
-        stop_at = int(end_ms) if end_ms else None
-        self.binance_limiter.wait()
-
-        # fetch iteratively
-        while True:
+# Retry/backoff helper
+def with_retries(fn, retries=4, backoff_base=0.8, allowed_exceptions=(Exception,), rate_bucket_key: Optional[str]=None):
+    """
+    Returns a wrapper that applies retries/backoff and respects a token bucket if provided.
+    Usage: call wrapper(*args, **kwargs)
+    """
+    def wrapper(*args, **kwargs):
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            # rate limit wait
+            if rate_bucket_key:
+                bucket = _rate_buckets.get(rate_bucket_key)
+                if bucket:
+                    ok = bucket.wait_for(timeout=10.0)
+                    if not ok:
+                        logger.warning("Rate bucket timeout for %s", rate_bucket_key)
             try:
-                ohlcv = self._ccxt_exchange.fetch_ohlcv(symbol_ccxt, timeframe=tf, since=since, limit=limit_per_fetch)
-            except ccxt.NetworkError as e:
-                logger.warning("ccxt network error: %s (retry)", e)
-                time.sleep(1)
-                continue
-            except ccxt.ExchangeError as e:
-                logger.error("ccxt exchange error: %s", e)
-                raise
+                return fn(*args, **kwargs)
+            except allowed_exceptions as e:
+                last_exc = e
+                sleep_time = backoff_base * (2 ** (attempt - 1)) + (0.1 * attempt)
+                logger.debug("Retry %d/%d for %s after %s s due to %s", attempt, retries, getattr(fn, "__name__", "fn"), sleep_time, repr(e))
+                time.sleep(sleep_time)
+        # all retries failed
+        logger.exception("Function %s failed after %d retries: %s", getattr(fn, "__name__", "fn"), retries, last_exc)
+        raise last_exc
+    return wrapper
 
-            if not ohlcv:
-                break
-            # ccxt OHLCV format: [ts, open, high, low, close, volume]
-            all_rows.extend(ohlcv)
-            # advance since for next page
-            last_ts = ohlcv[-1][0]
-            # break if we've reached stop_at
-            if stop_at and last_ts >= stop_at:
-                break
-            # next since = last_ts + 1
-            since = last_ts + 1
-            # safety: if len < limit -> finished
-            if len(ohlcv) < limit_per_fetch:
-                break
-            # small sleep to respect rate limit
-            time.sleep(0.2)
-
-        if not all_rows:
-            return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
-
-        df = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
-        # ensure numeric and int ms
-        df["ts"] = df["ts"].astype("int64")
-        numeric_cols = ["open", "high", "low", "close", "volume"]
-        for c in numeric_cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df
-
-    def _fetch_yfinance_ohlcv(self, symbol: str, interval: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None) -> pd.DataFrame:
-        """Usa yfinance para acciones. interval debe ser streaming compatible (1m,5m,1h,1d)."""
-        if yf is None:
-            raise RuntimeError("yfinance no está instalado")
-        # yfinance interval mapping: '1m','2m','5m','15m','30m','60m','90m','1h' etc
-        yf_interval = interval
-        # yfinance uses period or start/end in datetime strings
-        start = pd.to_datetime(start_ms, unit="ms") if start_ms else None
-        end = pd.to_datetime(end_ms, unit="ms") if end_ms else None
+# Helper to ensure df structure
+def _ensure_df_structure(df: pd.DataFrame) -> pd.DataFrame:
+    expected = ["timestamp", "open", "high", "low", "close", "volume"]
+    for c in expected:
+        if c not in df.columns:
+            df[c] = pd.NA
+    # normalize timestamp column
+    if "timestamp" in df.columns:
         try:
-            # yfinance returns timezone-aware index
-            df = yf.download(tickers=symbol, interval=yf_interval, start=start, end=end, progress=False, threads=False)
-            if df is None or df.empty:
-                return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
-            df = df.reset_index()
-            # index name may be Datetime
-            ts = pd.to_datetime(df.iloc[:, 0], utc=True)
-            df2 = pd.DataFrame({
-                "ts": (ts.view("int64") // 10 ** 6).astype("int64"),
-                "open": df["Open"].astype(float),
-                "high": df["High"].astype(float),
-                "low": df["Low"].astype(float),
-                "close": df["Close"].astype(float),
-                "volume": df["Volume"].astype(float),
-            })
-            return df2
-        except Exception as e:
-            logger.exception("yfinance fetch failed for %s: %s", symbol, e)
-            raise
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        except Exception:
+            df["timestamp"] = df["timestamp"]
+    # keep column order
+    return df[expected]
 
-    def _fetch_finnhub_ohlcv(self, symbol: str, interval: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None) -> pd.DataFrame:
-        """
-        Usa Finnhub REST API. Documentación: https... (no se consulta aquí)
-        Endpoint esperado: /stock/candle?symbol=...&resolution=...&from=...&to=...
-        resolution: 1,5,15,30,60,D,W,M
-        """
-        key = self.finnhub_keys.next_key()
-        if not key:
-            raise RuntimeError("No Finnhub API key configured")
-        # resolution mapping
-        res_map = {
-            "1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60",
-            "1d": "D", "1w": "W", "1M": "M"
-        }
-        resolution = res_map.get(interval, interval)
-        url = "https://finnhub.io/api/v1/stock/candle"
-        params = {
-            "symbol": symbol,
-            "resolution": resolution,
-            "from": int(math.floor((start_ms or (now_ms() - 86400 * 1000)) / 1000)),
-            "to": int(math.floor((end_ms or now_ms()) / 1000)),
-            "token": key,
-        }
-        self.finnhub_limiter.wait()
-        resp = requests.get(url, params=params, timeout=30)
-        if resp.status_code != 200:
-            logger.error("Finnhub error %s: %s", resp.status_code, resp.text)
-            raise RuntimeError(f"Finnhub error {resp.status_code}")
-        j = resp.json()
-        # Finnhub returns: s (status), c (close array), h, l, o, v, t (array of timestamps seconds)
-        if j.get("s") != "ok":
-            # possible values: no_data
-            logger.warning("Finnhub returned non-ok status: %s", j.get("s"))
-            return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
-        ts = [int(t * 1000) for t in j.get("t", [])]
-        df = pd.DataFrame({
-            "ts": ts,
-            "open": j.get("o", []),
-            "high": j.get("h", []),
-            "low": j.get("l", []),
-            "close": j.get("c", []),
-            "volume": j.get("v", []),
-        })
-        # ensure types
-        df["ts"] = df["ts"].astype("int64")
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+# CSV persistence
+def _csv_path(symbol: str) -> str:
+    safe = symbol.replace("/", "_").replace(" ", "_")
+    return os.path.join(CACHE_DIR, f"{safe}.csv")
+
+def _save_csv(symbol: str, df: pd.DataFrame) -> bool:
+    try:
+        p = _csv_path(symbol)
+        # ensure timestamp serializable
+        if "timestamp" in df.columns:
+            d = df.copy()
+            d["timestamp"] = pd.to_datetime(d["timestamp"]).dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            d.to_csv(p, index=False)
+        else:
+            df.to_csv(p, index=False)
+        logger.debug("Saved CSV cache for %s -> %s", symbol, p)
+        return True
+    except Exception:
+        logger.exception("Failed to save CSV for %s", symbol)
+        return False
+
+def _load_csv(symbol: str, limit: Optional[int]=1000) -> pd.DataFrame:
+    p = _csv_path(symbol)
+    if not os.path.exists(p):
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    try:
+        df = pd.read_csv(p, parse_dates=["timestamp"], infer_datetime_format=True)
+        df = _ensure_df_structure(df)
+        if limit and len(df) > limit:
+            return df.sort_values("timestamp").iloc[-limit:].reset_index(drop=True)
         return df
+    except Exception:
+        logger.exception("Failed to load CSV for %s", symbol)
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
-    # -------------------------
-    # Public API
-    # -------------------------
-    def _choose_source(self, symbol: str) -> str:
-        """
-        Lógica para elegir fuente de datos:
-         - si es crypto -> binance (ccxt)
-         - else -> finnhub (si keys) o yfinance
-         - permite override en self.config['default_data_source']
-        """
-        override = self.config.get("default_data_source")
-        if override:
-            return override
-        s = self.normalize_symbol(symbol)
-        if self._is_crypto(s):
-            return "binance"
-        if self.finnhub_keys.keys:
-            return "finnhub"
-        # fallback
-        return "yfinance" if yf is not None else "binance"
+# Storage helpers (Postgres preferred)
+def _load_from_storage(symbol: str, limit: int=1000) -> pd.DataFrame:
+    if pg and hasattr(pg, "load_candles"):
+        try:
+            df = pg.load_candles(symbol, limit=limit)
+            if isinstance(df, pd.DataFrame):
+                return _ensure_df_structure(df)
+        except Exception:
+            logger.exception("pg.load_candles failed for %s", symbol)
+    # fallback to CSV
+    return _load_csv(symbol, limit=limit)
 
-    def fetch_ohlcv(self, symbol: str, interval: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None) -> pd.DataFrame:
-        """
-        Devuelve DataFrame con columnas: ts (ms int), open, high, low, close, volume.
-        Elige fuente automáticamente si no se especifica. Lanza excepciones claras si falla.
-        """
-        symbol = self.normalize_symbol(symbol)
-        source = self._choose_source(symbol)
-        logger.debug("fetch_ohlcv: %s %s from %s", symbol, interval, source)
+def _save_to_storage(symbol: str, df: pd.DataFrame) -> bool:
+    if pg and hasattr(pg, "save_candles"):
+        try:
+            ok = pg.save_candles(symbol, df)
+            if ok:
+                return True
+        except Exception:
+            logger.exception("pg.save_candles failed for %s", symbol)
+    return _save_csv(symbol, df)
 
-        # implement retries with exponential backoff
-        attempts = 0
-        max_attempts = 4
-        backoff_base = 0.8
+# -------------------------
+# Network fetchers
+# -------------------------
 
-        while True:
+# FINNHUB fetcher (stock / crypto / forex depending on plan)
+def _fetch_with_finnhub(symbol: str, resolution: str = "1", count: int = 1000) -> pd.DataFrame:
+    """
+    resolution: '1','5','15','60','D' (Finnhub uses string resolutions)
+    count: approx number of candles -- we'll compute a from/until using now
+    """
+    if finnhub is None or FINNHUB_API_KEY is None:
+        logger.debug("Finnhub not available or FINNHUB_API_KEY missing")
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+    # Respect rate limits via token bucket
+    bucket_key = "finnhub"
+    bucket = _rate_buckets.get(bucket_key)
+    if bucket and not bucket.wait_for(timeout=10.0):
+        logger.warning("Finnhub rate bucket wait failed")
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+    try:
+        client = finnhub.Client(api_key=FINNHUB_API_KEY)  # type: ignore
+        # Compute from/until based on resolution and count (best-effort)
+        now = int(time.time())
+        # resolution to seconds heuristic
+        if resolution.upper() in ("D", "D1", "DAYS"):
+            span = 24*3600
+        else:
             try:
-                if source == "binance":
-                    return self._fetch_binance_ohlcv(symbol, interval, start_ms=start_ms, end_ms=end_ms)
-                elif source == "finnhub":
-                    return self._fetch_finnhub_ohlcv(symbol, interval, start_ms=start_ms, end_ms=end_ms)
-                elif source == "yfinance":
-                    return self._fetch_yfinance_ohlcv(symbol, interval, start_ms=start_ms, end_ms=end_ms)
-                else:
-                    raise RuntimeError(f"No data source configured for {source}")
-            except Exception as e:
-                attempts += 1
-                logger.warning("fetch_ohlcv failed attempt %d for %s: %s", attempts, symbol, e)
-                if attempts >= max_attempts:
-                    logger.exception("fetch_ohlcv finally failed for %s %s", symbol, interval)
-                    raise
-                sleep = backoff_base * (2 ** (attempts - 1)) + (0.1 * attempts)
-                time.sleep(sleep)
-
-    def backfill_range(self, symbol: str, interval: str, start_ms: int, end_ms: int, batch_window_ms: Optional[int] = None, callback: Optional[Callable[[pd.DataFrame], None]] = None) -> None:
-        """
-        Realiza backfill de un rango extenso dividiéndolo en ventanas manejables.
-        - batch_window_ms: si None, se calcula en función del interval (p.e. 1000 velas).
-        - callback: función que recibe DataFrame con velas y debe guardarlas en storage (p.e. storage.save_candles)
-        """
-        symbol = self.normalize_symbol(symbol)
-        if batch_window_ms is None:
-            # heurística (n velas por fetch)
-            candles_per_batch = 1000
-            # estimar ms por vela según interval
-            unit = interval.lower()
-            if unit.endswith("m"):
-                mins = int(unit[:-1]) if unit[:-1].isdigit() else 1
-                ms_per = mins * 60 * 1000
-            elif unit.endswith("h"):
-                hours = int(unit[:-1]) if unit[:-1].isdigit() else 1
-                ms_per = hours * 60 * 60 * 1000
-            elif unit.endswith("d"):
-                days = int(unit[:-1]) if unit[:-1].isdigit() else 1
-                ms_per = days * 24 * 60 * 60 * 1000
-            else:
-                ms_per = 60 * 1000
-            batch_window_ms = candles_per_batch * ms_per
-
-        cursor = int(start_ms)
-        end = int(end_ms)
-        while cursor < end:
-            window_end = min(cursor + batch_window_ms - 1, end)
-            try:
-                df = self.fetch_ohlcv(symbol, interval, start_ms=cursor, end_ms=window_end)
-                if df is None or df.empty:
-                    logger.info("No data in window %d-%d for %s", cursor, window_end, symbol)
-                else:
-                    if callback:
-                        callback(df)
-                    else:
-                        # si storage disponible, intentar guardar con la API save_candles
-                        if self.storage and hasattr(self.storage, "save_candles"):
-                            try:
-                                self.storage.save_candles(df, symbol, interval)
-                            except Exception:
-                                logger.exception("Error saving candles for %s", symbol)
-                # avanzar cursor al final de la ventana + 1 ms
-                if df is not None and not df.empty:
-                    last_ts = int(df["ts"].max())
-                    cursor = last_ts + 1
-                else:
-                    cursor = window_end + 1
+                span = int(resolution) * 60
             except Exception:
-                logger.exception("Error en backfill window %d-%d for %s", cursor, window_end, symbol)
-                # avanzar para evitar bucle infinito (pero con backoff)
-                cursor = window_end + 1
-                time.sleep(1)
+                span = 60
+        from_ts = now - int(span * max(1, count))
+        to_ts = now
+        # Finnhub: client.stock_candles(symbol, resolution, _from, to)
+        # The symbol format depends on exchange (user must provide appropriate symbol)
+        resp = client.stock_candles(symbol, resolution, from_ts, to_ts)  # may return dict with 'c','t','o','h','l','v'
+        if not resp or not isinstance(resp, dict) or "c" not in resp:
+            logger.debug("Finnhub returned no candles for %s", symbol)
+            return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        ts = resp.get("t", [])
+        df = pd.DataFrame({
+            "timestamp": pd.to_datetime(ts, unit="s"),
+            "open": resp.get("o", []),
+            "high": resp.get("h", []),
+            "low": resp.get("l", []),
+            "close": resp.get("c", []),
+            "volume": resp.get("v", []),
+        })
+        return _ensure_df_structure(df)
+    except Exception:
+        logger.exception("Finnhub fetch failed for %s", symbol)
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
-    # alias util
-    def ms_from_iso(self, iso: str) -> int:
-        return ms_from_iso(iso)
+# Binance via ccxt
+def _fetch_with_ccxt_binance(symbol: str, timeframe: str = "1m", limit: int = 1000) -> pd.DataFrame:
+    if ccxt is None:
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    # rate bucket
+    bucket_key = "binance"
+    bucket = _rate_buckets.get(bucket_key)
+    if bucket and not bucket.wait_for(timeout=10.0):
+        logger.warning("Binance rate bucket wait failed")
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    try:
+        params = {"enableRateLimit": True}
+        if BINANCE_API_KEY:
+            params.update({"apiKey": BINANCE_API_KEY, "secret": BINANCE_API_SECRET})
+        exchange = ccxt.binance(params)
+        # symbol must be ccxt format like 'BTC/USDT'
+        s = symbol
+        if "/" not in s:
+            # try to sanitize: 'BTCUSDT' -> 'BTC/USDT'
+            if s.endswith("USDT"):
+                s = f"{s[:-4]}/USDT"
+            elif s.endswith("BTC"):
+                s = f"{s[:-3]}/BTC"
+        ohlcv = exchange.fetch_ohlcv(s, timeframe=timeframe, limit=limit)
+        if not ohlcv:
+            return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return _ensure_df_structure(df)
+    except Exception:
+        logger.exception("ccxt/binance fetch failed for %s", symbol)
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
-    def now_ms(self) -> int:
-        return now_ms()
+# yfinance fallback
+def _fetch_with_yfinance(symbol: str, period: str = "1y", interval: str = "1d", limit: Optional[int] = None) -> pd.DataFrame:
+    if yf is None:
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    try:
+        tk = symbol
+        # sanitize: remove slash if present (yfinance uses 'AAPL' or 'AAPL.MX' etc)
+        tk = tk.replace("/", "-")
+        hist = yf.Ticker(tk).history(period=period, interval=interval, auto_adjust=False)
+        if hist is None or hist.empty:
+            return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        df = hist.reset_index().rename(columns={"Date": "timestamp", "Open": "open", "High":"high", "Low":"low", "Close":"close", "Volume":"volume"})
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        if limit and len(df) > limit:
+            df = df.iloc[-limit:]
+        return _ensure_df_structure(df)
+    except Exception:
+        logger.exception("yfinance fetch failed for %s", symbol)
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+# Generic network attempt respecting priority and rate-limits
+def _network_get_candles(symbol: str, limit: int = 1000, timeframe: Optional[str] = None) -> pd.DataFrame:
+    """
+    Try in order:
+     - Finnhub (if FINNHUB_API_KEY and finnhub available)
+     - Binance via ccxt heuristics (if ccxt available)
+     - yfinance (fallback for equities)
+    """
+    sym_up = symbol.upper()
+    # Try Finnhub for tickers if configured (best for many stocks)
+    if FINNHUB_API_KEY and finnhub:
+        # choose resolution: if timeframe provided map to finnhub resolution (best-effort)
+        resolution = None
+        if timeframe:
+            # map '1m'->'1', '5m'->'5', '1d'->'D'
+            if timeframe.endswith("m"):
+                resolution = timeframe[:-1]
+            elif timeframe.endswith("h"):
+                resolution = str(int(timeframe[:-1]) * 60)
+            elif timeframe.lower() in ("1d","1D","D"):
+                resolution = "D"
+        else:
+            resolution = "1"  # default 1-min
+        try:
+            df = _fetch_with_finnhub(sym_up, resolution, count=limit)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            logger.exception("Finnhub attempt failed for %s", symbol)
+
+    # If looks like crypto (endswith USDT/BTC/ETH) try ccxt/binance
+    if ccxt:
+        crypto_markers = ("USDT", "BTC", "ETH", "BNB", "USDC")
+        if any(sym_up.endswith(m) for m in crypto_markers):
+            try:
+                tf = timeframe or "1m"
+                df = _fetch_with_ccxt_binance(sym_up, timeframe=tf, limit=limit)
+                if df is not None and not df.empty:
+                    return df
+            except Exception:
+                logger.exception("ccxt attempt failed for %s", symbol)
+
+    # fallback to yfinance for equities
+    if yf:
+        try:
+            interval = "1d"
+            if timeframe and timeframe.endswith("m"):
+                # yfinance does not support <1m trivial mapping; use 1d default
+                interval = "1d"
+            df = _fetch_with_yfinance(symbol, period="1y", interval=interval, limit=limit)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            logger.exception("yfinance attempt failed for %s", symbol)
+
+    # last resort: empty df
+    return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+# -------------------------
+# Public API
+# -------------------------
+def list_watchlist_assets() -> List[str]:
+    # Prefer Postgres storage listing if available
+    try:
+        if pg and hasattr(pg, "list_assets"):
+            out = pg.list_assets()
+            if isinstance(out, list):
+                return out
+            if isinstance(out, pd.DataFrame):
+                if "symbol" in out.columns:
+                    return out["symbol"].astype(str).tolist()
+                return out.iloc[:,0].astype(str).tolist()
+    except Exception:
+        logger.exception("pg.list_assets failed; falling back")
+
+    # Try config files
+    candidates = [os.path.join(CONF_DIR, "watchlist.csv"), os.path.join(CONF_DIR, "watchlist.json")]
+    for c in candidates:
+        if os.path.exists(c):
+            try:
+                if c.endswith(".csv"):
+                    df = pd.read_csv(c)
+                    if "symbol" in df.columns:
+                        return df["symbol"].astype(str).tolist()
+                    return df.iloc[:,0].astype(str).tolist()
+                else:
+                    j = json.load(open(c,"r",encoding="utf8"))
+                    if isinstance(j, list):
+                        return j
+                    if isinstance(j, dict):
+                        return list(j.keys())
+            except Exception:
+                logger.exception("Failed read watchlist file %s", c)
+                continue
+
+    # fallback
+    return ["BTCUSDT", "ETHUSDT", "AAPL", "TSLA"]
+
+def get_candles(symbol: str, limit: int = 1000, timeframe: Optional[str] = None, force_network: bool = False) -> pd.DataFrame:
+    """
+    Returns a DataFrame with columns timestamp, open, high, low, close, volume.
+    Strategy:
+      1) If not force_network: try storage (pg) via pg.load_candles
+      2) Try network get (Finnhub/ccxt/yfinance)
+      3) Save network result to storage (pg or csv)
+      4) If network fails, load from CSV/storage fallback
+    timeframe: string like '1m','5m','1h','1d' — used where supported
+    """
+    # 1) storage
+    if not force_network:
+        try:
+            df = _load_from_storage(symbol, limit=limit)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            logger.exception("load from storage failed for %s", symbol)
+
+    # 2) network
+    try:
+        df_net = _network_get_candles(symbol, limit=limit, timeframe=timeframe)
+        if isinstance(df_net, pd.DataFrame) and not df_net.empty:
+            # 3) save to storage
+            try:
+                _save_to_storage(symbol, df_net)
+            except Exception:
+                logger.exception("saving network result failed for %s", symbol)
+            return df_net
+    except Exception:
+        logger.exception("network_get_candles failed for %s", symbol)
+
+    # 4) fallback storage/csv
+    try:
+        return _load_from_storage(symbol, limit=limit)
+    except Exception:
+        logger.exception("final fallback load failed for %s", symbol)
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+# Aliases expected by other modules
+fetch_candles = get_candles
+get_latest_candles = get_candles
+fetch = get_candles
+
+def fetch_multi(symbols: List[str], limit_per_symbol:int = 1000, timeframe: Optional[str] = None, parallel: bool = True) -> Dict[str, pd.DataFrame]:
+    """
+    Fetch multiple symbols (either from storage or network). Returns dict symbol->DataFrame.
+    If parallel True uses threads (bounded).
+    """
+    results: Dict[str, pd.DataFrame] = {}
+    if not symbols:
+        return results
+
+    def _worker(sym):
+        try:
+            d = get_candles(sym, limit=limit_per_symbol, timeframe=timeframe)
+            results[sym] = d
+        except Exception:
+            logger.exception("fetch_multi failed for %s", sym)
+            results[sym] = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+    if parallel:
+        threads = []
+        for s in symbols:
+            t = threading.Thread(target=_worker, args=(s,), daemon=True)
+            threads.append(t)
+            t.start()
+            # avoid starting unlimited threads: small throttle
+            time.sleep(0.01)
+        for t in threads:
+            t.join(timeout=30)
+    else:
+        for s in symbols:
+            _worker(s)
+    return results
+
+def run_full_backfill(symbols: Optional[List[str]] = None, per_symbol_limit: int = 1000) -> Dict[str, Any]:
+    """
+    Full backfill: iterate over symbols and fetch network data, saving to storage.
+    Returns summary dict.
+    NOTE: This can be slow; call from background thread/process.
+    """
+    out: Dict[str, Any] = {"started_at": datetime.utcnow().isoformat(), "results": {}}
+    syms = symbols or list_watchlist_assets()
+    for s in syms:
+        try:
+            df = _network_get_candles(s, limit=per_symbol_limit)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                saved = _save_to_storage(s, df)
+                out["results"][s] = {"rows": len(df), "saved": bool(saved)}
+            else:
+                # try to load fallback and report
+                df2 = _load_from_storage(s, limit=per_symbol_limit)
+                out["results"][s] = {"rows": len(df2) if isinstance(df2, pd.DataFrame) else 0, "saved": False}
+        except Exception as e:
+            logger.exception("Backfill error for %s", s)
+            out["results"][s] = {"error": str(e)}
+    out["finished_at"] = datetime.utcnow().isoformat()
+    return out
+
+def health_check() -> Dict[str, Any]:
+    """Return a dict summarizing available modules and status (useful for UI)."""
+    return {
+        "time": datetime.utcnow().isoformat(),
+        "modules": {
+            "finnhub": bool(finnhub and FINNHUB_API_KEY),
+            "ccxt": bool(ccxt),
+            "yfinance": bool(yf),
+            "pg_storage": bool(pg),
+        },
+        "rate_buckets": {k: getattr(v, "rate_per_minute", None) for k,v in _rate_buckets.items()},
+        "cache_files": len([f for f in os.listdir(CACHE_DIR) if f.endswith(".csv")]) if os.path.exists(CACHE_DIR) else 0
+    }
+
+# compatibility exports
+list_assets = list_watchlist_assets
+run_backfill = run_full_backfill
+# End of file
