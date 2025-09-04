@@ -24,6 +24,9 @@ import streamlit as st
 
 from dashboard import utils
 
+if "task_manual_backfill" not in st.session_state:
+    st.session_state["task_manual_backfill"] = {"status": "idle", "result": None}
+    
 # ---------- helpers ----------
 def _to_df(wl):
     """

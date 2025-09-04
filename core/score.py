@@ -42,7 +42,7 @@ Estructura de config (ejemplo):
 from __future__ import annotations
 import math
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple
 
 import pandas as pd
@@ -98,7 +98,7 @@ class NormCfg:
 class ComponentCfg:
     source: Optional[str] = None     # nombre de columna
     expr: Optional[str] = None       # pandas.eval expression
-    norm: NormCfg = NormCfg()
+    norm: NormCfg = field(default_factory=NormCfg)
     weight: float = 1.0              # peso en agregación
 
 @dataclass

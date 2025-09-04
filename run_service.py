@@ -184,6 +184,10 @@ if __name__ == "__main__":
     start_retention_job(storage, dry_run=True, interval_hours=24)
 
     orch = Orchestrator(storage=storage)
+    # arrancar processor de jobs para consumir requests 'backfill' insertadas por la UI
+    from run_service import start_job_processor_thread
+    _job_thread = start_job_processor_thread(storage, orch, poll_interval_secs=8, batch_limit=4)
+
 
     # try init db (idempotent)
     try:
@@ -272,3 +276,177 @@ def start_retention_job(storage, retention_map=None, interval_hours=24, dry_run=
     return t
 
 # --- Fin parche run_service/scheduler ---
+
+# --- Inicio parche run_service.py: processor de jobs (backfill) ---
+import json
+import threading
+import time
+import logging
+from typing import Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
+
+def _fetch_pending_jobs_from_db(storage, limit: int = 5) -> list:
+    """
+    Lee filas con status='pending' de la tabla jobs.
+    Devuelve lista de dicts {id, name, details(json), started_at, ...}
+    Usa storage.get_conn() si existe, o intenta usar psycopg2 con DATABASE_URL.
+    """
+    rows = []
+    try:
+        if hasattr(storage, "get_conn"):
+            with storage.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, name, status, details FROM jobs WHERE status = %s ORDER BY id ASC LIMIT %s", ('pending', limit))
+                    fetched = cur.fetchall()
+                    for r in fetched:
+                        # r may be tuple (id,name,status,details)
+                        jid, name, status, details = r
+                        try:
+                            details_obj = json.loads(details) if details else {}
+                        except Exception:
+                            details_obj = details
+                        rows.append({"id": jid, "name": name, "details": details_obj})
+            return rows
+    except Exception:
+        logger.exception("Error leyendo jobs via storage.get_conn")
+
+    # Fallback: try psycopg2 + DATABASE_URL
+    try:
+        import os, psycopg2
+        dsn = os.getenv("DATABASE_URL")
+        if not dsn:
+            return []
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name, status, details FROM jobs WHERE status = %s ORDER BY id ASC LIMIT %s", ('pending', limit))
+                fetched = cur.fetchall()
+                for jid, name, status, details in fetched:
+                    try:
+                        details_obj = json.loads(details) if details else {}
+                    except Exception:
+                        details_obj = details
+                    rows.append({"id": jid, "name": name, "details": details_obj})
+        return rows
+    except Exception:
+        logger.exception("Error leyendo jobs via DATABASE_URL fallback")
+        return []
+
+def _update_job_status(storage, job_id: int, status: str, details: Optional[Dict[str, Any]] = None):
+    """
+    Actualiza job.status en la tabla jobs.
+    Usa storage.update_job(job_id, status, details) si existe, si no, intenta SQL directo.
+    """
+    try:
+        if hasattr(storage, "update_job"):
+            # storage.update_job espera (job_id, status, details_dict)
+            return storage.update_job(job_id, status, details or {})
+    except Exception:
+        logger.exception("storage.update_job falló para job %s", job_id)
+
+    # fallback SQL
+    try:
+        if hasattr(storage, "get_conn"):
+            with storage.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE jobs SET status=%s, details=COALESCE(%s, details), finished_at = CASE WHEN %s IN ('success','failed') THEN now() ELSE finished_at END WHERE id=%s",
+                                (status, json.dumps(details) if details else None, status, job_id))
+                conn.commit()
+            return True
+    except Exception:
+        logger.exception("Fallback update_job SQL falló para job %s", job_id)
+    return False
+
+def _process_single_job(storage, orchestrator, job: dict):
+    """
+    Procesa un job tipo 'backfill':
+      - marca job como 'running'
+      - extrae details {'asset','interval'}
+      - llama orchestrator.run_backfill_for(asset, interval, ...)
+      - marca job 'success' o 'failed' y guarda detalles
+    """
+    job_id = job.get("id")
+    name = job.get("name")
+    details = job.get("details") or {}
+
+    logger.info("Procesando job id=%s name=%s details=%s", job_id, name, details)
+    # marcar running
+    try:
+        _update_job_status(storage, job_id, "running", {"started_by": "worker"})
+    except Exception:
+        logger.exception("No se pudo marcar job running")
+
+    try:
+        if name == "backfill":
+            asset = details.get("asset")
+            interval = details.get("interval")
+            # determinar start/end: si el details contiene start_ms/end_ms usamos, si no pasamos None para reanudar incremental en orchestrator
+            start_ms = details.get("start_ms")
+            end_ms = details.get("end_ms")
+            # ejecutar backfill mediante orchestrator (si existe)
+            if hasattr(orchestrator, "run_backfill_for"):
+                res = orchestrator.run_backfill_for(asset, interval, start_ms=start_ms, end_ms=end_ms)
+            else:
+                # fallback: si fetcher existe directamente (sin orchestrator) intentar simple fetcher.backfill_range
+                fetcher = getattr(orchestrator, "fetcher", None) or getattr(storage, "fetcher", None)
+                if fetcher and hasattr(fetcher, "backfill_range"):
+                    # guardamos usando storage.save_candles si existe
+                    def _cb(batch):
+                        try:
+                            if hasattr(storage, "save_candles"):
+                                storage.save_candles(asset, batch)
+                        except Exception:
+                            logger.exception("Error guardando batch en backup flow")
+                    fetcher.backfill_range(asset, interval, start_ms or 0, end_ms or fetcher.now_ms(), callback=_cb)
+                    res = {"status": "done", "note": "fetched via fetcher"}
+                else:
+                    raise RuntimeError("Ni orchestrator.run_backfill_for ni fetcher.backfill_range disponibles")
+            # marcar success y guardar resultado summary
+            _update_job_status(storage, job_id, "success", {"result": res})
+            logger.info("Job %s processed successfully", job_id)
+            return True
+        else:
+            # soportar otros tipos de jobs en el futuro
+            logger.warning("Job type no soportado por worker: %s", name)
+            _update_job_status(storage, job_id, "failed", {"error": "unsupported_job_type"})
+            return False
+    except Exception as e:
+        logger.exception("Error processing job id=%s: %s", job_id, e)
+        _update_job_status(storage, job_id, "failed", {"error": str(e)})
+        return False
+
+def start_job_processor_thread(storage, orchestrator, poll_interval_secs: int = 10, batch_limit: int = 5, run_in_thread: bool = True):
+    """
+    Lanza thread que consulta jobs pendings cada poll_interval_secs y los procesa.
+    - storage: instancia PostgresStorage u otra que implemente get_conn/update_job/save_candles
+    - orchestrator: instancia de Orchestrator con run_backfill_for
+    Devuelve el objeto Thread (si run_in_thread=True) o None si ejecuta en mismo hilo.
+    """
+    def _loop():
+        logger.info("Job processor arrancado (poll_interval=%ss)", poll_interval_secs)
+        while True:
+            try:
+                jobs = _fetch_pending_jobs_from_db(storage, limit=batch_limit)
+                if not jobs:
+                    time.sleep(poll_interval_secs)
+                    continue
+                for job in jobs:
+                    try:
+                        _process_single_job(storage, orchestrator, job)
+                    except Exception:
+                        logger.exception("Error procesando job %s", job)
+                # pequeña pausa entre batches para no saturar DB
+                time.sleep(0.5)
+            except Exception:
+                logger.exception("Job processor loop fallo, durmiendo 5s")
+                time.sleep(5)
+
+    if run_in_thread:
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        return t
+    else:
+        _loop()
+        return None
+
+# --- Fin parche run_service.py: processor de jobs (backfill) ---
