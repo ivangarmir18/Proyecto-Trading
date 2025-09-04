@@ -105,12 +105,17 @@ st.set_page_config(page_title='Trading Intelligence — Full Dashboard', layout=
 # ---------------------------
 @st.cache_resource
 def get_storage() -> Optional[PostgresStorage]:
+    """
+    Devuelve un singleton de storage (cacheado por Streamlit).
+    No recibe argumentos (evita problemas de hashing).
+    """
     if make_storage_from_env is None:
         st.warning('Fábrica de storage no disponible (make_storage_from_env). Algunas funciones estarán deshabilitadas.')
         return None
     try:
         s = make_storage_from_env()
         try:
+            # Init DB es idempotente; lo intentamos para facilitar despliegues.
             s.init_db()
         except Exception:
             logger.exception('init_db fallo (continuando)')
@@ -120,12 +125,29 @@ def get_storage() -> Optional[PostgresStorage]:
         st.error(f'No se pudo conectar a la DB: {e}')
         return None
 
+# IMPORTANT: Streamlit attempts to hash/cache function arguments.
+# To avoid UnhashableParamError when passing objects like PostgresStorage or Orchestrator,
+# we name parameters with a leading underscore so Streamlit will not hash them.
 @st.cache_resource
-def get_orchestrator(storage: Optional[PostgresStorage]) -> Optional[Orchestrator]:
+def get_orchestrator(_storage: Optional[PostgresStorage] = None, _config: Optional[Dict[str, Any]] = None) -> Optional[Orchestrator]:
+    """
+    Devuelve un Orchestrator instanciado y cacheado por Streamlit.
+
+    Nota: parámetros con _ leading underscore NO son hasheados por Streamlit,
+    lo que evita errores al pasar objetos no-hasheables (p. ej. conexiones DB).
+    """
     if Orchestrator is None:
         return None
     try:
-        return Orchestrator(storage)
+        storage = _storage
+        # si no se pasó storage explícitamente, intentar construir el singleton
+        if storage is None:
+            try:
+                storage = get_storage()
+            except Exception:
+                storage = None
+        config = _config or {}
+        return Orchestrator(storage, config=config)
     except Exception:
         logger.exception('No se pudo crear orchestrator')
         return None
@@ -295,7 +317,7 @@ def backfill_tab(storage: Optional[PostgresStorage], orchestrator: Optional[Orch
                 st.error('Completa asset y interval')
             else:
                 try:
-                    with st.spinner('Ejecutando backfill...'): 
+                    with st.spinner('Ejecutando backfill...'):
                         # El orchestrator puede exponer init_and_backfill o run_backfill_for
                         if hasattr(orchestrator, 'run_backfill_for'):
                             orchestrator.run_backfill_for(asset2.strip(), interval2.strip())
@@ -375,7 +397,14 @@ def assets_tab(storage: Optional[PostgresStorage]):
                 if df.empty:
                     st.info('No hay velas')
                 else:
-                    st.line_chart(df.set_index('ts')['close'])
+                    # Preferimos mostrar gráfico con timestamps legibles
+                    try:
+                        df_plot = df.copy()
+                        df_plot['ts_dt'] = pd.to_datetime(df_plot['ts'], unit='ms', utc=True)
+                        df_plot = df_plot.set_index('ts_dt')
+                        st.line_chart(df_plot['close'])
+                    except Exception:
+                        st.line_chart(df.set_index('ts')['close'])
                     st.dataframe(df.tail(500))
                     # si core.score tiene funciones de indicadores, mostrar ejemplo
                     if score_module and hasattr(score_module, 'features_from_candles'):
@@ -484,11 +513,29 @@ def backtest_tab(storage: Optional[PostgresStorage]):
                 with st.spinner('Ejecutando backtest...'):
                     res = backtest_module.run_backtest_for(storage, asset.strip(), interval.strip(), start_ts=s, end_ts=e)
                 st.subheader('Resultados')
-                st.json(res.get('metrics') if isinstance(res, dict) else res)
-                if isinstance(res, dict) and 'equity_curve' in res:
-                    df = pd.DataFrame(res['equity_curve'])
-                    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-                    st.line_chart(df.set_index('ts')['equity'])
+                # compatibilidad: algunos motores devuelven 'metrics' y 'equity_curve'; otros devuelven summary
+                if isinstance(res, dict):
+                    # try common keys first
+                    metrics = {}
+                    metrics_keys = ['total_return', 'cagr', 'annual_volatility', 'sharpe', 'max_drawdown']
+                    for k in metrics_keys:
+                        if k in res:
+                            metrics[k] = res[k]
+                    if metrics:
+                        st.json(metrics)
+                    elif 'metrics' in res:
+                        st.json(res['metrics'])
+                    else:
+                        st.json(res)
+                    if 'equity_curve' in res:
+                        df = pd.DataFrame(res['equity_curve'])
+                        if 'ts' in df.columns:
+                            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+                            df = df.set_index('ts')
+                        if 'equity' in df.columns:
+                            st.line_chart(df['equity'])
+                else:
+                    st.json(res)
             except Exception as e:
                 st.error(f'Backtest falló: {e}')
 
@@ -547,6 +594,7 @@ def logs_tab():
 # ---------------------------
 
 def main():
+    # Obtenemos storage y orchestrator (get_orchestrator acepta storage posicionalmente)
     storage = get_storage()
     orchestrator = get_orchestrator(storage)
 
