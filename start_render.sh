@@ -1,3 +1,4 @@
+export PYTHONPATH=/opt/render/project/src:$PYTHONPATH
 #!/usr/bin/env bash
 # start_render.sh - robust start script for Render
 # (compatible con entornos donde 'set -o pipefail' pueda no estar disponible)
