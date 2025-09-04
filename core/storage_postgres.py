@@ -9,6 +9,7 @@ import psycopg2
 from psycopg2 import pool
 import logging
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -34,14 +35,12 @@ class PostgresStorage:
         database_url = os.getenv("DATABASE_URL")
         print("🔍 DEBUG: DATABASE_URL =", repr(database_url))
         if database_url:
-            # Use DSN string
             try:
                 self._pool = pool.SimpleConnectionPool(self._minconn, self._maxconn, dsn=database_url)
                 logger.info("PostgresStorage initialized via DATABASE_URL.")
                 return
             except Exception as e:
                 logger.exception("Fallo al crear pool con DATABASE_URL: %s", e)
-                # fallback to separate vars
 
         # Fallback: individual env vars (or provided args)
         self.host = host or os.getenv("POSTGRES_HOST", "localhost")
@@ -136,52 +135,6 @@ class PostgresStorage:
             cur.close()
         logger.info("Database schema ensured.")
 
-# al final de core/storage_postgres.py
-from urllib.parse import urlparse
-
-def make_storage_from_env() -> PostgresStorage:
-    """
-    Factory helper: crea y devuelve PostgresStorage leyendo DATABASE_URL
-    o las variables POSTGRES_* individuales.
-    """
-    url = os.getenv("DATABASE_URL")
-    if url:
-        parsed = urlparse(url)
-        host = parsed.hostname
-        port = parsed.port
-        dbname = parsed.path.lstrip("/") if parsed.path else None
-        user = parsed.username
-        password = parsed.password
-        return PostgresStorage(
-            host=host,
-            port=int(port) if port else None,
-            dbname=dbname,
-            user=user,
-            password=password,
-        )
-
-    # Fallback a POSTGRES_HOST / POSTGRES_PORT / POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD
-    host = os.getenv("POSTGRES_HOST")
-    port = os.getenv("POSTGRES_PORT")
-    dbname = os.getenv("POSTGRES_DB")
-    user = os.getenv("POSTGRES_USER")
-    password = os.getenv("POSTGRES_PASSWORD")
-
-    if not (host and dbname and user):
-        raise RuntimeError(
-            "DATABASE_URL no está configurada y variables POSTGRES_* incompletas. "
-            "Define DATABASE_URL o POSTGRES_HOST/POSTGRES_DB/POSTGRES_USER."
-        )
-
-    return PostgresStorage(
-        host=host,
-        port=int(port) if port else None,
-        dbname=dbname,
-        user=user,
-        password=password,
-    )
-    print(f"🔍 DEBUG: DATABASE_URL = {repr(url)}")
-
     # ---------------------
     # Candles IO
     # ---------------------
@@ -225,7 +178,8 @@ def make_storage_from_env() -> PostgresStorage:
             cur.close()
         logger.info("Saved %d candle rows", len(rows))
 
-    def load_candles(self, asset: str, interval: str, start_ts: Optional[int] = None, end_ts: Optional[int] = None, limit: Optional[int] = None) -> pd.DataFrame:
+    def load_candles(self, asset: str, interval: str, start_ts: Optional[int] = None,
+                     end_ts: Optional[int] = None, limit: Optional[int] = None) -> pd.DataFrame:
         with self._get_conn() as conn:
             cur = conn.cursor()
             base_q = "SELECT ts, timestamp, open, high, low, close, volume, asset, interval FROM candles WHERE asset=%s AND interval=%s"
@@ -261,7 +215,8 @@ def make_storage_from_env() -> PostgresStorage:
 
         rows = []
         for _, row in df_scores.iterrows():
-            rows.append((int(row["ts"]), str(row["asset"]), str(row["interval"]), row.get("model_id"), json.dumps(row["score"])))
+            rows.append((int(row["ts"]), str(row["asset"]), str(row["interval"]),
+                         row.get("model_id"), json.dumps(row["score"])))
 
         with self._get_conn() as conn:
             cur = conn.cursor()
@@ -276,7 +231,9 @@ def make_storage_from_env() -> PostgresStorage:
             cur.close()
         logger.info("Saved %d score rows", len(rows))
 
-    def load_scores(self, asset: str, interval: str, start_ts: Optional[int] = None, end_ts: Optional[int] = None, model_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def load_scores(self, asset: str, interval: str,
+                    start_ts: Optional[int] = None, end_ts: Optional[int] = None,
+                    model_id: Optional[int] = None) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:
             cur = conn.cursor()
             base_q = "SELECT ts, asset, interval, model_id, score, created_at FROM scores WHERE asset=%s AND interval=%s"
@@ -309,7 +266,9 @@ def make_storage_from_env() -> PostgresStorage:
     # ---------------------
     # Model metadata
     # ---------------------
-    def save_model_record(self, asset: str, interval: str, supabase_path: str, filename: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    def save_model_record(self, asset: str, interval: str,
+                          supabase_path: str, filename: str,
+                          meta: Dict[str, Any]) -> Dict[str, Any]:
         with self._get_conn() as conn:
             cur = conn.cursor()
             sql_q = """
@@ -403,3 +362,45 @@ def make_storage_from_env() -> PostgresStorage:
         except Exception as e:
             logger.exception("DB health check failed: %s", e)
             return {"ok": False, "error": str(e)}
+
+
+def make_storage_from_env() -> PostgresStorage:
+    """
+    Factory helper: crea y devuelve PostgresStorage leyendo DATABASE_URL
+    o las variables POSTGRES_* individuales.
+    """
+    url = os.getenv("DATABASE_URL")
+    if url:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port
+        dbname = parsed.path.lstrip("/") if parsed.path else None
+        user = parsed.username
+        password = parsed.password
+        return PostgresStorage(
+            host=host,
+            port=int(port) if port else None,
+            dbname=dbname,
+            user=user,
+            password=password,
+        )
+
+    host = os.getenv("POSTGRES_HOST")
+    port = os.getenv("POSTGRES_PORT")
+    dbname = os.getenv("POSTGRES_DB")
+    user = os.getenv("POSTGRES_USER")
+    password = os.getenv("POSTGRES_PASSWORD")
+
+    if not (host and dbname and user):
+        raise RuntimeError(
+            "DATABASE_URL no está configurada y variables POSTGRES_* incompletas. "
+            "Define DATABASE_URL o POSTGRES_HOST/POSTGRES_DB/POSTGRES_USER."
+        )
+
+    return PostgresStorage(
+        host=host,
+        port=int(port) if port else None,
+        dbname=dbname,
+        user=user,
+        password=password,
+    )
