@@ -568,3 +568,155 @@ def health_check() -> Dict[str, Any]:
 list_assets = list_watchlist_assets
 run_backfill = run_full_backfill
 # End of file
+# ----------------------------
+# Wrappers públicos compat (añadir al final de core/fetch.py)
+# ----------------------------
+import pandas as _pd
+import os as _os
+from datetime import datetime as _dt
+
+# list_watchlist_assets -> intenta fetch internals o config
+def list_watchlist_assets():
+    try:
+        # si el módulo define una función específica
+        for name in ("list_watchlist_assets", "list_assets", "get_watchlist", "get_assets"):
+            if name in globals() and callable(globals()[name]):
+                try:
+                    out = globals()[name]()
+                    if isinstance(out, (list,tuple)):
+                        return list(out)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # fallback: leer archivos data/config
+    cfg_dir = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "data", "config"))
+    out=[]
+    for fn in ("actions.csv","cryptos.csv","crypto.csv"):
+        p = _os.path.join(cfg_dir, fn)
+        if _os.path.exists(p):
+            try:
+                df = _pd.read_csv(p, dtype=str, keep_default_na=False)
+                if "symbol" in df.columns:
+                    out.extend(df["symbol"].tolist())
+                else:
+                    out.extend(df.iloc[:,0].astype(str).tolist())
+            except Exception:
+                continue
+    # dedupe
+    seen=set(); final=[]
+    for s in out:
+        if s not in seen:
+            seen.add(s); final.append(s)
+    return final
+
+# get_candles alias: intenta storage -> network -> csv fallback
+def get_candles(symbol: str, limit: int = 1000, timeframe: str=None, force_network: bool=False) -> _pd.DataFrame:
+    # try storage loader if implemented elsewhere (storage_postgres wrappers)
+    try:
+        import core.storage_postgres as _sp
+        if hasattr(_sp, "load_candles") and not force_network:
+            try:
+                df = _sp.load_candles(symbol, limit=limit)
+                if isinstance(df, _pd.DataFrame) and not df.empty:
+                    return df
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # try existing fetch implementations
+    if "fetch_ohlcv" in globals():
+        try:
+            # try to call with common signature
+            try:
+                df = fetch_ohlcv(symbol, timeframe or "1m", start_ms=None, end_ms=None, limit=limit)
+            except TypeError:
+                try:
+                    df = fetch_ohlcv(symbol, timeframe or "1m")
+                except Exception:
+                    df = fetch_ohlcv(symbol)
+            if isinstance(df, _pd.DataFrame) and not df.empty:
+                # persist via storage_postgres if possible
+                try:
+                    import core.storage_postgres as _sp2
+                    if hasattr(_sp2, "save_candles"):
+                        _sp2.save_candles(symbol, df)
+                except Exception:
+                    pass
+                return df
+        except Exception:
+            pass
+
+    # if there is a network backfill function, call it then try storage
+    if "backfill_range" in globals():
+        try:
+            try:
+                backfill_range(symbol, timeframe or "1m", None, None)
+            except TypeError:
+                backfill_range(symbol, timeframe or "1m")
+            # try load again from storage
+            try:
+                import core.storage_postgres as _sp3
+                if hasattr(_sp3, "load_candles"):
+                    df = _sp3.load_candles(symbol, limit=limit)
+                    if isinstance(df, _pd.DataFrame) and not df.empty:
+                        return df
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # csv fallback
+    try:
+        p = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "data", "cache", f"{symbol.replace('/','_')}.csv"))
+        if _os.path.exists(p):
+            df = _pd.read_csv(p, parse_dates=["timestamp"], infer_datetime_format=True)
+            if limit and len(df) > limit:
+                return df.sort_values("timestamp").iloc[-limit:].reset_index(drop=True)
+            return df
+    except Exception:
+        pass
+
+    return _pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+# aliases
+fetch_candles = get_candles
+get_latest_candles = get_candles
+
+def run_full_backfill(symbols=None, per_symbol_limit:int=1000):
+    out = {"started_at": _dt.utcnow().isoformat(), "results": {}}
+    try:
+        if symbols is None:
+            symbols = list_watchlist_assets()
+        for s in symbols:
+            try:
+                # try existing backfill fn
+                if "backfill_range" in globals():
+                    backfill_range(s, None, None, None)
+                    # try to load saved rows
+                    try:
+                        import core.storage_postgres as _sp4
+                        if hasattr(_sp4, "load_candles"):
+                            df = _sp4.load_candles(s, limit=per_symbol_limit)
+                            out["results"][s] = {"rows": len(df) if df is not None else 0}
+                            continue
+                    except Exception:
+                        pass
+                # fallback: call fetch_ohlcv and persist
+                if "fetch_ohlcv" in globals():
+                    df = fetch_ohlcv(s, "1m")
+                    try:
+                        import core.storage_postgres as _sp5
+                        if hasattr(_sp5, "save_candles"):
+                            _sp5.save_candles(s, df)
+                    except Exception:
+                        pass
+                    out["results"][s] = {"rows": len(df) if hasattr(df,'__len__') else 0}
+            except Exception as e:
+                out["results"][s] = {"error": str(e)}
+    except Exception as e:
+        out["error"] = str(e)
+    out["finished_at"] = _dt.utcnow().isoformat()
+    return out
+

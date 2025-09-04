@@ -210,3 +210,137 @@ class PostgresStorage:
             with conn.cursor() as cur:
                 cur.execute(sql, (status, json.dumps(details) if details else None, status, job_id))
             conn.commit()
+# ----------------------------
+# Wrappers de compatibilidad (NO DESTRUIDOS) para UI / fetch
+# Añadir al final de core/storage_postgres.py
+# ----------------------------
+import pandas as _pd
+import json as _json
+
+# map to existing upsert/load functions if present
+def save_candles(symbol: str, df: _pd.DataFrame) -> bool:
+    """
+    Compat wrapper para guardar velas.
+    Internamente usa upsert_prices (si existe) o guarda CSV fallback.
+    """
+    try:
+        if hasattr(PostgresStorage, "upsert_prices"):
+            # use instance method if available
+            try:
+                return PostgresStorage().upsert_prices(symbol, df)
+            except Exception:
+                pass
+        # fallback to CSV
+        path = os.path.join(os.path.dirname(__file__), "..", "data", "cache", f"{symbol.replace('/','_')}.csv")
+        df.to_csv(path, index=False)
+        return True
+    except Exception:
+        return False
+
+def load_candles(symbol: str, limit: int = 1000) -> _pd.DataFrame:
+    """
+    Compat wrapper para cargar velas.
+    Internamente usa load_prices (si existe) o lee CSV de data/cache/.
+    """
+    try:
+        if hasattr(PostgresStorage, "load_prices"):
+            try:
+                df = PostgresStorage().load_prices(symbol, limit=limit)
+                if isinstance(df, _pd.DataFrame):
+                    return df
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # fallback CSV
+    path = os.path.join(os.path.dirname(__file__), "..", "data", "cache", f"{symbol.replace('/','_')}.csv")
+    if os.path.exists(path):
+        try:
+            df = _pd.read_csv(path, parse_dates=["timestamp"], infer_datetime_format=True)
+            if limit and len(df) > limit:
+                return df.sort_values("timestamp").iloc[-limit:].reset_index(drop=True)
+            return df
+        except Exception:
+            return _pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    return _pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+def list_assets() -> list:
+    """
+    Intentar leer assets desde la tabla si existe, sino fallback a CSVs en data/config.
+    """
+    try:
+        if hasattr(PostgresStorage, "list_assets"):
+            try:
+                return PostgresStorage().list_assets()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # fallback: read config CSVs
+    cfgs = []
+    cfg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "config"))
+    for name in ("actions.csv","cryptos.csv","crypto.csv"):
+        p = os.path.join(cfg_dir, name)
+        if os.path.exists(p):
+            try:
+                df = _pd.read_csv(p, dtype=str, keep_default_na=False)
+                if "symbol" in df.columns:
+                    cfgs.extend(df["symbol"].astype(str).tolist())
+                else:
+                    cfgs.extend(df.iloc[:,0].astype(str).tolist())
+            except Exception:
+                continue
+    seen = set(); uniq=[]
+    for s in cfgs:
+        if s not in seen:
+            seen.add(s); uniq.append(s)
+    return uniq
+
+# Simple settings persistence using a small json fallback if storage doesn't provide it
+def save_setting(key: str, value) -> bool:
+    try:
+        if hasattr(PostgresStorage, "upsert_setting"):
+            try:
+                return PostgresStorage().upsert_setting(key, value)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # fallback to JSON file
+    try:
+        settings_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "config", "settings.json"))
+        data = {}
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, "r", encoding="utf8") as fh:
+                    data = _json.load(fh)
+            except Exception:
+                data = {}
+        data[key] = value
+        with open(settings_path, "w", encoding="utf8") as fh:
+            _json.dump(data, fh, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+def load_setting(key: str, default=None):
+    try:
+        if hasattr(PostgresStorage, "load_setting"):
+            try:
+                return PostgresStorage().load_setting(key, default)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    settings_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "config", "settings.json"))
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, "r", encoding="utf8") as fh:
+                data = _json.load(fh)
+            return data.get(key, default)
+        except Exception:
+            return default
+    return default
+
+# expose short aliases for compatibility imports like `from core.storage_postgres import save_candles`
+__all__ = list(globals().keys())
