@@ -1,24 +1,24 @@
 # dashboard/app.py
 """
-Dashboard profesional completo para Watchlist.
-Características:
- - Watchlist interactiva con filtros, ordenar y botones por fila.
- - Panel de detalle (velas, EMAs, RSI, volumen, export).
- - Settings persistentes (score weights, toggle IA).
- - Background auto-updater que actualiza velas en cache automáticamente.
- - Forzar backfill, ejecutar backtests en background y guardar resultados.
- - System status con tasks session y cache listing.
- - Fail-safe total: si faltan módulos core, usa fallbacks y no rompe.
+Dashboard robusto y autocontenido para Watchlist.
+- Prioriza core.storage_postgres.PostgresStorage.
+- Fallback a core.fetch.
+- Fallback final a CSVs en data/cache y data/config.
+- Backfill de arranque (no bloqueante) a menos que SKIP_BACKFILL=1.
+- Auto-updater configurable (AUTO_UPDATE_ENABLED, AUTO_UPDATE_INTERVAL_MIN).
+- Botones: backfill manual, correr backtest por activo, entrenar IA, inferencia IA.
+- Persistencia de settings: PostgresStorage.save_setting / load_setting si existe, sino JSON fallback en data/config/settings.json.
+- Guarda backtests en data/db/backtests/.
 """
 
 import os
 import sys
 import time
 import json
-import threading
 import logging
+import threading
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import streamlit as st
 import pandas as pd
@@ -26,63 +26,290 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# asegurar ruta repo
+# --- config paths ---
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from core.adapter import adapter
-from core.settings import save_setting, load_setting, health_status
-
-LOG = logging.getLogger("dashboard")
-LOG.setLevel(logging.INFO)
-
 DATA_DIR = os.path.join(ROOT, "data")
 CACHE_DIR = os.path.join(DATA_DIR, "cache")
+CONF_DIR = os.path.join(DATA_DIR, "config")
 DB_DIR = os.path.join(DATA_DIR, "db")
 BACKTESTS_DIR = os.path.join(DB_DIR, "backtests")
+SETTINGS_FILE = os.path.join(CONF_DIR, "settings.json")
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CONF_DIR, exist_ok=True)
+os.makedirs(DB_DIR, exist_ok=True)
 os.makedirs(BACKTESTS_DIR, exist_ok=True)
 
-# -----------------------
-# Utilidades internas
-# -----------------------
-def format_float(x):
+# --- logging ---
+logger = logging.getLogger("watchlist.dashboard")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(ch)
+
+# --- dynamic import helper ---
+def _import_safe(module: str, attr: Optional[str] = None):
     try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return "—"
-        return f"{float(x):,.6f}"
+        m = __import__(module, fromlist=[attr] if attr else [])
+        return getattr(m, attr) if attr else m
     except Exception:
-        return str(x)
+        return None
 
-def ensure_df_ts(df: pd.DataFrame) -> pd.DataFrame:
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-        df = df.dropna(subset=["timestamp"])
-        df = df.sort_values("timestamp").reset_index(drop=True)
-    return df
+# --- try PostgresStorage first ---
+PostgresStorage = None
+pg = None
+try:
+    mod_ps = _import_safe("core.storage_postgres")
+    if mod_ps and hasattr(mod_ps, "PostgresStorage"):
+        PostgresStorage = getattr(mod_ps, "PostgresStorage")
+        try:
+            pg = PostgresStorage()  # assume it reads DATABASE_URL from env or config
+            logger.info("Usando core.storage_postgres.PostgresStorage")
+        except Exception as e:
+            logger.warning("No se pudo instanciar PostgresStorage: %s", e)
+            pg = None
+except Exception:
+    pg = None
 
-def save_backtest_result(symbol: str, result: Dict[str, Any]) -> str:
-    now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    fname = f"{symbol.replace('/','_')}_backtest_{now}.json"
-    path = os.path.join(BACKTESTS_DIR, fname)
+# --- try core.fetch and orchestrator/ai modules ---
+fetch_mod = _import_safe("core.fetch")
+orchestrator_mod = _import_safe("core.orchestrator")
+ai_train_mod = _import_safe("core.ai_train")
+ai_inf_mod = _import_safe("core.ai_inference")
+
+# common function resolution (several possible names)
+_list_assets_fn = None
+_load_candles_fn = None
+_run_full_backfill_fn = None
+_run_backtest_for_fn = None
+_train_ai_fn = None
+_infer_ai_fn = None
+_save_setting_fn = None
+_load_setting_fn = None
+
+# If pg available and exposes methods, prefer those
+if pg:
+    if hasattr(pg, "list_assets"):
+        _list_assets_fn = getattr(pg, "list_assets")
+    if hasattr(pg, "load_candles"):
+        _load_candles_fn = getattr(pg, "load_candles")
+    elif hasattr(pg, "get_candles"):
+        _load_candles_fn = getattr(pg, "get_candles")
+    if hasattr(pg, "run_full_backfill"):
+        _run_full_backfill_fn = getattr(pg, "run_full_backfill")
+    if hasattr(pg, "save_setting"):
+        _save_setting_fn = getattr(pg, "save_setting")
+    if hasattr(pg, "load_setting"):
+        _load_setting_fn = getattr(pg, "load_setting")
+
+# If not provided by pg, try fetch_mod
+if not _list_assets_fn and fetch_mod:
+    for name in ("list_watchlist_assets", "list_assets", "get_watchlist", "get_assets"):
+        if hasattr(fetch_mod, name):
+            _list_assets_fn = getattr(fetch_mod, name)
+            break
+
+if not _load_candles_fn and fetch_mod:
+    for name in ("get_candles", "get_latest_candles", "fetch_candles", "get_historical"):
+        if hasattr(fetch_mod, name):
+            _load_candles_fn = getattr(fetch_mod, name)
+            break
+
+if not _run_full_backfill_fn and fetch_mod:
+    for name in ("run_full_backfill", "backfill_all", "run_backfill"):
+        if hasattr(fetch_mod, name):
+            _run_full_backfill_fn = getattr(fetch_mod, name)
+            break
+
+# orchestrator backtest
+if orchestrator_mod:
+    for name in ("run_backtest_for", "run_backtest", "backtest"):
+        if hasattr(orchestrator_mod, name):
+            _run_backtest_for_fn = getattr(orchestrator_mod, name)
+            break
+
+if ai_train_mod:
+    for name in ("train", "do_train", "run_train"):
+        if hasattr(ai_train_mod, name):
+            _train_ai_fn = getattr(ai_train_mod, name)
+            break
+
+if ai_inf_mod:
+    for name in ("predict", "infer", "run_predict"):
+        if hasattr(ai_inf_mod, name):
+            _infer_ai_fn = getattr(ai_inf_mod, name)
+            break
+
+# --- fallback CSV loader for candles and watchlist ---
+def fallback_list_assets() -> List[str]:
+    candidates = [
+        os.path.join(CONF_DIR, "watchlist.csv"),
+        os.path.join(CONF_DIR, "watchlist.json"),
+        os.path.join(CONF_DIR, "assets.csv"),
+        os.path.join(CONF_DIR, "assets.json"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            try:
+                if c.endswith(".csv"):
+                    df = pd.read_csv(c)
+                    if "symbol" in df.columns:
+                        return df["symbol"].astype(str).tolist()
+                    return df.iloc[:, 0].astype(str).tolist()
+                else:
+                    j = pd.read_json(c)
+                    return j.iloc[:, 0].astype(str).tolist()
+            except Exception:
+                continue
+    return ["BTCUSDT", "ETHUSDT", "AAPL", "TSLA"]
+
+def fallback_load_candles(symbol: str, limit: int = 1000) -> pd.DataFrame:
+    path = os.path.join(CACHE_DIR, f"{symbol}.csv")
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path, parse_dates=["timestamp"], infer_datetime_format=True)
+            expected = ["timestamp", "open", "high", "low", "close", "volume"]
+            for col in expected:
+                if col not in df.columns:
+                    df[col] = pd.NA
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            if limit and len(df) > limit:
+                return df.iloc[-limit:].reset_index(drop=True)
+            return df
+        except Exception:
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+# --- settings persistence helpers ---
+def _fallback_load_setting(key, default=None):
     try:
-        with open(path, "w", encoding="utf8") as f:
-            json.dump(result, f, default=str, indent=2)
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf8") as f:
+                j = json.load(f)
+            return j.get(key, default)
     except Exception:
-        LOG.exception("Error saving backtest result")
-    return path
+        pass
+    return default
 
-# -----------------------
-# Background task runner
-# -----------------------
-def _run_background(task_fn, args=(), kwargs=None, task_key=None, on_done=None):
-    kwargs = kwargs or {}
-    key = f"task_{task_key or str(time.time())}"
-    st.session_state[key] = {"status": "running", "started_at": datetime.utcnow().isoformat(), "result": None, "error": None}
+def _fallback_save_setting(key, value):
+    data = {}
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf8") as f:
+                data = json.load(f)
+    except Exception:
+        data = {}
+    data[key] = value
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf8") as f:
+            json.dump(data, f, indent=2, default=str)
+        return True
+    except Exception:
+        return False
 
+def save_setting(key, value):
+    try:
+        if _save_setting_fn:
+            return _save_setting_fn(key, value)
+    except Exception:
+        logger.exception("save_setting via primary failed")
+    return _fallback_save_setting(key, value)
+
+def load_setting(key, default=None):
+    try:
+        if _load_setting_fn:
+            return _load_setting_fn(key, default)
+    except Exception:
+        logger.exception("load_setting via primary failed")
+    return _fallback_load_setting(key, default)
+
+# --- wrapper functions used by UI ---
+def list_assets():
+    try:
+        if _list_assets_fn:
+            out = _list_assets_fn()
+            # if returns dataframe/list/dict coerce to list
+            if isinstance(out, pd.DataFrame):
+                if "symbol" in out.columns:
+                    return out["symbol"].astype(str).tolist()
+                return out.iloc[:, 0].astype(str).tolist()
+            if isinstance(out, (list, tuple)):
+                return list(out)
+            if isinstance(out, dict):
+                return list(out.keys())
+    except Exception:
+        logger.exception("list_assets primary failed")
+    return fallback_list_assets()
+
+def load_candles(symbol: str, limit: int = 1000) -> pd.DataFrame:
+    try:
+        if _load_candles_fn:
+            df = _load_candles_fn(symbol, limit=limit)
+            if isinstance(df, (list, tuple)):
+                try:
+                    df = pd.DataFrame(df)
+                except Exception:
+                    return fallback_load_candles(symbol, limit=limit)
+            if isinstance(df, pd.DataFrame):
+                if "timestamp" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                if limit and len(df) > limit:
+                    return df.sort_values("timestamp").iloc[-limit:].reset_index(drop=True)
+                return df.sort_values("timestamp").reset_index(drop=True) if "timestamp" in df.columns else df
+    except Exception:
+        logger.exception("load_candles primary failed for %s", symbol)
+    return fallback_load_candles(symbol, limit=limit)
+
+# --- auto backfill at startup (non-blocking) ---
+def _run_start_backfill():
+    if os.getenv("SKIP_BACKFILL", "0").strip() == "1":
+        logger.info("SKIP_BACKFILL=1 -> skipping startup backfill")
+        return {"skipped": True}
+    if _run_full_backfill_fn:
+        try:
+            logger.info("Running startup backfill via core.fetch/core.storage_postgres")
+            try:
+                res = _run_full_backfill_fn()
+            except TypeError:
+                res = _run_full_backfill_fn(per_symbol_limit=int(os.getenv("BACKFILL_LIMIT", "1000")))
+            logger.info("Startup backfill finished")
+            return {"skipped": False, "result": res}
+        except Exception as e:
+            logger.exception("Startup backfill failed: %s", e)
+            return {"skipped": False, "error": str(e)}
+    logger.info("No run_full_backfill function available; skipping network backfill")
+    return {"skipped": False, "result": "no_backfill_fn"}
+
+_start_backfill_started = False
+def maybe_start_backfill_thread():
+    global _start_backfill_started
+    if _start_backfill_started:
+        return
+    _start_backfill_started = True
     def _worker():
         try:
-            res = task_fn(*args, **kwargs)
+            res = _run_start_backfill()
+            logger.info("Startup backfill result: %s", str(res))
+        except Exception:
+            logger.exception("Startup backfill worker crashed")
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+# start non-blocking
+maybe_start_backfill_thread()
+
+# --- background runner for UI tasks ---
+def run_in_background(fn, args=(), kwargs=None, task_key=None, on_done=None):
+    kwargs = kwargs or {}
+    key = f"task_{task_key or str(time.time()).replace('.','_')}"
+    st.session_state[key] = {"status": "running", "started_at": datetime.utcnow().isoformat(), "result": None, "error": None}
+    def _worker():
+        try:
+            res = fn(*args, **kwargs)
             st.session_state[key]["status"] = "done"
             st.session_state[key]["result"] = res
             st.session_state[key]["finished_at"] = datetime.utcnow().isoformat()
@@ -90,107 +317,73 @@ def _run_background(task_fn, args=(), kwargs=None, task_key=None, on_done=None):
                 try:
                     on_done(res)
                 except Exception:
-                    LOG.exception("on_done callback failed")
+                    logger.exception("on_done callback error")
         except Exception as e:
-            LOG.exception("Background task error")
+            logger.exception("Background task error")
             st.session_state[key]["status"] = "error"
             st.session_state[key]["error"] = str(e)
             st.session_state[key]["finished_at"] = datetime.utcnow().isoformat()
-
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
     return key
 
-# -----------------------
-# Auto-updater (periodic)
-# -----------------------
-AUTO_UPDATE_ENABLED = os.getenv("AUTO_UPDATE_ENABLED", "1").strip() != "0"
-AUTO_UPDATE_INTERVAL_MIN = int(os.getenv("AUTO_UPDATE_INTERVAL_MIN", "5"))
-AUTO_UPDATE_INITIAL_DELAY_SEC = int(os.getenv("AUTO_UPDATE_INITIAL_DELAY_SEC", "5"))
-AUTO_UPDATE_BATCH = int(os.getenv("AUTO_UPDATE_BATCH", "10"))  # cuantos símbolos por iteración
+# --- plotting helpers ---
+def plot_candles_with_indicators(df: pd.DataFrame, ema_short: int = 9, ema_long: int = 50, show_volume: bool = True):
+    df = df.copy()
+    if "timestamp" in df.columns:
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    # Ensure numeric
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    if f"ema_{ema_short}" not in df.columns:
+        df[f"ema_{ema_short}"] = df["close"].ewm(span=ema_short, adjust=False).mean()
+    if f"ema_{ema_long}" not in df.columns:
+        df[f"ema_{ema_long}"] = df["close"].ewm(span=ema_long, adjust=False).mean()
+    # RSI
+    rsi_col = "rsi_14"
+    if rsi_col not in df.columns:
+        delta = df["close"].diff()
+        up = delta.clip(lower=0).fillna(0)
+        down = -1 * delta.clip(upper=0).fillna(0)
+        ma_up = up.ewm(com=(14 - 1), adjust=False).mean()
+        ma_down = down.ewm(com=(14 - 1), adjust=False).mean()
+        rs = ma_up / (ma_down.replace(0, np.nan))
+        df[rsi_col] = 100 - (100 / (1 + rs))
+    rows = 2 if show_volume or rsi_col in df.columns else 1
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
+    fig.add_trace(go.Candlestick(x=df["timestamp"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Candles"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df[f"ema_{ema_short}"], name=f"EMA{ema_short}", line=dict(width=1.4)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df[f"ema_{ema_long}"], name=f"EMA{ema_long}", line=dict(width=1.0, dash="dash")), row=1, col=1)
+    if show_volume and "volume" in df.columns:
+        fig.add_trace(go.Bar(x=df["timestamp"], y=df["volume"], showlegend=False), row=2, col=1)
+    # add RSI to second row as line
+    if rsi_col in df.columns and rows == 2:
+        fig.add_trace(go.Scatter(x=df["timestamp"], y=df[rsi_col], name="RSI(14)"), row=2, col=1)
+    fig.update_layout(height=700, margin=dict(l=8, r=8, t=30, b=8), template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    fig.update_xaxes(rangeslider_visible=False)
+    return fig
 
-def _auto_updater_loop():
-    """
-    Funcion que corre en background: itera sobre la lista de activos y llama adapter.update_symbol
-    para mantener cache actualizada. No bloquea la UI.
-    """
-    LOG.info("Auto-updater thread started (enabled=%s interval_min=%s)", AUTO_UPDATE_ENABLED, AUTO_UPDATE_INTERVAL_MIN)
-    # initial delay to give process time to start
-    time.sleep(AUTO_UPDATE_INITIAL_DELAY_SEC)
-    while True:
-        try:
-            assets = adapter.list_assets()
-            if not assets:
-                LOG.info("Auto-updater: no assets listed")
-                time.sleep(AUTO_UPDATE_INTERVAL_MIN * 60)
-                continue
-            # iterar por lotes para no saturar
-            for i in range(0, len(assets), AUTO_UPDATE_BATCH):
-                batch = assets[i:i+AUTO_UPDATE_BATCH]
-                for s in batch:
-                    try:
-                        adapter.update_symbol(s, limit=500)
-                    except Exception:
-                        LOG.exception("Auto-updater failed for %s", s)
-                # pequeña pausa entre batches
-                time.sleep(1)
-            # esperar siguiente ciclo
-            time.sleep(AUTO_UPDATE_INTERVAL_MIN * 60)
-        except Exception:
-            LOG.exception("Auto-updater top loop error")
-            time.sleep(AUTO_UPDATE_INTERVAL_MIN * 60)
-
-# lanzar auto-updater en background (no se reinicia en reruns)
-if AUTO_UPDATE_ENABLED and ("_auto_updater_started" not in st.session_state):
-    st.session_state["_auto_updater_started"] = True
-    try:
-        t = threading.Thread(target=_auto_updater_loop, daemon=True)
-        t.start()
-        LOG.info("Auto-updater launched")
-    except Exception:
-        LOG.exception("Failed to start auto-updater")
-
-# -----------------------
-# Score weights defaults
-# -----------------------
-DEFAULT_SCORE_WEIGHTS = {"momentum": 0.4, "trend": 0.4, "volatility": 0.2}
-def load_score_weights():
-    return load_setting("score_weights", DEFAULT_SCORE_WEIGHTS)
-def save_score_weights(weights):
-    return save_setting("score_weights", weights)
-
-# -----------------------
-# Streamlit UI
-# -----------------------
-st.set_page_config(page_title="Watchlist — Dashboard", layout="wide", initial_sidebar_state="expanded")
+# --- Streamlit UI ---
+st.set_page_config(page_title="Watchlist", layout="wide", initial_sidebar_state="expanded")
 
 # Sidebar
 with st.sidebar:
-    st.title("Watchlist - Config")
+    st.title("Watchlist — Config")
     st.markdown("Ajustes globales y operaciones.")
 
-    # IA toggle persistent
     ia_default = load_setting("ia_enabled", False)
     ia_enabled = st.checkbox("Activar IA (persistente)", value=bool(ia_default))
-    if st.session_state.get("_ia_saved_flag") is None:
-        st.session_state["_ia_saved_flag"] = True
-        save_setting = save_setting if 'save_setting' in globals() else save_setting  # fallback guard
+    if st.button("Guardar IA toggle"):
         save_setting("ia_enabled", bool(ia_enabled))
-    else:
-        # detect changes and save
-        if st.session_state.get("ia_enabled") != ia_enabled:
-            save_setting("ia_enabled", bool(ia_enabled))
-    st.session_state["ia_enabled"] = ia_enabled
+        st.success("Guardado")
 
     st.markdown("---")
     st.subheader("Score weights")
-    cur_weights = load_score_weights()
-    w_momentum = st.slider("Momentum", 0.0, 1.0, float(cur_weights.get("momentum", 0.4)), step=0.01, key="w_momentum")
-    w_trend = st.slider("Trend", 0.0, 1.0, float(cur_weights.get("trend", 0.4)), step=0.01, key="w_trend")
-    w_vol = st.slider("Volatility", 0.0, 1.0, float(cur_weights.get("volatility", 0.2)), step=0.01, key="w_vol")
+    sw = load_setting("score_weights", {"momentum": 0.4, "trend": 0.4, "volatility": 0.2})
+    m = st.slider("Momentum", 0.0, 1.0, float(sw.get("momentum", 0.4)), step=0.01)
+    t_ = st.slider("Trend", 0.0, 1.0, float(sw.get("trend", 0.4)), step=0.01)
+    v = st.slider("Volatility", 0.0, 1.0, float(sw.get("volatility", 0.2)), step=0.01)
     if st.button("Guardar pesos score"):
-        new_w = {"momentum": w_momentum, "trend": w_trend, "volatility": w_vol}
-        save_score_weights(new_w)
+        save_setting("score_weights", {"momentum": m, "trend": t_, "volatility": v})
         st.success("Pesos guardados")
 
     st.markdown("---")
@@ -200,140 +393,154 @@ with st.sidebar:
     ema_long = st.number_input("EMA larga", min_value=5, max_value=400, value=50, step=1)
 
     st.markdown("---")
-    st.subheader("Operaciones rápidas")
-    if st.button("Forzar backfill (todos)"):
-        key = _run_background(adapter.run_full_backfill, args=(), task_key="backfill_all")
-        st.info(f"Backfill lanzado (task {key})")
-    if st.button("Entrenar IA global"):
-        key = _run_background(adapter.train_ai, args=({},), task_key="train_ai")
-        st.info(f"Entrenamiento IA lanzado (task {key})")
+    st.subheader("Operaciones")
+    if st.button("Forzar backfill ahora"):
+        def _do_backfill():
+            if _run_full_backfill_fn:
+                try:
+                    return _run_full_backfill_fn()
+                except Exception as e:
+                    return {"error": str(e)}
+            return {"error": "no_backfill_fn"}
+        key = run_in_background(_do_backfill, task_key="manual_backfill")
+        st.info(f"Backfill en background (task {key})")
 
-# Pestañas principales
+    if st.button("Entrenar IA (background)"):
+        def _do_train():
+            if _train_ai_fn:
+                try:
+                    return _train_ai_fn({})
+                except Exception as e:
+                    return {"error": str(e)}
+            return {"error": "no_train_fn"}
+        key = run_in_background(_do_train, task_key="train_ai")
+        st.info(f"Entrenamiento IA en background (task {key})")
+
+# Main layout: tabs
 tabs = st.tabs(["Watchlist", "Settings", "System"])
 tab_watch, tab_settings, tab_system = tabs
 
-# -------- WATCHLIST TAB --------
+# Watchlist tab
 with tab_watch:
     st.header("Watchlist")
-    st.markdown("Listado de activos monitorizados. Filtra, ordena y abre detalle.")
+    st.markdown("Activos monitorizados. Si no hay fetch, coloca CSVs en data/cache/{SYMBOL}.csv")
 
+    # assets
     try:
-        assets = adapter.list_assets()
+        assets = list_assets()
     except Exception:
-        LOG.exception("adapter.list_assets failed")
-        assets = ["BTCUSDT", "ETHUSDT", "AAPL"]
+        logger.exception("list_assets failed")
+        assets = fallback_list_assets()
 
-    # filtros rápidos
+    # filters
     f1, f2, f3, f4 = st.columns([3, 1, 1, 1])
-    q = f1.text_input("Buscar símbolo", value="", placeholder="p.ej. BTC")
-    min_price = f2.number_input("Precio min", value=0.0, step=0.01)
-    max_rows = f3.selectbox("Mostrar filas", options=[10, 25, 50, 100], index=1)
-    if f4.button("Refrescar datos"):
+    q = f1.text_input("Buscar símbolo", value="", placeholder="BTC, AAPL, etc.")
+    min_price = f2.number_input("Precio mínimo", value=0.0, step=0.01)
+    max_rows = f3.selectbox("Mostrar filas", [10, 25, 50, 100], index=1)
+    if f4.button("Refrescar"):
         st.experimental_rerun()
 
-    # construir tabla resumen
-    summary_rows = []
+    rows = []
     for s in assets:
         try:
-            df = adapter.load_candles(s, limit=3)
-            df = ensure_df_ts(df)
-            last_price = float(df.iloc[-1]["close"]) if (isinstance(df, pd.DataFrame) and not df.empty) else None
+            df2 = load_candles(s, limit=2)
+            df2 = df2 if isinstance(df2, pd.DataFrame) else fallback_load_candles(s, limit=2)
+            df2 = df2.dropna(subset=["close"]) if "close" in df2.columns else df2
+            last_price = float(df2.iloc[-1]["close"]) if (isinstance(df2, pd.DataFrame) and not df2.empty) else None
         except Exception:
             last_price = None
-        summary_rows.append({"symbol": s, "last_price": last_price})
+        rows.append({"symbol": s, "last_price": last_price})
 
-    df_summary = pd.DataFrame(summary_rows)
+    df_summary = pd.DataFrame(rows)
     if q:
         df_summary = df_summary[df_summary["symbol"].str.contains(q, case=False, na=False)]
     if min_price and min_price > 0:
         df_summary = df_summary[df_summary["last_price"].fillna(0) >= float(min_price)]
     df_summary = df_summary.head(max_rows).reset_index(drop=True)
 
-    st.dataframe(df_summary.style.format({"last_price": lambda v: format_float(v)}), height=320)
-    st.markdown("**Acciones por activo**")
-    for row in df_summary.to_dict("records"):
-        s = row["symbol"]
+    st.dataframe(df_summary.style.format({"last_price": lambda v: f"{v:,.6f}" if v is not None else "—"}), height=320)
+    st.markdown("**Acciones**")
+    for r in df_summary.to_dict("records"):
+        s = r["symbol"]
         cols = st.columns([2, 2, 1, 2])
         cols[0].markdown(f"**{s}**")
-        cols[1].markdown(f"Precio: {format_float(row['last_price'])}")
+        cols[1].markdown(f"Precio: {format(r['last_price'], '.6f') if r['last_price'] is not None else '—'}")
         if cols[2].button("Ver detalle", key=f"view_{s}"):
             st.session_state["selected_asset"] = s
             st.experimental_rerun()
         if cols[3].button("Backtest", key=f"bt_{s}"):
-            def _on_done_save(res, symbol=s):
-                try:
-                    path = save_backtest_result(symbol, res)
-                    LOG.info("Backtest saved to %s", path)
-                except Exception:
-                    LOG.exception("Saving backtest failed")
-            key = _run_background(adapter.run_backtest_for, args=(s,), task_key=f"backtest_{s}", on_done=_on_done_save)
+            def _do_bt(sym=s):
+                if _run_backtest_for_fn:
+                    try:
+                        return _run_backtest_for_fn(sym)
+                    except Exception as e:
+                        return {"error": str(e)}
+                return {"error": "no_backtest_engine"}
+            key = run_in_background(_do_bt, task_key=f"backtest_{s}", on_done=lambda res, sym=s: save_backtest_result_local(sym, res))
             st.info(f"Backtest para {s} lanzado (task {key})")
 
     st.markdown("---")
     selected = st.session_state.get("selected_asset", None)
     if not selected:
-        st.info("Selecciona un activo desde la lista para ver detalles.")
+        st.info("Selecciona un activo para ver el detalle.")
     else:
         st.subheader(f"Detalle — {selected}")
-        dfc = adapter.load_candles(selected, limit=1500)
-        dfc = ensure_df_ts(dfc)
+        try:
+            dfc = load_candles(selected, limit=1500)
+            if not isinstance(dfc, pd.DataFrame):
+                dfc = fallback_load_candles(selected, limit=1500)
+        except Exception:
+            dfc = fallback_load_candles(selected, limit=1500)
+        dfc = dfc if isinstance(dfc, pd.DataFrame) else fallback_load_candles(selected, limit=1500)
         if dfc.empty:
-            st.warning("No hay datos históricos. Ejecuta backfill o coloca CSV en data/cache/{SYMBOL}.csv")
+            st.warning("No hay datos históricos. Añade CSV en data/cache/{SYMBOL}.csv o habilita fetch/storage_postgres.")
         else:
-            params = {"ema_short": ema_short, "ema_long": ema_long, "rsi_period": 14}
-            dfc2 = adapter.apply_indicators(dfc, indicators=["ema", "rsi"], params=params)
-            # prepare figure
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.02, row_heights=[0.7, 0.3])
-            fig.add_trace(go.Candlestick(x=dfc2["timestamp"], open=dfc2["open"], high=dfc2["high"], low=dfc2["low"], close=dfc2["close"], name="Candles"), row=1, col=1)
-            ema_short_col = f"ema_{ema_short}"
-            ema_long_col = f"ema_{ema_long}"
-            if ema_short_col in dfc2.columns:
-                fig.add_trace(go.Scatter(x=dfc2["timestamp"], y=dfc2[ema_short_col], name=f"EMA{ema_short}", line=dict(width=1.4)), row=1, col=1)
-            if ema_long_col in dfc2.columns:
-                fig.add_trace(go.Scatter(x=dfc2["timestamp"], y=dfc2[ema_long_col], name=f"EMA{ema_long}", line=dict(width=1.0, dash="dash")), row=1, col=1)
-            if show_volume and "volume" in dfc2.columns:
-                fig.add_trace(go.Bar(x=dfc2["timestamp"], y=dfc2["volume"], showlegend=False), row=2, col=1)
-            if f"rsi_{14}" in dfc2.columns:
-                # add RSI as line in second subplot as overlay
-                fig.add_trace(go.Scatter(x=dfc2["timestamp"], y=dfc2[f"rsi_{14}"], name="RSI(14)"), row=2, col=1)
-            fig.update_layout(height=700, margin=dict(l=8, r=8, t=30, b=8), template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-            fig.update_xaxes(rangeslider_visible=False)
+            fig = plot_candles_with_indicators(dfc, ema_short=int(ema_short), ema_long=int(ema_long), show_volume=bool(show_volume))
             st.plotly_chart(fig, use_container_width=True)
-            # actions
-            a1, a2, a3 = st.columns([1,1,1])
-            if a1.button("Export CSV"):
-                csv = dfc2.to_csv(index=False).encode("utf-8")
+            c1, c2, c3 = st.columns([1,1,1])
+            if c1.button("Descargar CSV"):
+                csv = dfc.to_csv(index=False).encode("utf-8")
                 st.download_button("Descargar CSV", data=csv, file_name=f"{selected}_candles.csv", mime="text/csv")
-            if a2.button("Abrir detalle completo"):
-                st.session_state["open_detail_full"] = selected
-                st.experimental_rerun()
-            if a3.button("Infer IA"):
-                key = _run_background(adapter.infer_ai, args=(selected,), task_key=f"infer_{selected}")
+            if c2.button("Infer IA (background)"):
+                def _do_infer(sym=selected):
+                    if _infer_ai_fn:
+                        try:
+                            return _infer_ai_fn(sym)
+                        except Exception as e:
+                            return {"error": str(e)}
+                    return {"error": "no_ai_infer"}
+                key = run_in_background(_do_infer, task_key=f"infer_{selected}")
                 st.info(f"Inferencia IA lanzada (task {key})")
+            if c3.button("Backtest (background)"):
+                def _do_bt2(sym=selected):
+                    if _run_backtest_for_fn:
+                        try:
+                            return _run_backtest_for_fn(sym)
+                        except Exception as e:
+                            return {"error": str(e)}
+                    return {"error": "no_backtest_engine"}
+                key = run_in_background(_do_bt2, task_key=f"backtest_{selected}", on_done=lambda res, s=selected: save_backtest_result_local(s, res))
+                st.info(f"Backtest lanzado (task {key})")
 
-# -------- SETTINGS TAB --------
+# Settings tab
 with tab_settings:
-    st.header("Settings & Administración")
-    st.markdown("Ajustes persistentes y herramientas administrativas.")
-
-    st.subheader("Pesos del score (actuales)")
-    cur_weights = load_score_weights()
-    st.json(cur_weights)
-    st.markdown("Edítalos en la barra lateral y pulsa 'Guardar pesos score'.")
-
-    st.subheader("Tareas Background (session state)")
-    task_keys = sorted([k for k in st.session_state.keys() if str(k).startswith("task_")])
-    if not task_keys:
-        st.info("No hay tasks en esta sesión.")
+    st.header("Settings")
+    st.markdown("Ajustes persistentes (IA, pesos, etc.)")
+    cur_w = load_setting("score_weights", {"momentum": 0.4, "trend": 0.4, "volatility": 0.2})
+    st.json(cur_w)
+    st.markdown("Tareas en background (session)")
+    keys = [k for k in st.session_state.keys() if k.startswith("task_")]
+    if not keys:
+        st.info("No hay tareas.")
     else:
-        for tk in task_keys:
-            st.markdown(f"**{tk}** — status: {st.session_state[tk].get('status')}")
-            st.json(st.session_state[tk])
+        for k in keys:
+            st.markdown(f"**{k}**")
+            st.json(st.session_state[k])
 
     st.subheader("Backtests guardados")
     files = sorted([f for f in os.listdir(BACKTESTS_DIR) if f.endswith(".json")], reverse=True)
     if not files:
-        st.info("No hay backtests guardados todavía.")
+        st.info("No hay backtests guardados.")
     else:
         sel = st.selectbox("Selecciona backtest", options=files)
         if sel:
@@ -342,40 +549,37 @@ with tab_settings:
                 data = json.load(f)
             st.json(data)
             if st.button("Descargar JSON"):
-                with open(path, "rb") as f:
-                    st.download_button("Download", f.read(), file_name=sel)
+                with open(path, "rb") as fh:
+                    st.download_button("Download", fh.read(), file_name=sel, mime="application/json")
 
-# -------- SYSTEM TAB --------
+# System tab
 with tab_system:
-    st.header("System Status")
-    st.markdown("Estado del sistema, cache, y tareas.")
-
-    try:
-        stat = health_status() or adapter.health_status()
-    except Exception:
-        LOG.exception("health_status error")
-        stat = adapter.health_status()
-    st.subheader("Resumen")
-    st.json(stat)
-
-    st.subheader("Cache files (data/cache)")
+    st.header("System")
+    mod_status = {
+        "postgres_storage": bool(pg),
+        "core.fetch": bool(fetch_mod),
+        "orchestrator": bool(orchestrator_mod),
+        "ai_train": bool(ai_train_mod),
+        "ai_infer": bool(ai_inf_mod),
+    }
+    st.json(mod_status)
+    st.subheader("Cache files")
     if os.path.exists(CACHE_DIR):
-        cache_files = [f for f in os.listdir(CACHE_DIR) if f.endswith(".csv")]
-        st.write(f"{len(cache_files)} archivos en cache")
-        for f in cache_files[:200]:
+        files = [f for f in os.listdir(CACHE_DIR) if f.endswith(".csv")]
+        st.write(f"{len(files)} archivos en data/cache/")
+        for f in files[:200]:
             st.write(f"- {f}")
     else:
-        st.info("No existe carpeta data/cache")
+        st.info("No hay carpeta cache")
 
     st.markdown("---")
     st.subheader("Tasks (session)")
-    task_keys = sorted([k for k in st.session_state.keys() if str(k).startswith("task_")])
-    if not task_keys:
-        st.info("No hay tasks en esta sesión.")
+    tks = sorted([k for k in st.session_state.keys() if k.startswith("task_")])
+    if not tks:
+        st.info("No hay tasks en esta sesión")
     else:
-        for tk in task_keys:
-            t = st.session_state[tk]
-            st.markdown(f"**{tk}** — status: {t.get('status')}")
-            st.json(t)
+        for tk in tks:
+            st.markdown(f"**{tk}** — {st.session_state[tk].get('status')}")
+            st.json(st.session_state[tk])
 
-# EOF
+# end of file
