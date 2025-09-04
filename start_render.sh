@@ -1,45 +1,24 @@
 export PYTHONPATH=/opt/render/project/src:$PYTHONPATH
 #!/usr/bin/env bash
-# start_render.sh - robust start script for Render
-# (compatible con entornos donde 'set -o pipefail' pueda no estar disponible)
+# start_server.sh
+# Simple start script for deploying locally or on Render.
+# Usage: ./start_server.sh
+# Make sure DATABASE_URL is set in environment (Supabase connection string).
+set -euo pipefail
 
-# Hacer el script fallar en caso de error, pero manejar pipefail con fallback.
-set -e
-set -u
-# intentar activar pipefail, si no estÃ¡ disponible, ignorar el fallo
-set -o pipefail 2>/dev/null || true
+# Optional: load .env file if present (requires `dotenv` or envsetup)
+if [ -f .env ]; then
+  echo "Loading .env into environment"
+  set -a
+  source .env
+  set +a
+fi
 
-# Logs
-mkdir -p /tmp/watchlist_logs
-WORKER_LOG="/tmp/watchlist_logs/worker.log"
+# ensure python deps installed (optional)
+# pip install -r requirements.txt
 
-echo "[start] Inicializando DB..."
-python - <<'PY'
-import traceback
-try:
-    from core.storage_postgres import PostgresStorage
-    PostgresStorage().init_db()
-    print("DB init OK")
-except Exception:
-    traceback.print_exc()
-    raise
-PY
-
-echo "[start] Arrancando worker en background (nohup)..."
-nohup python run_service.py > "${WORKER_LOG}" 2>&1 &
-
-echo "[start] Worker log: ${WORKER_LOG}"
-PORT="${PORT:-8501}"
-echo "[start] Arrancando Streamlit en puerto ${PORT}..."
-python - <<'PY'
-import importlib, traceback
-try:
-    importlib.import_module('core.storage_postgres')
-    print("OK: core.storage_postgres importado correctamente")
-except Exception:
-    traceback.print_exc()
-PY
-chmod +x scripts/ensure_db_on_start.py
-exec streamlit run dashboard/app.py --server.port "${PORT}" --server.address "0.0.0.0" --server.enableCORS false
-
-
+# Run streamlit app
+export STREAMLIT_SERVER_HEADLESS=true
+export STREAMLIT_LOG_LEVEL=${STREAMLIT_LOG_LEVEL:-info}
+echo "Starting Streamlit app dashboard/app.py"
+exec streamlit run dashboard/app.py

@@ -1,428 +1,283 @@
 # core/backtest.py
 """
-Backtest engine sencillo pero completo.
+Backtesting profesional y reutilizable.
 
-Función principal exportada:
-    run_backtest_for(storage, asset, interval, start_ts=None, end_ts=None,
-                     initial_capital=10000.0, fee=0.0005, slippage=0.0005,
-                     fraction_of_capital=1.0, score_threshold=0.0, hold_period=1,
-                     use_scores=True)
-
-Retorna un dict con:
-    {
-      "asset": asset,
-      "interval": interval,
-      "start_ts": start_ts,
-      "end_ts": end_ts,
-      "initial_capital": ...,
-      "final_capital": ...,
-      "total_return": ...,
-      "cagr": ...,
-      "annual_volatility": ...,
-      "sharpe": ...,
-      "max_drawdown": ...,
-      "max_drawdown_start": ...,
-      "max_drawdown_end": ...,
-      "trades": [ {trade dicts} ],
-      "equity_curve": [ { "ts": ..., "equity": ... } ],
-      "per_bar": pandas.DataFrame (index ts_dt) with columns: close, position, pnl, equity, returns
-    }
-
-Notas de diseño:
-- El backtest usa precios de cierre para entradas/salidas (entrada al close de la barra cuando señal aparece).
-- Si hay scores (storage.load_scores), alinea score por timestamp <= candle.ts y genera señales: long si score['pred'] > score_threshold.
-- hold_period define cuántas barras mantener (1 = próxima barra exit allowed).
-- fraction_of_capital define fracción del capital usada por trade (1.0 = todo el capital).
-- fee y slippage aplicados en cada operación como costos relativos.
+Diseño:
+ - Input: candles DataFrame (ts, open, high, low, close, volume) ordenado asc por ts.
+ - Signals: pandas.Series indexed like candles (same length) con valores in {-1,0,1} que representan posición objetivo.
+            Alternativamente, puede pasarse una función strategy_fn(df) -> Series.
+ - El backtester aplica cambios de posición sólo en la apertura de la vela siguiente (simula ejecución market @ open).
+ - Parámetros: capital inicial, comisiones (pct), slippage (pct).
+ - Output: dict con keys:
+     - 'trades': list de trades {entry_ts, exit_ts, entry_price, exit_price, direction, pnl, return_pct}
+     - 'metrics': dict con métricas (total_return, CAGR, max_drawdown, winrate, expectancy, num_trades)
+     - 'equity': pandas.DataFrame with columns ts, equity, position
 """
-from __future__ import annotations
 
+from __future__ import annotations
+from typing import Optional, Callable, List, Dict, Any, Union
 import logging
 import math
-from typing import Optional, Dict, Any, List
-
-import pandas as pd
 import numpy as np
+import pandas as pd
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
 
 
-def _bars_per_year_from_interval(interval: str) -> float:
-    """
-    Estimar número de barras por año según interval:
-    - minutos/hours -> 365 * 24 * 60 / minutes
-    - '1d' -> 252
-    - '1w' -> 52
-    - '1M' -> 12
-    Fallback: 365
-    """
-    s = interval.strip().lower()
+# -------------------- helpers -------------------- #
+def _ensure_sorted_candles(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        raise ValueError("candles_df is None")
+    if 'ts' not in df.columns:
+        raise ValueError("candles_df must contain 'ts' column (unix seconds)")
+    df2 = df.sort_values('ts').reset_index(drop=True)
+    return df2
+
+
+def _signal_from_callable_or_series(signals, candles: pd.DataFrame) -> pd.Series:
+    if callable(signals):
+        s = signals(candles)
+        if not isinstance(s, (pd.Series, pd.DataFrame)):
+            raise ValueError("strategy_fn must return pandas.Series or DataFrame-like with single column")
+        s = s.squeeze()
+        s = s.reindex(candles.index).fillna(0).astype(int)
+        return s
+    if isinstance(signals, pd.Series):
+        # align indices
+        s = signals.reindex(candles.index).fillna(0).astype(int)
+        return s
+    # if None => neutral
+    return pd.Series(0, index=candles.index)
+
+
+def _annualize_return(total_return: float, days: float) -> float:
+    if days <= 0:
+        return float(total_return)
     try:
-        if s.endswith("m"):
-            mins = int(s[:-1]) if s[:-1].isdigit() else 1
-            return 365.0 * 24.0 * 60.0 / max(1, mins)
-        if s.endswith("h"):
-            hours = int(s[:-1]) if s[:-1].isdigit() else 1
-            return 365.0 * 24.0 / max(1, hours)
-        if s.endswith("d"):
-            # use trading days approximation
-            return 252.0 / max(1, int(s[:-1]) if s[:-1].isdigit() else 1)
-        if s.endswith("w"):
-            return 52.0 / max(1, int(s[:-1]) if s[:-1].isdigit() else 1)
-        if s.endswith("m"):  # 'M' months
-            return 12.0
+        years = max(days / 365.0, 1e-9)
+        return (1 + total_return) ** (1.0 / years) - 1.0
     except Exception:
-        pass
-    # fallback
-    return 365.0
+        return float(total_return)
 
 
-def _compute_drawdown(equity_series: pd.Series) -> Dict[str, Any]:
+def _max_drawdown_from_series(equity_vals: np.ndarray) -> float:
+    # equity_vals is cumulative equity series
+    peaks = np.maximum.accumulate(equity_vals)
+    dd = (equity_vals - peaks) / peaks
+    return float(min(dd))  # negative
+
+
+# -------------------- built-in simple signal helpers -------------------- #
+def signal_from_score_thresholds(scores_series: pd.Series, entry_threshold: float = 0.8, exit_threshold: float = 0.5) -> pd.Series:
     """
-    Recibe equity_series index datetime, returns max_dd value (positive fraction), start/end timestamps (ints ms),
-    and drawdown series.
+    genera una serie de señales 1/0 basada en un score:
+     - entry when score >= entry_threshold -> position 1
+     - exit (go flat) when score < exit_threshold -> position 0
+    Mantiene posición hasta que condición de salida se cumple.
     """
-    # equity_series must be numeric
-    eq = equity_series.fillna(method="ffill").fillna(0.0)
-    running_max = eq.cummax()
-    drawdown = (running_max - eq) / running_max
-    # handle case where running_max==0 -> drawdown NaN -> set 0
-    drawdown = drawdown.fillna(0.0)
-    if drawdown.empty:
-        return {"max_drawdown": 0.0, "start": None, "end": None, "dd_series": drawdown}
-    max_dd = float(drawdown.max())
-    if max_dd <= 0:
-        return {"max_drawdown": 0.0, "start": None, "end": None, "dd_series": drawdown}
-    # find end index (first occurrence of max)
-    end_idx = drawdown.idxmax()
-    # find previous peak (running_max before end where running_max equals peak)
-    peak_val = running_max.loc[: end_idx].max()
-    # start is last index where running_max == peak_val before or at end_idx
-    peaks = running_max.loc[: end_idx]
-    # locate the last timestamp where peaks == peak_val
-    starts = peaks[peaks == peak_val]
-    start_idx = starts.index[-1] if not starts.empty else None
-    # convert timestamps to ms
-    start_ts = int(start_idx.value // 10 ** 6) if start_idx is not None else None
-    end_ts = int(end_idx.value // 10 ** 6) if end_idx is not None else None
-    return {"max_drawdown": max_dd, "start": start_ts, "end": end_ts, "dd_series": drawdown}
+    s = scores_series.fillna(0).astype(float).copy()
+    pos = 0
+    out = []
+    for v in s.values:
+        if pos == 0 and v >= entry_threshold:
+            pos = 1
+        elif pos == 1 and v < exit_threshold:
+            pos = 0
+        out.append(pos)
+    return pd.Series(out, index=s.index)
 
 
-def _annualize_return(total_return: float, years: float) -> float:
-    if years <= 0:
-        return 0.0
-    # (1 + total_return) ** (1/years) - 1
-    return (1.0 + total_return) ** (1.0 / years) - 1.0
-
-
-def run_backtest_for(
-    storage: Any,
-    asset: str,
-    interval: str,
-    start_ts: Optional[int] = None,
-    end_ts: Optional[int] = None,
-    initial_capital: float = 10000.0,
-    fee: float = 0.0005,
+# -------------------- core backtest runner -------------------- #
+def run_backtest(
+    candles_df: pd.DataFrame,
+    signals: Union[pd.Series, Callable[[pd.DataFrame], pd.Series], None],
+    capital: float = 10000.0,
+    fee_pct: float = 0.0005,
     slippage: float = 0.0005,
-    fraction_of_capital: float = 1.0,
-    score_threshold: float = 0.0,
-    hold_period: int = 1,
-    use_scores: bool = True,
+    allow_short: bool = False,
+    verbose: bool = False
 ) -> Dict[str, Any]:
     """
-    Ejecuta backtest para asset/interval sobre datos en storage.
-    - storage debe exponer load_candles(asset, interval, start_ts=None, end_ts=None, limit=None)
-      y opcionalmente load_scores(asset, interval, start_ts=None, end_ts=None, limit=None)
-      (en este proyecto PostgresStorage implementa esas funciones).
-    - use_scores: si True, intenta usar storage.load_scores para generar señales, si no hay scores,
-      cae al buy_and_hold.
+    Ejecuta backtest.
+
+    candles_df: must contain columns ['ts','open','high','low','close'] at least.
+    signals: Series aligned to candles_df index with -1/0/1 or callable strategy(candles_df) -> Series
+    returns dict with trades, equity DataFrame and metrics.
     """
-    if storage is None:
-        raise ValueError("storage requerido para run_backtest_for")
+    df = _ensure_sorted_candles(candles_df).reset_index(drop=True)
+    idx = df.index
+    # get signals aligned
+    sig = _signal_from_callable_or_series(signals, df)
+    # clamp for shorts
+    if not allow_short:
+        sig = sig.clip(lower=0)
 
-    # 1) cargar velas
-    try:
-        # preferir cargar con rango si se proporciona
-        df = storage.load_candles(asset, interval, start_ts=start_ts, end_ts=end_ts, limit=None)
-    except Exception as e:
-        logger.exception("storage.load_candles falló en backtest: %s", e)
-        raise RuntimeError("No se pudieron cargar velas para backtest") from e
+    # We'll assume trades executed at next candle open (after signal appears)
+    # Build position series: shift signals by 1 (changes take effect next bar open)
+    pos = sig.shift(1).fillna(0).astype(int).copy()
 
-    if df is None or df.empty:
-        raise RuntimeError("No hay velas para el backtest")
+    # keep only -1/0/1
+    pos = pos.apply(lambda x: int(max(min(x, 1), -1)))
 
-    # normalizar df: ts int -> datetime index
-    df2 = df.copy()
-    if "ts" not in df2.columns:
-        raise RuntimeError("Las velas deben contener columna 'ts' (ms)")
-    df2["ts"] = df2["ts"].astype("int64")
-    df2["ts_dt"] = pd.to_datetime(df2["ts"], unit="ms", utc=True)
-    df2 = df2.set_index("ts_dt", drop=False)
-    df2 = df2.sort_index()
-    close = pd.to_numeric(df2["close"], errors="coerce")
-
-    # 2) load scores if requested and available
-    signals = None
-    if use_scores and hasattr(storage, "load_scores"):
-        try:
-            # load all scores in range to align
-            scores_df = storage.load_scores(asset=asset, interval=interval, start_ts=start_ts, end_ts=end_ts, limit=None)
-            if scores_df is not None and not scores_df.empty:
-                # convert ts to datetime index
-                scores_df = scores_df.copy()
-                scores_df["ts"] = scores_df["ts"].astype("int64")
-                scores_df["ts_dt"] = pd.to_datetime(scores_df["ts"], unit="ms", utc=True)
-                scores_df = scores_df.set_index("ts_dt", drop=False).sort_index()
-                # assume score JSON contains key 'pred' numeric (fallback to first numeric found)
-                def extract_pred(row):
-                    s = row.get("score") if isinstance(row, dict) else row
-                    if isinstance(s, dict):
-                        if "pred" in s:
-                            return float(s["pred"])
-                        # try first numeric value in dict
-                        for v in s.values():
-                            try:
-                                return float(v)
-                            except Exception:
-                                continue
-                    try:
-                        return float(s)
-                    except Exception:
-                        return np.nan
-                scores_df["_pred"] = scores_df["score"].apply(extract_pred)
-                # align to candle index by forward-fill last known score <= candle.ts
-                # create a series of preds indexed by ts_dt
-                pred_series = scores_df["_pred"]
-                # reindex to candles using asof (last valid index <= ts)
-                preds_aligned = pd.Series(index=df2.index, dtype=float)
-                # use pandas.merge_asof approach
-                joined = pd.merge_asof(df2.reset_index().rename(columns={"ts_dt":"ts_dt_c"}).sort_values("ts_dt"),
-                                       scores_df.reset_index().rename(columns={"ts_dt":"ts_dt_s"})[["ts_dt_s","_pred"]].sort_values("ts_dt_s"),
-                                       left_on="ts_dt", right_on="ts_dt_s", direction="backward")
-                preds_aligned = pd.Series(joined["_pred"].values, index=df2.index)
-                # fill nans with 0
-                preds_aligned = preds_aligned.fillna(0.0)
-                signals = preds_aligned
-        except Exception:
-            logger.exception("Error cargando/alineando scores. Se usará buy-and-hold fallback.")
-            signals = None
-
-    # 3) generate trading signals
-    # We'll produce 'signal' series: 1 -> long, 0 -> flat
-    if signals is not None:
-        signal = (signals > score_threshold).astype(int)
-        # apply hold_period: when signal becomes 1, keep it for hold_period bars (simple implementation)
-        if hold_period and hold_period > 1:
-            sig = signal.copy()
-            out = sig.copy() * 0
-            n = len(sig)
-            sig_values = sig.values
-            for i in range(n):
-                if sig_values[i] == 1:
-                    # keep next hold_period bars including current
-                    end = min(n, i + hold_period)
-                    out.iloc[i:end] = 1
-            signal = out
-    else:
-        # buy-and-hold: enter long at first available bar and hold to end
-        signal = pd.Series(0, index=df2.index)
-        signal.iloc[0] = 1
-        signal = signal.cumsum().clip(upper=1)  # ensure 1 for all forward bars
-
-    # 4) simulate PnL using close prices, simple discrete execution at close, position 0/1
-    equity = []
+    initial_capital = float(capital)
+    equity = float(capital)
+    equity_series = []
     trades: List[Dict[str, Any]] = []
-    cash = float(initial_capital)
-    position = 0  # number of units (not quantity of assets) - we use fraction_of_capital to buy
-    position_qty = 0.0
-    entry_price = None
-    last_equity = cash
-    bar_index = 0
+    current_trade = None  # dict storing entry info
+    last_pos = 0
 
-    per_bar_rows = []
+    for i in idx:
+        row = df.loc[i]
+        ts = int(row['ts'])
+        open_price = float(row['open'])
+        high = float(row['high'])
+        low = float(row['low'])
+        close = float(row['close'])
 
-    for ts, row in df2.iterrows():
-        price = float(row["close"])
-        desired = int(signal.iloc[bar_index])  # 0 or 1
-        timestamp_ms = int(row["ts"])
-
-        # if currently flat and desired=1 -> enter
-        if position == 0 and desired == 1:
-            # capital to allocate
-            alloc = cash * float(fraction_of_capital)
-            # compute quantity after fees/slippage: buy at price * (1 + slippage)
-            buy_price = price * (1.0 + float(slippage))
-            qty = alloc / buy_price if buy_price > 0 else 0.0
-            # apply fee on trade value
-            trade_cost = alloc * float(fee)
-            cash = cash - alloc - trade_cost  # remaining cash
-            position = 1
-            position_qty = qty
-            entry_price = buy_price
+        position = int(pos.loc[i])  # position during this bar
+        # position change?
+        if last_pos == 0 and position != 0:
+            # enter at open_price with commission+slippage
+            entry_price = open_price * (1.0 + slippage if position > 0 else 1.0 - slippage)
+            entry_comm = entry_price * fee_pct
+            current_trade = {
+                "entry_idx": int(i),
+                "entry_ts": ts,
+                "entry_price": entry_price,
+                "direction": int(position),
+                "entry_comm": entry_comm
+            }
+            if verbose: log.info("Entry %s @%s", current_trade['direction'], entry_price)
+        elif last_pos != 0 and position == 0:
+            # exit at open
+            exit_price = open_price * (1.0 - slippage if last_pos > 0 else 1.0 + slippage)
+            exit_comm = exit_price * fee_pct
+            if current_trade is None:
+                # defensive
+                current_trade = {"entry_price": open_price, "entry_idx": None, "entry_ts": None, "direction": last_pos}
+            entry_price = current_trade.get('entry_price')
+            direction = current_trade.get('direction', last_pos)
+            # PnL calculation
+            if direction > 0:
+                pnl = (exit_price - entry_price) - (current_trade.get('entry_comm', 0.0) + exit_comm)
+            else:
+                pnl = (entry_price - exit_price) - (current_trade.get('entry_comm', 0.0) + exit_comm)
+            return_pct = pnl / (entry_price)  # approximate percent vs price
             trades.append({
-                "type": "buy",
-                "ts": timestamp_ms,
-                "price": buy_price,
-                "qty": qty,
-                "cash_after": cash,
-                "fee": trade_cost,
-                "slippage": slippage
+                "entry_idx": current_trade.get("entry_idx"),
+                "exit_idx": int(i),
+                "entry_ts": current_trade.get("entry_ts"),
+                "exit_ts": ts,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "direction": direction,
+                "pnl": float(pnl),
+                "return_pct": float(return_pct)
             })
-        # if currently long and desired==0 -> exit
-        elif position == 1 and desired == 0:
-            # sell at price * (1 - slippage)
-            sell_price = price * (1.0 - float(slippage))
-            proceeds = position_qty * sell_price
-            trade_cost = proceeds * float(fee)
-            cash = cash + proceeds - trade_cost
-            pnl = (sell_price - entry_price) * position_qty - trade_cost
-            trades.append({
-                "type": "sell",
-                "ts": timestamp_ms,
-                "price": sell_price,
-                "qty": position_qty,
-                "cash_after": cash,
-                "fee": trade_cost,
-                "slippage": slippage,
-                "pnl": pnl
-            })
-            # reset position
-            position = 0
-            position_qty = 0.0
-            entry_price = None
-
-        # mark-to-market equity: cash + position_qty * price (mid price)
-        mtm = cash + position_qty * price
-        last_equity = float(mtm)
-        equity.append({"ts": timestamp_ms, "equity": float(last_equity)})
-        per_bar_rows.append({
-            "ts": timestamp_ms,
-            "close": price,
-            "position": int(position),
-            "qty": float(position_qty),
-            "cash": float(cash),
-            "equity": float(last_equity)
-        })
-        bar_index += 1
-
-    # If still long at the end, close position at last close
-    if position == 1 and position_qty > 0:
-        final_price = float(df2["close"].iloc[-1]) * (1.0 - float(slippage))
-        proceeds = position_qty * final_price
-        trade_cost = proceeds * float(fee)
-        cash = cash + proceeds - trade_cost
-        pnl = (final_price - entry_price) * position_qty - trade_cost if entry_price is not None else 0.0
-        timestamp_ms = int(df2["ts"].iloc[-1])
-        trades.append({
-            "type": "sell",
-            "ts": timestamp_ms,
-            "price": final_price,
-            "qty": position_qty,
-            "cash_after": cash,
-            "fee": trade_cost,
-            "slippage": slippage,
-            "pnl": pnl
-        })
-        position = 0
-        position_qty = 0.0
-        entry_price = None
-        last_equity = float(cash)
-        equity.append({"ts": timestamp_ms, "equity": float(last_equity)})
-        per_bar_rows.append({
-            "ts": timestamp_ms,
-            "close": float(df2["close"].iloc[-1]),
-            "position": 0,
-            "qty": 0.0,
-            "cash": float(cash),
-            "equity": float(last_equity)
-        })
-
-    # Build equity series
-    equity_df = pd.DataFrame(equity)
-    if equity_df.empty:
-        raise RuntimeError("No se generó equity curve en backtest")
-    equity_df = equity_df.drop_duplicates(subset=["ts"]).set_index(pd.to_datetime(equity_df["ts"], unit="ms", utc=True))
-    equity_series = equity_df["equity"].astype(float)
-
-    # Metrics
-    start_equity = float(initial_capital)
-    end_equity = float(equity_series.iloc[-1])
-    total_return = (end_equity / start_equity) - 1.0 if start_equity != 0 else 0.0
-
-    # period in years: compute from timestamps
-    seconds = (equity_series.index[-1].to_datetime64() - equity_series.index[0].to_datetime64()) / np.timedelta64(1, "s")
-    years = float(seconds) / (365.0 * 24.0 * 3600.0) if seconds > 0 else 0.0
-    # fallback using bars_per_year
-    bars_per_year = _bars_per_year_from_interval(interval)
-    # per-bar returns for volatility: pct change of equity
-    eq_returns = equity_series.pct_change().fillna(0.0)
-
-    # annualized return
-    if years > 0:
-        cagr = _annualize_return(total_return, years)
-    else:
-        # fallback: use geometric mean with bars_per_year
-        periods = len(eq_returns)
-        if periods > 0:
-            total_return_alt = (end_equity / start_equity) - 1.0
-            years_alt = float(periods) / bars_per_year
-            cagr = _annualize_return(total_return_alt, years_alt) if years_alt > 0 else 0.0
+            equity += pnl
+            if verbose: log.info("Exit trade %s pnl=%.4f equity=%.2f", direction, pnl, equity)
+            current_trade = None
         else:
-            cagr = 0.0
+            # no transaction this bar; mark unrealized PnL if you want (we compute equity series as cash + unrealized for position)
+            pass
 
-    # annualized vol
-    try:
-        ann_vol = float(eq_returns.std(ddof=0) * math.sqrt(bars_per_year))
-    except Exception:
-        ann_vol = float(0.0)
+        # compute unrealized PnL for current open position at close price (mark-to-market)
+        unreal = 0.0
+        if current_trade:
+            entry_price = current_trade['entry_price']
+            direction = current_trade['direction']
+            # mark-to-market using close
+            if direction > 0:
+                unreal = (close - entry_price)
+            else:
+                unreal = (entry_price - close)
+            # subtract estimated fees on entry (already subtracted earlier) not on unreal PnL
+        # equity snapshot = cash + unreal
+        equity_snapshot = equity + unreal
+        equity_series.append({"idx": int(i), "ts": ts, "equity": float(equity_snapshot), "position": int(position)})
 
-    # sharpe (risk-free = 0)
-    sharpe = float((cagr) / ann_vol) if ann_vol > 0 else float("nan")
+        last_pos = position
 
-    # drawdown
-    dd_info = _compute_drawdown(equity_series)
-    max_dd = float(dd_info.get("max_drawdown", 0.0))
-    dd_start = dd_info.get("start")
-    dd_end = dd_info.get("end")
+    # if position still open at end, close at last close price
+    if current_trade:
+        last_row = df.iloc[-1]
+        exit_price = float(last_row['close']) * (1.0 - slippage if current_trade['direction'] > 0 else 1.0 + slippage)
+        exit_comm = exit_price * fee_pct
+        entry_price = current_trade.get('entry_price')
+        direction = current_trade.get('direction', 1)
+        if direction > 0:
+            pnl = (exit_price - entry_price) - (current_trade.get('entry_comm', 0.0) + exit_comm)
+        else:
+            pnl = (entry_price - exit_price) - (current_trade.get('entry_comm', 0.0) + exit_comm)
+        return_pct = pnl / (entry_price)
+        trades.append({
+            "entry_idx": current_trade.get("entry_idx"),
+            "exit_idx": int(df.index[-1]),
+            "entry_ts": current_trade.get("entry_ts"),
+            "exit_ts": int(last_row['ts']),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "direction": direction,
+            "pnl": float(pnl),
+            "return_pct": float(return_pct)
+        })
+        equity += pnl
+        equity_series[-1]['equity'] = float(equity)
+        equity_series[-1]['position'] = 0
 
-    # trades summary
-    trades_summary = {
-        "n_trades": len([t for t in trades if t.get("type") == "buy"]),
-        "n_wins": len([t for t in trades if t.get("type") == "sell" and t.get("pnl", 0) > 0]),
-        "n_losses": len([t for t in trades if t.get("type") == "sell" and t.get("pnl", 0) <= 0]),
-        "net_pnl": float(end_equity - start_equity),
-    }
+    eq_df = pd.DataFrame(equity_series)
+    if eq_df.empty:
+        # no trades executed; construct trivial equity series
+        eq_df = pd.DataFrame([{"idx": int(i), "ts": int(df.loc[i,'ts']), "equity": initial_capital, "position": 0} for i in df.index])
 
-    # per_bar DataFrame
-    per_bar_df = pd.DataFrame(per_bar_rows)
-    if not per_bar_df.empty:
-        per_bar_df = per_bar_df.set_index(pd.to_datetime(per_bar_df["ts"], unit="ms", utc=True))
-        per_bar_df["returns"] = per_bar_df["equity"].pct_change().fillna(0.0)
+    # metrics
+    total_return = (eq_df['equity'].iloc[-1] / initial_capital) - 1.0
+    days = (pd.to_datetime(int(df['ts'].iloc[-1]), unit='s') - pd.to_datetime(int(df['ts'].iloc[0]), unit='s')).days or 1
+    cagr = _annualize_return(total_return, days)
+    equity_vals = eq_df['equity'].values
+    max_dd = _max_drawdown_from_series(equity_vals)
 
-    result = {
-        "asset": asset,
-        "interval": interval,
-        "start_ts": int(df2["ts"].iloc[0]),
-        "end_ts": int(df2["ts"].iloc[-1]),
+    num_trades = len(trades)
+    wins = [t for t in trades if t['pnl'] > 0]
+    losses = [t for t in trades if t['pnl'] <= 0]
+    winrate = float(len(wins) / num_trades) if num_trades > 0 else 0.0
+    avg_return = float(np.mean([t['return_pct'] for t in trades])) if trades else 0.0
+    avg_win = float(np.mean([t['pnl'] for t in wins])) if wins else 0.0
+    avg_loss = float(np.mean([t['pnl'] for t in losses])) if losses else 0.0
+    expectancy = ( (avg_win if avg_win else 0.0) * (len(wins)/num_trades if num_trades else 0) ) - ( (abs(avg_loss) if avg_loss else 0.0) * (len(losses)/num_trades if num_trades else 0) )
+
+    metrics = {
         "initial_capital": float(initial_capital),
-        "final_capital": float(end_equity),
+        "final_equity": float(eq_df['equity'].iloc[-1]),
         "total_return": float(total_return),
-        "cagr": float(cagr),
-        "annual_volatility": float(ann_vol),
-        "sharpe": float(sharpe) if not np.isnan(sharpe) else None,
+        "cagr_approx": float(cagr),
         "max_drawdown": float(max_dd),
-        "max_drawdown_start": dd_start,
-        "max_drawdown_end": dd_end,
-        "trades": trades,
-        "trades_summary": trades_summary,
-        "equity_curve": equity_df.reset_index().rename(columns={"index": "ts_dt"}).to_dict(orient="records"),
-        "per_bar": per_bar_df,
+        "num_trades": int(num_trades),
+        "winrate": float(winrate),
+        "avg_return_per_trade": float(avg_return),
+        "avg_win": float(avg_win),
+        "avg_loss": float(avg_loss),
+        "expectancy": float(expectancy)
     }
 
-    return result
+    return {"trades": trades, "metrics": metrics, "equity": eq_df}
 
 
-# Convenience alias (expected by Orchestrator)
-def run_backtest_for_storage(*args, **kwargs):
-    return run_backtest_for(*args, **kwargs)
+# -------------------- example usage -------------------- #
+if __name__ == "__main__":
+    # quick demo if executed directly (requires sample CSV with columns ts,open,high,low,close)
+    import argparse, os
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file", help="CSV de velas", required=True)
+    parser.add_argument("--entry", type=float, default=0.9)
+    parser.add_argument("--exit", type=float, default=0.6)
+    args = parser.parse_args()
+    df = pd.read_csv(args.file)
+    # assume df has ts,open,high,low,close
+    # make fake scores: normalized close
+    scores = (df['close'] - df['close'].min()) / (df['close'].max() - df['close'].min())
+    sig = signal_from_score_thresholds(scores, entry_threshold=args.entry, exit_threshold=args.exit)
+    res = run_backtest(df, sig, capital=10000)
+    print("Metrics:", res['metrics'])

@@ -1,651 +1,290 @@
 # core/score.py
 """
-Cálculo y persistencia del SCORE de un activo.
+core/score.py
+--------------
+Cálculo del "score" por fila (timestamp) a partir de los indicadores ya calculados
+(en la forma que produce apply_indicators: value dict con keys 'ema','rsi','macd','atr','fibonacci','support').
 
-Diseño:
-- Entrada: DataFrame OHLCV + columnas de indicadores (producidas por core.indicators.apply_indicators).
-- Configurable por componentes: cada componente mapea 1 columna o expresión a [0,1].
-- Normalizaciones disponibles: zscore->sigmoid, minmax, clip, escalado e inversión.
-- Agregación: weighted (por defecto). Preparado para añadir otras (rank, vote).
-- *Blend* opcional con un score alternativo (IA) por columna o serie externa.
-- Persistencia: guarda un histórico de scores en Postgres con upsert por ts.
+Funciones principales:
+ - indicator_to_score_* : mapeos de cada indicador a valor 0..1
+ - compute_score_for_row(value_dict, weights, cfg) -> dict { score, details }
+ - compute_scores_from_df(df, weights, method='weighted', cfg=None) -> list[dict]
 
-Ejemplo mínimo:
-    from core.score import compute_and_persist_scores, make_default_score_config
-    cfg = make_default_score_config()
-    compute_and_persist_scores("BTCUSDT", df_ind, cfg, storage=storage, method="weighted")
-
-Estructura de config (ejemplo):
+Salida por fila:
 {
-  "method": "weighted",
-  "blend": {"enabled": True, "alpha": 0.3, "alt_col": "ai_score"},  # opcional
-  "components": {
-    "rsi": {
-      "source": "rsi_14",               # columna o 'expr' (pandas eval)
-      "norm": {"type": "minmax", "min": 0, "max": 100},  # mapea 0..100 -> 0..1
-      "weight": 0.3
-    },
-    "trend": {
-      "expr": "(close / ema_50) - 1",   # expresión con columnas del DF
-      "norm": {"type": "zscore", "window": 200, "clip": [0,1]}, # zscore->sigmoid->clip
-      "weight": 0.4
-    },
-    "macd": {
-      "source": "macd_hist",
-      "norm": {"type": "zscore", "window": 200, "clip": [0,1]},
-      "weight": 0.3
-    }
+  "ts": <int>,
+  "score": <0..1 float>,
+  "details": {
+      "ema": {"raw":..., "score":...},
+      "rsi": {...},
+      "macd": {...},
+      "atr": {...},
+      "fibonacci": {...},
+      "support": {...},
+      "entry": <float>,
+      "stop": <float>,
+      "target": <float>
   }
 }
+
+Stop/target:
+ - stop_distance = 1.3 * ATR
+ - target_distance = 2.6 * ATR
+ - For long: stop = entry - stop_distance ; target = entry + target_distance
+ - For short: reversed (not implemented auto-detection of short vs long; current implementation assumes LONG bias)
 """
 
 from __future__ import annotations
+from typing import Dict, Any, List, Optional
 import math
-import logging
-from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, Tuple
-
-import pandas as pd
-
-logger = logging.getLogger("score")
-
-
-# ==========================
-# Helpers matemáticos
-# ==========================
-
-def _sigmoid(x: pd.Series) -> pd.Series:
-    # numéricamente estable
-    return 1.0 / (1.0 + pd.Series.map(-x, lambda v: math.exp(v) if pd.notna(v) else float("nan")))
-
-def _zscore(series: pd.Series, window: Optional[int] = None) -> pd.Series:
-    if window and window > 1:
-        mean = series.rolling(window=window, min_periods=max(5, window // 5)).mean()
-        std = series.rolling(window=window, min_periods=max(5, window // 5)).std(ddof=0)
-    else:
-        mean = series.expanding(min_periods=10).mean()
-        std = series.expanding(min_periods=10).std(ddof=0)
-    z = (series - mean) / std.replace(0, pd.NA)
-    return z
-
-def _minmax(series: pd.Series, vmin: float, vmax: float) -> pd.Series:
-    rng = (vmax - vmin) if (vmax is not None and vmin is not None) else None
-    if rng is None or rng == 0:
-        return pd.Series(index=series.index, dtype=float)
-    return (series - vmin) / rng
-
-def _clip01(series: pd.Series, lo: float = 0.0, hi: float = 1.0) -> pd.Series:
-    return series.clip(lower=lo, upper=hi)
-
-def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
-    return a / b.replace(0, pd.NA)
-
-
-# ==========================
-# Config dataclasses
-# ==========================
-
-@dataclass
-class NormCfg:
-    type: str = "zscore"             # "zscore" | "minmax" | "none"
-    window: Optional[int] = None     # zscore rolling window
-    min: Optional[float] = None      # minmax
-    max: Optional[float] = None      # minmax
-    clip: Optional[Tuple[float, float]] = (0.0, 1.0)  # clip final
-    invert: bool = False             # invierte (1 - x) al final
-
-@dataclass
-class ComponentCfg:
-    source: Optional[str] = None     # nombre de columna
-    expr: Optional[str] = None       # pandas.eval expression
-    norm: NormCfg = field(default_factory=NormCfg)
-    weight: float = 1.0              # peso en agregación
-
-@dataclass
-class BlendCfg:
-    enabled: bool = False
-    alpha: float = 0.25              # 0..1 (peso del alternativo)
-    alt_col: Optional[str] = None    # columna con score alternativo (ej. IA)
-
-
-# ==========================
-# Extracción/normalización de componentes
-# ==========================
-
-def _get_series_from_cfg(df: pd.DataFrame, comp: ComponentCfg) -> pd.Series:
-    """
-    Obtiene la serie fuente para el componente:
-    - Si comp.source, usa esa columna.
-    - Si comp.expr, evalúa expresión con pandas.eval (columnas del DF).
-    """
-    if comp.source:
-        if comp.source not in df.columns:
-            raise KeyError(f"Columna no encontrada para componente: {comp.source}")
-        s = df[comp.source].astype(float)
-    elif comp.expr:
-        # pandas.eval con columnas del df (más seguro que eval)
-        s = pd.eval(comp.expr, local_dict={c: df[c] for c in df.columns if c in comp.expr})
-        s = pd.Series(s, index=df.index, dtype=float)
-    else:
-        raise ValueError("ComponentCfg requiere 'source' o 'expr'")
-    return s
-
-def _normalize_series(s: pd.Series, cfg: NormCfg) -> pd.Series:
-    if cfg.type == "zscore":
-        z = _zscore(s, window=cfg.window)
-        out = _sigmoid(z)  # mapear a (0,1)
-    elif cfg.type == "minmax":
-        if cfg.min is None or cfg.max is None:
-            raise ValueError("minmax requiere 'min' y 'max'")
-        out = _minmax(s, cfg.min, cfg.max)
-    elif cfg.type == "none":
-        out = s.astype(float)
-    else:
-        raise ValueError(f"Normalización no soportada: {cfg.type}")
-
-    if cfg.clip:
-        lo, hi = cfg.clip
-        out = _clip01(out, lo, hi)
-    if cfg.invert:
-        out = 1.0 - out
-    return out
-
-
-# ==========================
-# Agregación de componentes
-# ==========================
-
-def _aggregate_weighted(components_df: pd.DataFrame, weights: Dict[str, float]) -> pd.Series:
-    # asegura que pesos existan para todas las columnas
-    w = pd.Series({k: weights.get(k, 1.0) for k in components_df.columns}, dtype=float)
-    denom = w.sum()
-    if denom == 0 or pd.isna(denom):
-        return pd.Series(index=components_df.index, dtype=float)
-    # broadcasting por columnas
-    return (components_df * w.reindex(components_df.columns)).sum(axis=1) / denom
-
-
-# ==========================
-# API pública
-# ==========================
-
-def make_default_score_config() -> Dict[str, Any]:
-    """
-    Config por defecto (razonable si tienes EMA50, RSI14 y MACD_hist):
-    - RSI (0..100) -> minmax
-    - Trend: (close/ema_50 - 1) -> zscore->sigmoid
-    - MACD hist -> zscore->sigmoid
-    """
-    return {
-        "method": "weighted",
-        "blend": {"enabled": False, "alpha": 0.25, "alt_col": None},
-        "components": {
-            "rsi": {
-                "source": "rsi_14",
-                "norm": {"type": "minmax", "min": 0, "max": 100, "clip": [0,1], "invert": False},
-                "weight": 0.3
-            },
-            "trend": {
-                "expr": "(close / ema_50) - 1",
-                "norm": {"type": "zscore", "window": 200, "clip": [0,1], "invert": False},
-                "weight": 0.4
-            },
-            "macd": {
-                "source": "macd_hist",
-                "norm": {"type": "zscore", "window": 200, "clip": [0,1], "invert": False},
-                "weight": 0.3
-            }
-        }
-    }
-
-
-def compute_score_timeseries(
-    df: pd.DataFrame,
-    config: Dict[str, Any],
-) -> pd.DataFrame:
-    """
-    Calcula componentes normalizados y el score para todo el histórico del DataFrame.
-    Requiere 'ts' como columna (ms epoch) y columnas de indicadores referenciadas en la config.
-
-    Returns:
-        DataFrame con columnas:
-          ['ts', 'score', 'score_base', 'score_alt'(si aplica), 'comp.<name>' ...]
-    """
-    if "ts" not in df.columns:
-        raise ValueError("El DataFrame debe contener columna 'ts' en ms")
-
-    comps_cfg_raw = config.get("components", {})
-    if not comps_cfg_raw:
-        raise ValueError("config.components requerido")
-
-    # Construir componentes normalizados
-    comp_cols = {}
-    weights = {}
-    for name, raw in comps_cfg_raw.items():
-        comp_cfg = ComponentCfg(
-            source=raw.get("source"),
-            expr=raw.get("expr"),
-            norm=NormCfg(
-                type=raw.get("norm", {}).get("type", "zscore"),
-                window=raw.get("norm", {}).get("window"),
-                min=raw.get("norm", {}).get("min"),
-                max=raw.get("norm", {}).get("max"),
-                clip=tuple(raw.get("norm", {}).get("clip", (0.0, 1.0))) if raw.get("norm", {}).get("clip") else None,
-                invert=bool(raw.get("norm", {}).get("invert", False)),
-            ),
-            weight=float(raw.get("weight", 1.0)),
-        )
-        s_raw = _get_series_from_cfg(df, comp_cfg)
-        s_norm = _normalize_series(s_raw, comp_cfg.norm)
-        comp_cols[name] = s_norm
-        weights[name] = comp_cfg.weight
-
-    comps_df = pd.DataFrame(comp_cols, index=df.index)
-
-    # Agregación
-    method = (config.get("method") or "weighted").lower()
-    if method == "weighted":
-        base_score = _aggregate_weighted(comps_df, weights)
-    else:
-        raise ValueError(f"Método de score no soportado: {method}")
-
-    # Blend con alternativo
-    out = pd.DataFrame(index=df.index)
-    out["ts"] = df["ts"].astype("int64")
-    out["score_base"] = _clip01(base_score, 0.0, 1.0)
-
-    blend_cfg_raw = config.get("blend", {}) or {}
-    blend = BlendCfg(
-        enabled=bool(blend_cfg_raw.get("enabled", False)),
-        alpha=float(blend_cfg_raw.get("alpha", 0.25)),
-        alt_col=blend_cfg_raw.get("alt_col"),
-    )
-    if blend.enabled and blend.alt_col and blend.alt_col in df.columns:
-        alt = df[blend.alt_col].astype(float)
-        score = (1.0 - blend.alpha) * out["score_base"] + blend.alpha * alt
-        out["score_alt"] = alt
-        out["score"] = _clip01(score, 0.0, 1.0)
-    else:
-        out["score"] = out["score_base"]
-
-    # Adjuntar componentes normalizados para trazabilidad
-    for c in comps_df.columns:
-        out[f"comp.{c}"] = comps_df[c]
-
-    return out.reset_index(drop=True)
-
-
-def compute_and_persist_scores(
-    asset: str,
-    df: pd.DataFrame,
-    config: Dict[str, Any],
-    storage: Optional[Any] = None,
-    method: Optional[str] = None,
-    persist: bool = True,
-) -> pd.DataFrame:
-    """
-    Calcula el score (histórico) y, si se indica, lo guarda en BD.
-
-    - asset: símbolo del activo (ej. "BTCUSDT")
-    - df: DataFrame con 'ts' y columnas de indicadores (p.ej. tras apply_indicators)
-    - config: ver docstring arriba
-    - storage: instancia que expone upsert_score(asset, ts, score, components, method)
-    - method: fuerza un método distinto a config['method'] (opcional)
-    - persist: guarda en BD si True y hay storage
-
-    Devuelve el DataFrame con columnas ['ts','score','score_base','score_alt'(si aplica),'comp.*']
-    """
-    if not isinstance(df, pd.DataFrame) or "ts" not in df.columns:
-        raise ValueError("df debe ser un DataFrame con columna 'ts'")
-
-    _config = dict(config or {})
-    if method:
-        _config["method"] = method
-
-    scored = compute_score_timeseries(df, _config)
-
-    if persist and storage is not None:
-        meth = (_config.get("method") or "weighted").lower()
-        # guardamos fila a fila para mantener histórico consistente y permitir upsert
-        # (optimizable más adelante a batch si lo necesitas)
-        for _, row in scored.iterrows():
-            ts = int(row["ts"])
-            score_val = float(row["score"]) if pd.notna(row["score"]) else None
-            # componemos dict de componentes (solo comp.*)
-            comps = {k.replace("comp.", ""): (float(row[k]) if pd.notna(row[k]) else None)
-                     for k in scored.columns if k.startswith("comp.")}
-            try:
-                storage.upsert_score(asset, ts, score_val, comps, meth)
-            except Exception as e:
-                logger.exception("Error guardando score (asset=%s ts=%s): %s", asset, ts, e)
-
-    return scored
-
-
-def compute_latest_score(
-    asset: str,
-    df: pd.DataFrame,
-    config: Dict[str, Any],
-    storage: Optional[Any] = None,
-    persist: bool = True,
-) -> Dict[str, Any]:
-    """
-    Calcula el score SOLO para la última fila de df.
-    Ideal para ciclos en tiempo real.
-
-    Devuelve:
-      {"ts": int, "score": float, "score_base": float, "components": {..}, "method": str}
-    """
-    scored = compute_score_timeseries(df.tail(1000), config)
-    last = scored.iloc[-1].to_dict()
-    out = {
-        "ts": int(last["ts"]),
-        "score": float(last["score"]) if pd.notna(last["score"]) else None,
-        "score_base": float(last["score_base"]) if pd.notna(last["score_base"]) else None,
-        "components": {k.replace("comp.", ""): (float(last[k]) if pd.notna(last[k]) else None)
-                       for k in scored.columns if k.startswith("comp.")},
-        "method": (config.get("method") or "weighted").lower(),
-    }
-    if persist and storage is not None:
-        try:
-            storage.upsert_score(asset, out["ts"], out["score"], out["components"], out["method"])
-        except Exception as e:
-            logger.exception("Error guardando último score (asset=%s ts=%s): %s", asset, out["ts"], e)
-    return out
-# ----------------------------
-# Stop / Target helpers (ATR-based)
-# Pegar al final de core/score.py
-# ----------------------------
-import math
-from typing import Dict, Optional
 import numpy as np
+import logging
+import pandas
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
 
-# Nota: 'logger' ya existe en este módulo; si no, definimos uno suave
-try:
-    logger
-except NameError:
-    import logging
-    logger = logging.getLogger("score")
 
-def compute_atr(df, window: int = 14, high_col="high", low_col="low", close_col="close") -> Optional[float]:
+# -------------------- mapping functions (raw -> 0..1) -------------------- #
+def ema_to_score(raw_ema: float) -> float:
     """
-    Calcula ATR simple (Wilder) sobre df ordenado ascendentemente por tiempo.
-    Devuelve el último ATR (float) o None si no hay datos suficientes.
+    raw_ema: value computed by indicators.apply_indicators (tanh scaled relative diff, roughly -1..1)
+    Interpreting: positive => bullish -> higher score.
     """
-    if df is None or len(df) < max(2, window):
-        return None
-    if not all(c in df.columns for c in (high_col, low_col, close_col)):
-        logger.debug("compute_atr: columnas OHLC faltan en df")
-        return None
-    high = df[high_col].astype(float)
-    low = df[low_col].astype(float)
-    close = df[close_col].astype(float)
-
-    prev_close = close.shift(1)
-    tr1 = (high - low).abs()
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    # Wilder smoothing: ATR_t = (ATR_{t-1} * (n-1) + TR_t) / n
-    # Implementado con .ewm(adjust=False) aproximado o con rolling mean for warmup
     try:
-        atr = tr.rolling(window=window, min_periods=window).mean()
-        # For more Wilder exact: use ewm on full TR with alpha=1/window after warmup; keep simple for now
-        atr = atr.fillna(method="ffill")
-        last_atr = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else None
-        return last_atr
-    except Exception as e:
-        logger.exception("compute_atr error: %s", e)
-        return None
+        s = float(raw_ema)
+    except Exception:
+        s = 0.0
+    # map -1..1 -> 0..1
+    s = max(-1.0, min(1.0, s))
+    return (s + 1.0) / 2.0
 
-def infer_direction_by_ema(df, short_span: int = 9, long_span: int = 40, close_col="close") -> str:
-    """
-    Heurística sencilla para inferir si la tendencia actual es 'long' o 'short'
-    usando dos EMAs sobre el close. Devuelve 'long' si EMA_short > EMA_long, sino 'short'.
-    """
-    if df is None or close_col not in df.columns or len(df) < max(short_span, long_span):
-        return "long"  # fallback neutro
-    close = df[close_col].astype(float)
-    ema_short = close.ewm(span=short_span, adjust=False).mean()
-    ema_long = close.ewm(span=long_span, adjust=False).mean()
-    return "long" if ema_short.iloc[-1] > ema_long.iloc[-1] else "short"
 
-def compute_entry_stop_target(
-    df,
-    atr_window: int = 14,
-    stop_mult: float = 1.3,
-    target_mult: float = 2.6,
-    entry_price: Optional[float] = None,
-    direction: Optional[str] = None,
-    close_col="close"
-) -> Dict:
+def rsi_to_score(raw_rsi: float, lower: float = 30.0, upper: float = 70.0) -> float:
     """
-    Dado un DataFrame de velas (orden asc), calcula:
-      - atr (último)
-      - entry_price (último close si no se pasa)
-      - stop (entry ± 1.3 * atr)
-      - target (entry ± 2.6 * atr)
-      - direction: 'long' o 'short' (si no se pasa, se infiere por EMA)
-    Devuelve dict con keys: atr, entry, stop, target, direction, pct_stop, pct_target
+    raw_rsi: 0..100. Best zone typically above 50, penalize overbought extreme > upper and oversold < lower.
+    We map:
+      - rsi <= lower -> 0.25
+      - rsi == 50 -> 0.6
+      - rsi between lower..upper -> linear mapping favoring middle
+      - rsi > upper -> decreasing score (overbought)
+    Adjust mapping to prefer slightly bullish (>50).
     """
-    out = {"atr": None, "entry": None, "stop": None, "target": None, "direction": None,
-           "pct_stop": None, "pct_target": None}
-    if df is None or len(df) == 0:
-        return out
-
     try:
-        atr = compute_atr(df, window=atr_window, close_col=close_col)
-        out["atr"] = atr
-        entry = float(entry_price) if entry_price is not None else float(df[close_col].iloc[-1])
-        out["entry"] = entry
+        r = float(raw_rsi)
+    except Exception:
+        return 0.5
+    # clamp
+    r = max(0.0, min(100.0, r))
+    # normalize 0..1
+    mid = 50.0
+    if r <= lower:
+        return 0.2
+    if r >= upper:
+        # penalize heavy overbought slightly
+        val = 0.8 - (r - upper) / (100.0 - upper) * 0.6
+        return float(max(0.0, min(0.95, val)))
+    # between lower and upper: map to 0.2..0.9 favoring mid->higher
+    norm = (r - lower) / (upper - lower)
+    # use ease curve
+    val = 0.2 + 0.7 * (norm ** 0.8)
+    return float(min(max(val, 0.0), 1.0))
 
-        if direction is None:
-            direction = infer_direction_by_ema(df, close_col=close_col)
-        out["direction"] = direction
 
-        if atr is None or atr <= 0:
-            # No ATR available -> no stop/target
-            return out
+def macd_to_score(raw_macd: float) -> float:
+    """
+    raw_macd: roughly -1..1 after tanh scaling. Positive -> bullish.
+    Map to 0..1.
+    """
+    try:
+        m = float(raw_macd)
+    except Exception:
+        m = 0.0
+    m = max(-1.0, min(1.0, m))
+    return (m + 1.0) / 2.0
 
-        if direction == "long":
-            stop = entry - stop_mult * atr
-            target = entry + target_mult * atr
+
+def atr_to_score(raw_atr: float, reference_price: Optional[float] = None) -> float:
+    """
+    ATR is absolute volatility. Lower ATR relative to price is preferred for 'cleaner' entries.
+    We compute coefficient = atr / reference_price (if reference present), then map invert: lower -> higher score.
+    If reference_price missing or zero, fallback to an empirical mapping that normalizes within [0..1] using a soft curve.
+    """
+    try:
+        a = float(raw_atr)
+    except Exception:
+        return 0.5
+    if a <= 0:
+        return 0.9
+    if reference_price and reference_price > 0:
+        rel = a / reference_price
+        # typical rel ranges: 0.0001 .. 0.05 ; map via logistic-like function
+        val = 1.0 / (1.0 + rel * 200.0)  # scale factor 200 chosen empirically
+        return float(max(0.0, min(1.0, val)))
+    # fallback: small atr -> good
+    val = 1.0 / (1.0 + a)
+    return float(max(0.0, min(1.0, val)))
+
+
+def fibonacci_to_score(fib_dict: Dict[str, float], close: Optional[float]) -> float:
+    """
+    fib_dict: mapping fib levels to prices (from indicators)
+    close: current price
+    We reward price near a lower fib support (i.e., close to fib_0..fib_1). If info missing, return 0.5.
+    """
+    if not fib_dict or close is None:
+        return 0.5
+    # find fib levels below or equal to close, choose the nearest one
+    try:
+        levels = [(k, float(v)) for k, v in fib_dict.items() if isinstance(v, (int, float))]
+        if not levels:
+            return 0.5
+        # compute distances
+        dist = [(k, abs(close - price), price) for k, price in levels]
+        # choose minimal distance
+        kmin, dmin, price_min = min(dist, key=lambda x: x[1])
+        # normalize distance relative to span between fib_0 and fib_1 if available
+        if 'fib_0' in fib_dict and 'fib_1' in fib_dict:
+            span = abs(float(fib_dict['fib_0']) - float(fib_dict['fib_1'])) or 1.0
+            score = 1.0 - min(1.0, dmin / (0.5 * span))
+            return float(max(0.0, min(1.0, score)))
         else:
-            # short
-            stop = entry + stop_mult * atr
-            target = entry - target_mult * atr
-
-        out.update({
-            "stop": float(stop),
-            "target": float(target),
-            "pct_stop": (stop - entry) / entry if entry != 0 else None,
-            "pct_target": (target - entry) / entry if entry != 0 else None
-        })
-        return out
-    except Exception as e:
-        logger.exception("compute_entry_stop_target error: %s", e)
-        return out
-
-# Convenience helper that uses the project adapter to load candles for an asset
-def compute_stop_target_for_asset(adapter_obj, asset: str, interval: str = "1h", lookback: int = 200,
-                                  atr_window: int = 14, stop_mult: float = 1.3, target_mult: float = 2.6) -> Dict:
-    """
-    Usa `adapter_obj.load_candles(asset, limit=lookback)` y calcula stop/target.
-    adapter_obj es el singleton `core.adapter.adapter` o equivalente.
-    """
-    try:
-        df = adapter_obj.load_candles(asset, limit=lookback)
-        # adapter retorna DataFrame o None
-        return compute_entry_stop_target(df, atr_window=atr_window, stop_mult=stop_mult,
-                                         target_mult=target_mult, entry_price=None)
-    except Exception as e:
-        logger.exception("compute_stop_target_for_asset failed for %s %s: %s", asset, interval, e)
-        return {"error": str(e)}
-# --- Inicio parche core/score.py: persistencia fallback para scores ---
-import os
-import logging
-logger = logging.getLogger(__name__)
-
-def _persist_score_fallback(storage, asset: str, ts: int, score_val: float, components: dict, method: str = None):
-    """
-    Intentar persistir score con varias estrategias:
-     - storage.upsert_score(...) si existe
-     - si storage.get_conn() existe, usar SQL simple
-     - fallback a psycopg2 con DATABASE_URL
-    """
-    if storage is None:
-        logger.debug("No storage provided to persist score.")
-        return False
-
-    # 1) método directo
-    try:
-        if hasattr(storage, "upsert_score"):
-            return storage.upsert_score(asset, ts, score_val, components, method)
-    except Exception as e:
-        logger.exception("storage.upsert_score failed: %s", e)
-
-    # 2) intentar usar conexión propia de storage
-    try:
-        if hasattr(storage, "get_conn"):
-            conn = storage.get_conn()
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO scores (asset, ts, score, method, components)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (asset, ts) DO UPDATE SET score = EXCLUDED.score, method = EXCLUDED.method, components = EXCLUDED.components
-                """, (asset, int(ts), float(score_val) if score_val is not None else None, method, json.dumps(components) if components else None))
-            conn.commit()
-            return True
-    except Exception as e:
-        logger.exception("Persist via storage.get_conn failed: %s", e)
-
-    # 3) fallback: psycopg2 + DATABASE_URL
-    try:
-        import psycopg2
-        dsn = os.getenv("DATABASE_URL")
-        if not dsn:
-            logger.debug("No DATABASE_URL for fallback")
-            return False
-        with psycopg2.connect(dsn) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO scores (asset, ts, score, method, components)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (asset, ts) DO UPDATE SET score = EXCLUDED.score, method = EXCLUDED.method, components = EXCLUDED.components
-                """, (asset, int(ts), float(score_val) if score_val is not None else None, method, json.dumps(components) if components else None))
-            conn.commit()
-        return True
-    except Exception as e:
-        logger.exception("Persist fallback via psycopg2 failed: %s", e)
-    return False
-
-# Attach to module so compute_and_persist_scores puede usarlo si storage.upsert_score falla.
-_persist_score = _persist_score_fallback
-# --- Fin parche core/score.py ---
-# ----------------------------
-# Score helpers: normalize weights and safe compute wrapper
-# ----------------------------
-import logging
-from typing import Dict, Any
-import json
-
-_logger = logging.getLogger(__name__)
-
-def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
-    """
-    Normaliza un diccionario de pesos para que sumen 1.0 (si s>0)
-    """
-    try:
-        s = sum(float(v) for v in weights.values())
-        if s > 0:
-            return {k: float(v) / s for k, v in weights.items()}
-    except Exception as e:
-        _logger.exception("normalize_weights failed: %s", e)
-    # fallback: return original as floats
-    return {k: float(v) for k, v in weights.items()}
-
-def compute_score_safe(df, score_config: Dict[str, Any], weights_override: Dict[str, float] = None):
-    """
-    Safe wrapper to compute a score:
-      - If module defines compute_score(df, config) use it.
-      - Otherwise compute a simple weighted average over named component columns present in df.
-    score_config expected to contain 'components' mapping with names -> { weight: .., source: ... }
-    """
-    try:
-        # If a compute_score function exists above in the module, prefer it
-        if "compute_score" in globals() and callable(globals()["compute_score"]):
-            try:
-                return globals()["compute_score"](df, score_config)
-            except Exception:
-                _logger.exception("module compute_score failed, falling back to simple weighted calc")
-
-        # Build weights mapping
-        components = score_config.get("components", {}) if isinstance(score_config, dict) else {}
-        weights = {name: float(defn.get("weight", 0.0)) for name, defn in components.items()}
-        if weights_override:
-            # override or merge
-            for k,v in weights_override.items():
-                weights[k] = float(v)
-        weights = normalize_weights(weights)
-
-        # compute per-row simple weighted sum using columns that match component keys (if present)
-        import pandas as _pd
-        if df is None or not hasattr(df, "shape"):
-            return None
-        # prepare series for each weight; if column missing use 0
-        total = _pd.Series(0, index=df.index, dtype=float)
-        for comp, w in weights.items():
-            if comp in df.columns:
-                col = df[comp].astype(float).fillna(0.0)
-            else:
-                # try fallback: common mapping rsi->rsi_14, ema->ema_50, etc (very naive)
-                mapping = {
-                    "rsi": "rsi_14",
-                    "ema": "ema_50",
-                    "atr": "atr",
-                    "macd": "macd",
-                    "support": "support",
-                    "fibonacci": "fibonacci"
-                }
-                alt = mapping.get(comp)
-                col = df[alt].astype(float).fillna(0.0) if (alt and alt in df.columns) else _pd.Series(0.0, index=df.index)
-            total = total + col * float(w)
-        # keep 0..1 bounds
-        total = total.clip(lower=0.0, upper=1.0)
-        return total
+            # fallback: small distance -> good
+            score = 1.0 / (1.0 + dmin)
+            return float(max(0.0, min(1.0, score)))
     except Exception:
-        _logger.exception("compute_score_safe failed")
-        return None
+        return 0.5
 
-# persistence helper: compute & persist last score for an asset (best-effort)
-def compute_and_persist_last_score(asset: str, df, score_config: Dict[str, Any], storage_module=None):
+
+def support_to_score(support_info: Dict[str, Any], close: Optional[float]) -> float:
     """
-    Computes the latest score for df using compute_score_safe and attempts to persist it
-    using a storage module if provided (expects storage_module.save_scores or storage upsert).
+    support_info expected as {"support_price": float, "span": float, "support_score": float}
+    If present, return support_score; otherwise 0.5
     """
+    if not support_info or close is None:
+        return 0.5
     try:
-        series = compute_score_safe(df, score_config)
-        if series is None or len(series) == 0:
-            return False
-        last_val = float(series.iloc[-1])
-        ts = int(df.iloc[-1].get("ts") if "ts" in df.columns else 0)
-        # try to persist via score persistence function, if present
-        if storage_module:
-            try:
-                if hasattr(storage_module, "save_scores"):
-                    # assume save_scores(asset, df_of_scores) signature -- not guaranteed
-                    storage_module.save_scores(asset, series.to_frame(name="score"))
-                    return True
-            except Exception:
-                _logger.exception("Failed saving score via storage_module")
-        # otherwise try module-level _persist_score if exists
-        if "_persist_score" in globals() and callable(globals()["_persist_score"]):
-            try:
-                globals()["_persist_score"](asset, ts, float(last_val), method=score_config.get("method"))
-                return True
-            except Exception:
-                _logger.exception("_persist_score call failed")
+        return float(max(0.0, min(1.0, float(support_info.get('support_score', 0.5)))))
     except Exception:
-        _logger.exception("compute_and_persist_last_score failed")
-    return False
+        return 0.5
 
+
+# -------------------- compute single-row score -------------------- #
+def compute_score_for_row(value: Dict[str, Any], weights: Dict[str, float], cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    value: dict produced by apply_indicators (keys: ema, rsi, macd, atr, fibonacci, support)
+    weights: normalized dict (sum -> 1.0) with keys matching: ema, support, atr, macd, rsi, fibonacci
+    cfg: optional dict: { 'entry_bias': 'close'|'fib_support', 'side': 'long'|'short' }
+    Returns:
+      { "score": 0..1, "details": { per-indicator raw & mapped, entry, stop, target } }
+    """
+    cfg = cfg or {}
+    entry_bias = cfg.get("entry_bias", "close")  # currently only close supported
+    side = cfg.get("side", "long")  # 'long' or 'short' (used to invert stop/target)
+
+    # read raw values with safe defaults
+    raw_ema = float(value.get('ema', 0.0))
+    raw_rsi = float(value.get('rsi', 50.0))
+    raw_macd = float(value.get('macd', 0.0))
+    raw_atr = float(value.get('atr', 0.0))
+    raw_fib = value.get('fibonacci', {}) or {}
+    raw_support = value.get('support', {}) or {}
+    # reference price for ATR normalization - prefer close
+    ref_price = None
+    # If value contains a 'close' key deliver it; otherwise external caller should pass reference_price in cfg
+    ref_price = float(value.get('close')) if value.get('close') is not None else cfg.get('reference_price')
+
+    # per-indicator mapped scores 0..1
+    s_ema = ema_to_score(raw_ema)
+    s_rsi = rsi_to_score(raw_rsi, lower=cfg.get('rsi_lower', 30.0), upper=cfg.get('rsi_upper', 70.0))
+    s_macd = macd_to_score(raw_macd)
+    s_atr = atr_to_score(raw_atr, reference_price=ref_price)
+    s_fib = fibonacci_to_score(raw_fib, ref_price)
+    s_support = support_to_score(raw_support, ref_price)
+
+    # ensure canonical keys in weights
+    w_ema = float(weights.get('ema', 0.0))
+    w_support = float(weights.get('support', 0.0))
+    w_atr = float(weights.get('atr', 0.0))
+    w_macd = float(weights.get('macd', 0.0))
+    w_rsi = float(weights.get('rsi', 0.0))
+    w_fib = float(weights.get('fibonacci', 0.0))
+
+    # weighted sum
+    score = (s_ema * w_ema + s_support * w_support + s_atr * w_atr + s_macd * w_macd + s_rsi * w_rsi + s_fib * w_fib)
+    # clamp to 0..1
+    score = max(0.0, min(1.0, float(score)))
+
+    # compute entry/stop/target using ATR (if ref_price available)
+    entry_price = None
+    stop_price = None
+    target_price = None
+    if ref_price:
+        entry_price = float(ref_price)
+        stop_distance = 1.3 * raw_atr
+        target_distance = 2.6 * raw_atr
+        if side == 'long':
+            stop_price = entry_price - stop_distance
+            target_price = entry_price + target_distance
+        else:
+            stop_price = entry_price + stop_distance
+            target_price = entry_price - target_distance
+
+    details = {
+        "ema": {"raw": raw_ema, "score": s_ema, "weight": w_ema},
+        "rsi": {"raw": raw_rsi, "score": s_rsi, "weight": w_rsi},
+        "macd": {"raw": raw_macd, "score": s_macd, "weight": w_macd},
+        "atr": {"raw": raw_atr, "score": s_atr, "weight": w_atr},
+        "fibonacci": {"raw": raw_fib, "score": s_fib, "weight": w_fib},
+        "support": {"raw": raw_support, "score": s_support, "weight": w_support},
+        "entry": entry_price,
+        "stop": stop_price,
+        "target": target_price
+    }
+
+    return {"score": score, "details": details}
+
+
+# -------------------- batch compute for DataFrame -------------------- #
+def compute_scores_from_df(df: "pandas.DataFrame", weights: Dict[str, float], method: str = "weighted", cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    df: pandas.DataFrame where every row corresponds to a timestamp and contains indicator columns
+        OR is the result of pd.json_normalize on indicators.value (i.e., has columns ema,rsi,macd,atr,fibonacci,support)
+        Important: If 'ts' column present, it will be used for output.
+        If 'close' present, it will be used as reference_price for ATR normalization and entry.
+    weights: dict normalized (sum -> 1.0). Keys: ema, support, atr, macd, rsi, fibonacci
+    method: reserved for future variants; currently only 'weighted' supported.
+    cfg: optional dict passed to compute_score_for_row
+    Returns: list of dicts: [{ "ts": <int>, "score": <0..1>, "details": {...} }, ...] ordered by df order.
+    """
+    import pandas as pd
+    if df is None or df.empty:
+        return []
+    cfg = cfg or {}
+    # ensure keys exist in weights
+    expected = ['ema', 'support', 'atr', 'macd', 'rsi', 'fibonacci']
+    # safe-get weights with 0 defaults
+    w = {k: float(weights.get(k, 0.0)) for k in expected}
+
+    out = []
+    # iterate rows vectorized-friendly (pandas apply is acceptable here)
+    def _row_to_val(row):
+        # build value dict consistent with compute_score_for_row expectations
+        val = {}
+        for k in expected:
+            val[k] = row.get(k, None)
+        # include close if present
+        if 'close' in row.index:
+            val['close'] = row['close']
+        if 'ts' in row.index:
+            val['ts'] = int(row['ts'])
+        return val
+
+    # Use DataFrame.itertuples for speed
+    for i, row in df.iterrows():
+        row_map = row.to_dict()
+        val = _row_to_val(row)
+        scored = compute_score_for_row(val, w, cfg=cfg)
+        ts = int(row_map.get('ts')) if 'ts' in row_map and not pd.isna(row_map.get('ts')) else None
+        out_item = {"ts": ts, "score": float(scored['score']), "details": scored['details']}
+        out.append(out_item)
+    return out
