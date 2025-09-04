@@ -30,6 +30,15 @@ nohup python run_service.py > "${WORKER_LOG}" 2>&1 &
 echo "[start] Worker log: ${WORKER_LOG}"
 PORT="${PORT:-8501}"
 echo "[start] Arrancando Streamlit en puerto ${PORT}..."
+python - <<'PY'
+import importlib, traceback
+try:
+    importlib.import_module('core.storage_postgres')
+    print("OK: core.storage_postgres importado correctamente")
+except Exception:
+    traceback.print_exc()
+PY
+
 exec streamlit run dashboard/app.py --server.port "${PORT}" --server.address "0.0.0.0" --server.enableCORS false
 
 

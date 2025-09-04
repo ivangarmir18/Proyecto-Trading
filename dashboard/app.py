@@ -28,6 +28,11 @@ Nota importante:
   con una función make_storage_from_env() o al menos una clase PostgresStorage con métodos usados abajo.
   Si tu storage tiene nombres distintos, el dashboard falla de forma controlada y te indicará qué método falta.
 """
+import logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
 
 import os
 import traceback
@@ -52,14 +57,23 @@ if os.getenv("OPENAI_API_KEY"):
 # Attempt to import factory for storage
 make_storage_from_env = None
 PostgresStorage = None
+make_storage_from_env = None
+PostgresStorage = None
 try:
     from core.storage_postgres import make_storage_from_env, PostgresStorage  # type: ignore
-except Exception:
+except Exception as e:
+    # mostrar la traza en Streamlit y en logs para depuración
+    import traceback, logging
+    logging.getLogger(__name__).exception("Error importando core.storage_postgres")
     try:
-        from core.storage_postgres import PostgresStorage  # type: ignore
+        import streamlit as st
+        st.error("Error importando core.storage_postgres. Mira el log para más detalles.")
+        st.exception(traceback.format_exc())
     except Exception:
-        PostgresStorage = None
+        # si no funciona Streamlit (p.ej. en proceso worker), no rompemos el arranque
+        pass
     make_storage_from_env = None
+    PostgresStorage = None
 
 # ---------------------------
 # Utility wrappers & helpers
