@@ -1,439 +1,354 @@
 # core/score.py
 """
-Módulo de scoring / features / entrenamiento / inferencia.
-
-Funciones principales exportadas:
- - features_from_candles(df) -> DataFrame (features, indexed by ts)
- - make_target(df, horizon=1) -> Series (target aligned with features)
- - train_and_persist(storage, asset, interval, model_name, X, y, model_type='rf', model_params=None)
-       -> dict (metadata)
- - infer_and_persist(storage, asset, interval, model_name=None, model_path=None, lookback=None)
-       -> DataFrame (predictions persisted)
+Cálculo y persistencia del SCORE de un activo.
 
 Diseño:
- - Las funciones son defensivas: validan inputs y lanzan excepciones claras.
- - El módulo intenta usar LightGBM si está instalado; si no, usa RandomForestRegressor de sklearn.
- - Modelos se guardan con joblib en data/models/{asset}_{interval}_{timestamp}_{model_name}.pkl
- - Registro de modelos: llama storage.save_model_record(asset, interval, model_name, metadata, path)
- - Inferencia: carga el último modelo si model_path no dado (storage.get_latest_model_record) y guarda resultados
-   con storage.save_scores(df_scores, asset, interval). El DataFrame pasado a save_scores debe tener columnas:
-   'ts' (ms int) y 'score' (dict JSON-serializable) -- storage se encargará de la persistencia.
+- Entrada: DataFrame OHLCV + columnas de indicadores (producidas por core.indicators.apply_indicators).
+- Configurable por componentes: cada componente mapea 1 columna o expresión a [0,1].
+- Normalizaciones disponibles: zscore->sigmoid, minmax, clip, escalado e inversión.
+- Agregación: weighted (por defecto). Preparado para añadir otras (rank, vote).
+- *Blend* opcional con un score alternativo (IA) por columna o serie externa.
+- Persistencia: guarda un histórico de scores en Postgres con upsert por ts.
+
+Ejemplo mínimo:
+    from core.score import compute_and_persist_scores, make_default_score_config
+    cfg = make_default_score_config()
+    compute_and_persist_scores("BTCUSDT", df_ind, cfg, storage=storage, method="weighted")
+
+Estructura de config (ejemplo):
+{
+  "method": "weighted",
+  "blend": {"enabled": True, "alpha": 0.3, "alt_col": "ai_score"},  # opcional
+  "components": {
+    "rsi": {
+      "source": "rsi_14",               # columna o 'expr' (pandas eval)
+      "norm": {"type": "minmax", "min": 0, "max": 100},  # mapea 0..100 -> 0..1
+      "weight": 0.3
+    },
+    "trend": {
+      "expr": "(close / ema_50) - 1",   # expresión con columnas del DF
+      "norm": {"type": "zscore", "window": 200, "clip": [0,1]}, # zscore->sigmoid->clip
+      "weight": 0.4
+    },
+    "macd": {
+      "source": "macd_hist",
+      "norm": {"type": "zscore", "window": 200, "clip": [0,1]},
+      "weight": 0.3
+    }
+  }
+}
 """
 
 from __future__ import annotations
-
-import os
-import time
-import json
+import math
 import logging
-from typing import Optional, Dict, Any, Tuple
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
-# ML libs
-try:
-    import lightgbm as lgb
-except Exception:
-    lgb = None
-
-try:
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.linear_model import LinearRegression
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import mean_squared_error, r2_score
-    import joblib
-except Exception:
-    # si sklearn no está instalado, fallamos temprano en funciones de entrenamiento
-    RandomForestRegressor = None
-    LinearRegression = None
-    train_test_split = None
-    mean_squared_error = None
-    r2_score = None
-    joblib = None
-
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
-
-MODELS_DIR = os.getenv("MODELS_DIR", "data/models")
+logger = logging.getLogger("score")
 
 
-# ---------------------------
-# Utilities / features
-# ---------------------------
-def _ensure_ts_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Asegura que df tenga columna 'ts' en ms y la convierte a índice datetime UTC."""
-    if "ts" not in df.columns:
-        raise ValueError("DataFrame de candles debe contener la columna 'ts' (ms desde epoch).")
-    df2 = df.copy()
-    # normalizar ts a int ms
-    if np.issubdtype(df2["ts"].dtype, np.datetime64):
-        df2["ts"] = (df2["ts"].astype("datetime64[ms]").astype("int64"))
+# ==========================
+# Helpers matemáticos
+# ==========================
+
+def _sigmoid(x: pd.Series) -> pd.Series:
+    # numéricamente estable
+    return 1.0 / (1.0 + pd.Series.map(-x, lambda v: math.exp(v) if pd.notna(v) else float("nan")))
+
+def _zscore(series: pd.Series, window: Optional[int] = None) -> pd.Series:
+    if window and window > 1:
+        mean = series.rolling(window=window, min_periods=max(5, window // 5)).mean()
+        std = series.rolling(window=window, min_periods=max(5, window // 5)).std(ddof=0)
     else:
-        df2["ts"] = df2["ts"].astype("int64")
-    df2 = df2.sort_values("ts")
-    df2["ts_dt"] = pd.to_datetime(df2["ts"], unit="ms", utc=True)
-    df2 = df2.set_index("ts_dt", drop=False)
-    return df2
+        mean = series.expanding(min_periods=10).mean()
+        std = series.expanding(min_periods=10).std(ddof=0)
+    z = (series - mean) / std.replace(0, pd.NA)
+    return z
+
+def _minmax(series: pd.Series, vmin: float, vmax: float) -> pd.Series:
+    rng = (vmax - vmin) if (vmax is not None and vmin is not None) else None
+    if rng is None or rng == 0:
+        return pd.Series(index=series.index, dtype=float)
+    return (series - vmin) / rng
+
+def _clip01(series: pd.Series, lo: float = 0.0, hi: float = 1.0) -> pd.Series:
+    return series.clip(lower=lo, upper=hi)
+
+def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
+    return a / b.replace(0, pd.NA)
 
 
-def _rolling_apply(df: pd.Series, window: int, fn):
-    """Helper seguro para rolling apply que maneja ventanas cortas."""
-    if window <= 0:
-        raise ValueError("window must be > 0")
-    if len(df) < window:
-        return pd.Series([np.nan] * len(df), index=df.index)
-    return df.rolling(window=window, min_periods=1).apply(fn, raw=False)
+# ==========================
+# Config dataclasses
+# ==========================
+
+@dataclass
+class NormCfg:
+    type: str = "zscore"             # "zscore" | "minmax" | "none"
+    window: Optional[int] = None     # zscore rolling window
+    min: Optional[float] = None      # minmax
+    max: Optional[float] = None      # minmax
+    clip: Optional[Tuple[float, float]] = (0.0, 1.0)  # clip final
+    invert: bool = False             # invierte (1 - x) al final
+
+@dataclass
+class ComponentCfg:
+    source: Optional[str] = None     # nombre de columna
+    expr: Optional[str] = None       # pandas.eval expression
+    norm: NormCfg = NormCfg()
+    weight: float = 1.0              # peso en agregación
+
+@dataclass
+class BlendCfg:
+    enabled: bool = False
+    alpha: float = 0.25              # 0..1 (peso del alternativo)
+    alt_col: Optional[str] = None    # columna con score alternativo (ej. IA)
 
 
-def features_from_candles(df: pd.DataFrame, include: Optional[list] = None) -> pd.DataFrame:
+# ==========================
+# Extracción/normalización de componentes
+# ==========================
+
+def _get_series_from_cfg(df: pd.DataFrame, comp: ComponentCfg) -> pd.Series:
     """
-    Calcula un set de features estándar a partir de candles OHLCV.
-    Input: df con columnas ts (ms), open, high, low, close, volume
-    Output: DataFrame indexado por ts_dt con columnas de features; mantiene columna 'ts' (ms int).
-    Features incluidas (por defecto):
-      - close, open, high, low, volume (passthrough)
-      - returns_1: log return 1 bar
-      - ma_5, ma_10, ma_20
-      - ema_10, ema_20
-      - vol_20: std dev of returns (volatility)
-      - momentum_10: close / ma_10 - 1
-      - rsi_14 (implementación simple)
+    Obtiene la serie fuente para el componente:
+    - Si comp.source, usa esa columna.
+    - Si comp.expr, evalúa expresión con pandas.eval (columnas del DF).
     """
-    if df is None or df.empty:
-        return pd.DataFrame()
+    if comp.source:
+        if comp.source not in df.columns:
+            raise KeyError(f"Columna no encontrada para componente: {comp.source}")
+        s = df[comp.source].astype(float)
+    elif comp.expr:
+        # pandas.eval con columnas del df (más seguro que eval)
+        s = pd.eval(comp.expr, local_dict={c: df[c] for c in df.columns if c in comp.expr})
+        s = pd.Series(s, index=df.index, dtype=float)
+    else:
+        raise ValueError("ComponentCfg requiere 'source' o 'expr'")
+    return s
 
-    df2 = _ensure_ts_index(df)
+def _normalize_series(s: pd.Series, cfg: NormCfg) -> pd.Series:
+    if cfg.type == "zscore":
+        z = _zscore(s, window=cfg.window)
+        out = _sigmoid(z)  # mapear a (0,1)
+    elif cfg.type == "minmax":
+        if cfg.min is None or cfg.max is None:
+            raise ValueError("minmax requiere 'min' y 'max'")
+        out = _minmax(s, cfg.min, cfg.max)
+    elif cfg.type == "none":
+        out = s.astype(float)
+    else:
+        raise ValueError(f"Normalización no soportada: {cfg.type}")
 
-    close = pd.to_numeric(df2["close"], errors="coerce")
-    open_ = pd.to_numeric(df2["open"], errors="coerce")
-    high = pd.to_numeric(df2["high"], errors="coerce")
-    low = pd.to_numeric(df2["low"], errors="coerce")
-    volume = pd.to_numeric(df2.get("volume", pd.Series([np.nan] * len(df2))), errors="coerce")
-
-    out = pd.DataFrame(index=df2.index)
-    out["ts"] = df2["ts"].astype("int64")
-    out["close"] = close
-    out["open"] = open_
-    out["high"] = high
-    out["low"] = low
-    out["volume"] = volume
-
-    # returns
-    out["ret_1"] = np.log(close) - np.log(close.shift(1))
-
-    # moving averages
-    out["ma_5"] = close.rolling(5, min_periods=1).mean()
-    out["ma_10"] = close.rolling(10, min_periods=1).mean()
-    out["ma_20"] = close.rolling(20, min_periods=1).mean()
-
-    # ema
-    out["ema_10"] = close.ewm(span=10, adjust=False).mean()
-    out["ema_20"] = close.ewm(span=20, adjust=False).mean()
-
-    # volatility (std of returns)
-    out["vol_20"] = out["ret_1"].rolling(20, min_periods=1).std()
-
-    # momentum
-    out["mom_10"] = close / out["ma_10"] - 1.0
-
-    # rsi 14 (simple)
-    delta = close.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    roll_up = up.ewm(span=14, adjust=False).mean()
-    roll_down = down.ewm(span=14, adjust=False).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    out["rsi_14"] = 100 - (100 / (1 + rs))
-
-    # fill small NaNs (but keep large NaNs)
-    out = out.replace([np.inf, -np.inf], np.nan)
-
-    # select included features if requested
-    if include:
-        cols = [c for c in include if c in out.columns]
-        if not cols:
-            raise ValueError("include no contiene columnas válidas")
-        out = out[["ts"] + cols]
-
+    if cfg.clip:
+        lo, hi = cfg.clip
+        out = _clip01(out, lo, hi)
+    if cfg.invert:
+        out = 1.0 - out
     return out
 
 
-def make_target(df: pd.DataFrame, horizon: int = 1, target_type: str = "forward_return") -> pd.Series:
+# ==========================
+# Agregación de componentes
+# ==========================
+
+def _aggregate_weighted(components_df: pd.DataFrame, weights: Dict[str, float]) -> pd.Series:
+    # asegura que pesos existan para todas las columnas
+    w = pd.Series({k: weights.get(k, 1.0) for k in components_df.columns}, dtype=float)
+    denom = w.sum()
+    if denom == 0 or pd.isna(denom):
+        return pd.Series(index=components_df.index, dtype=float)
+    # broadcasting por columnas
+    return (components_df * w.reindex(components_df.columns)).sum(axis=1) / denom
+
+
+# ==========================
+# API pública
+# ==========================
+
+def make_default_score_config() -> Dict[str, Any]:
     """
-    Construye objetivo a predecir a partir de velas.
-    - horizon: número de barras hacia adelante
-    - target_type: 'forward_return' -> (close_{t+h} / close_t) - 1
-                  'forward_logret' -> log return
-    Retorna Series indexada por ts_dt (misma indexación que features_from_candles).
+    Config por defecto (razonable si tienes EMA50, RSI14 y MACD_hist):
+    - RSI (0..100) -> minmax
+    - Trend: (close/ema_50 - 1) -> zscore->sigmoid
+    - MACD hist -> zscore->sigmoid
     """
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-
-    df2 = _ensure_ts_index(df)
-    close = pd.to_numeric(df2["close"], errors="coerce")
-    if target_type == "forward_return":
-        target = (close.shift(-horizon) / close) - 1.0
-    elif target_type == "forward_logret":
-        target = np.log(close.shift(-horizon)) - np.log(close)
-    else:
-        raise ValueError("Unsupported target_type")
-
-    # align index and drop last horizon rows (they will be NaN)
-    target.name = "target"
-    return target
-
-
-# ---------------------------
-# Training helpers
-# ---------------------------
-def _ensure_models_dir():
-    os.makedirs(MODELS_DIR, exist_ok=True)
-
-
-def _train_sklearn_regressor(X: pd.DataFrame, y: pd.Series, model_params: Optional[Dict[str, Any]] = None) -> Tuple[Any, Dict[str, Any]]:
-    """Entrena RandomForestRegressor (fallback) o LinearRegression si sample muy pequeño."""
-    if RandomForestRegressor is None:
-        raise RuntimeError("scikit-learn no está disponible en el entorno.")
-
-    X2 = X.fillna(0).astype(float)
-    y2 = y.astype(float)
-
-    # train/test split
-    if len(X2) < 50:
-        # dataset pequeño -> usar regresión simple
-        model = LinearRegression()
-    else:
-        params = model_params or {"n_estimators": 100, "max_depth": 8, "random_state": 42}
-        model = RandomForestRegressor(**params)
-
-    X_train, X_test, y_train, y_test = train_test_split(X2, y2, test_size=0.2, random_state=42)
-    model.fit(X_train, y_train)
-    preds = model.predict(X_test)
-    rmse = float(np.sqrt(mean_squared_error(y_test, preds))) if mean_squared_error else None
-    r2 = float(r2_score(y_test, preds)) if r2_score else None
-    metrics = {"rmse": rmse, "r2": r2, "train_samples": len(X_train), "test_samples": len(X_test)}
-    return model, metrics
-
-
-def _train_lightgbm(X: pd.DataFrame, y: pd.Series, model_params: Optional[Dict[str, Any]] = None) -> Tuple[Any, Dict[str, Any]]:
-    """Entrena un LightGBM regresor si está disponible."""
-    if lgb is None:
-        raise RuntimeError("lightgbm no está instalado")
-
-    X2 = X.fillna(0).astype(float)
-    y2 = y.astype(float)
-
-    params = model_params or {"objective": "regression", "metric": "rmse", "verbosity": -1, "seed": 42}
-    lgb_train = lgb.Dataset(X2, label=y2)
-    booster = lgb.train(params, lgb_train, num_boost_round=100)
-    # No hay split por defecto aquí — métricas mínimas
-    preds = booster.predict(X2)
-    rmse = float(np.sqrt(((preds - y2) ** 2).mean()))
-    metrics = {"rmse": rmse, "train_samples": len(X2)}
-    return booster, metrics
-
-
-# ---------------------------
-# Persistence: train_and_persist
-# ---------------------------
-def train_and_persist(storage: Any, asset: str, interval: str, model_name: str, X: pd.DataFrame, y: pd.Series,
-                      model_type: str = "auto", model_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Entrena un modelo y lo persiste en disco + storage.save_model_record.
-
-    Parámetros:
-      - storage: instancia con método save_model_record(asset, interval, model_name, metadata, path)
-      - asset, interval, model_name: strings
-      - X: DataFrame features (index ts_dt, has 'ts' column)
-      - y: Series target (aligned index)
-      - model_type: 'auto'|'lgb'|'sklearn'
-      - model_params: dict con hyperparams
-
-    Retorna metadata dict con métricas y ruta de archivo.
-    """
-    if X is None or X.empty:
-        raise ValueError("X vacío")
-    if y is None or y.empty:
-        raise ValueError("y vacío")
-
-    _ensure_models_dir()
-    # ensure index alignment
-    Xc = X.copy().drop(columns=["ts"], errors="ignore").fillna(0)
-    # align y with X
-    y_aligned = y.reindex(X.index).dropna()
-    Xc = Xc.loc[y_aligned.index]
-
-    # choose model
-    chosen = model_type
-    if model_type == "auto":
-        chosen = "lgb" if lgb is not None else "sklearn"
-
-    if chosen == "lgb":
-        model, metrics = _train_lightgbm(Xc, y_aligned, model_params=model_params)
-    elif chosen == "sklearn":
-        model, metrics = _train_sklearn_regressor(Xc, y_aligned, model_params=model_params)
-    else:
-        raise ValueError("model_type desconocido")
-
-    # persist model
-    ts = int(time.time() * 1000)
-    safe_name = f"{asset}_{interval}_{ts}_{model_name}".replace("/", "_")
-    path = os.path.join(MODELS_DIR, f"{safe_name}.pkl")
-
-    # LightGBM booster no serializable con joblib? joblib works; otherwise dump booster with .save_model
-    try:
-        if joblib is None:
-            raise RuntimeError("joblib no disponible para persistir modelos")
-        joblib.dump(model, path)
-    except Exception:
-        # fallback para lightgbm: usar save_model
-        if lgb is not None and isinstance(model, lgb.Booster):
-            path = os.path.join(MODELS_DIR, f"{safe_name}.txt")
-            model.save_model(path)
-        else:
-            raise
-
-    # metadata
-    metadata = {
-        "asset": asset,
-        "interval": interval,
-        "model_name": model_name,
-        "model_type": chosen,
-        "model_params": model_params or {},
-        "metrics": metrics,
-        "saved_at": int(time.time() * 1000),
+    return {
+        "method": "weighted",
+        "blend": {"enabled": False, "alpha": 0.25, "alt_col": None},
+        "components": {
+            "rsi": {
+                "source": "rsi_14",
+                "norm": {"type": "minmax", "min": 0, "max": 100, "clip": [0,1], "invert": False},
+                "weight": 0.3
+            },
+            "trend": {
+                "expr": "(close / ema_50) - 1",
+                "norm": {"type": "zscore", "window": 200, "clip": [0,1], "invert": False},
+                "weight": 0.4
+            },
+            "macd": {
+                "source": "macd_hist",
+                "norm": {"type": "zscore", "window": 200, "clip": [0,1], "invert": False},
+                "weight": 0.3
+            }
+        }
     }
 
-    # save model record in storage if API available
-    if storage and hasattr(storage, "save_model_record"):
-        try:
-            storage.save_model_record(asset, interval, model_name, metadata, path)
-        except Exception:
-            logger.exception("save_model_record falló — continuar de todos modos")
 
-    return {"path": path, "metadata": metadata}
-
-
-# ---------------------------
-# Infer & persist
-# ---------------------------
-def infer_and_persist(storage: Any, asset: str, interval: str, model_name: Optional[str] = None,
-                      model_path: Optional[str] = None, lookback: Optional[int] = None) -> pd.DataFrame:
+def compute_score_timeseries(
+    df: pd.DataFrame,
+    config: Dict[str, Any],
+) -> pd.DataFrame:
     """
-    Ejecuta inferencia con el último modelo (o model_path si se da) sobre velas recientes y persiste scores.
+    Calcula componentes normalizados y el score para todo el histórico del DataFrame.
+    Requiere 'ts' como columna (ms epoch) y columnas de indicadores referenciadas en la config.
 
-    Output:
-      - DataFrame con columnas ts (ms) y score (dict)
+    Returns:
+        DataFrame con columnas:
+          ['ts', 'score', 'score_base', 'score_alt'(si aplica), 'comp.<name>' ...]
     """
-    if storage is None:
-        raise ValueError("storage requerido para infer_and_persist")
+    if "ts" not in df.columns:
+        raise ValueError("El DataFrame debe contener columna 'ts' en ms")
 
-    # obtener modelo: preferir model_path, luego storage.get_latest_model_record
-    model = None
-    used_path = model_path
-    if model_path:
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"model_path no encontrado: {model_path}")
-        if joblib is None:
-            raise RuntimeError("joblib requerido para cargar modelos")
-        try:
-            model = joblib.load(model_path)
-        except Exception:
-            # try LightGBM load
-            if lgb is not None:
-                try:
-                    model = lgb.Booster(model_file=model_path)
-                except Exception:
-                    raise
-            else:
-                raise
+    comps_cfg_raw = config.get("components", {})
+    if not comps_cfg_raw:
+        raise ValueError("config.components requerido")
+
+    # Construir componentes normalizados
+    comp_cols = {}
+    weights = {}
+    for name, raw in comps_cfg_raw.items():
+        comp_cfg = ComponentCfg(
+            source=raw.get("source"),
+            expr=raw.get("expr"),
+            norm=NormCfg(
+                type=raw.get("norm", {}).get("type", "zscore"),
+                window=raw.get("norm", {}).get("window"),
+                min=raw.get("norm", {}).get("min"),
+                max=raw.get("norm", {}).get("max"),
+                clip=tuple(raw.get("norm", {}).get("clip", (0.0, 1.0))) if raw.get("norm", {}).get("clip") else None,
+                invert=bool(raw.get("norm", {}).get("invert", False)),
+            ),
+            weight=float(raw.get("weight", 1.0)),
+        )
+        s_raw = _get_series_from_cfg(df, comp_cfg)
+        s_norm = _normalize_series(s_raw, comp_cfg.norm)
+        comp_cols[name] = s_norm
+        weights[name] = comp_cfg.weight
+
+    comps_df = pd.DataFrame(comp_cols, index=df.index)
+
+    # Agregación
+    method = (config.get("method") or "weighted").lower()
+    if method == "weighted":
+        base_score = _aggregate_weighted(comps_df, weights)
     else:
-        rec = None
-        if hasattr(storage, "get_latest_model_record"):
-            rec = storage.get_latest_model_record(asset, interval)
-        if rec is None:
-            raise RuntimeError("No se encontró modelo en storage; proporciona model_path o entrena primero.")
-        used_path = rec.get("path")
-        if not used_path or not os.path.exists(used_path):
-            raise FileNotFoundError(f"Ruta de modelo no válida en storage: {used_path}")
-        if joblib is None:
-            raise RuntimeError("joblib requerido para cargar modelos")
-        try:
-            model = joblib.load(used_path)
-        except Exception:
-            if lgb is not None:
-                try:
-                    model = lgb.Booster(model_file=used_path)
-                except Exception:
-                    raise
-            else:
-                raise
+        raise ValueError(f"Método de score no soportado: {method}")
 
-    # cargar velas recientes
-    # lookback defines how many candles to fetch; try to use 1000 default
-    lookback = int(lookback) if lookback else 1000
-    try:
-        df_candles = storage.load_candles(asset, interval, limit=lookback)
-    except Exception as e:
-        logger.exception("load_candles falló en infer_and_persist: %s", e)
-        raise
+    # Blend con alternativo
+    out = pd.DataFrame(index=df.index)
+    out["ts"] = df["ts"].astype("int64")
+    out["score_base"] = _clip01(base_score, 0.0, 1.0)
 
-    if df_candles is None or df_candles.empty:
-        raise RuntimeError("No hay velas para inferir")
+    blend_cfg_raw = config.get("blend", {}) or {}
+    blend = BlendCfg(
+        enabled=bool(blend_cfg_raw.get("enabled", False)),
+        alpha=float(blend_cfg_raw.get("alpha", 0.25)),
+        alt_col=blend_cfg_raw.get("alt_col"),
+    )
+    if blend.enabled and blend.alt_col and blend.alt_col in df.columns:
+        alt = df[blend.alt_col].astype(float)
+        score = (1.0 - blend.alpha) * out["score_base"] + blend.alpha * alt
+        out["score_alt"] = alt
+        out["score"] = _clip01(score, 0.0, 1.0)
+    else:
+        out["score"] = out["score_base"]
 
-    feats = features_from_candles(df_candles)
-    X = feats.drop(columns=["ts"], errors="ignore").fillna(0)
-    X_idx = X.index
-    # predict
-    preds = None
-    try:
-        if lgb is not None and isinstance(model, lgb.Booster):
-            preds = model.predict(X)
-        else:
-            preds = model.predict(X.values)
-    except Exception as e:
-        logger.exception("Error al predecir: %s", e)
-        # intentar predict en bloques
-        preds = []
-        for i in range(0, len(X), 1000):
-            block = X.iloc[i : i + 1000]
+    # Adjuntar componentes normalizados para trazabilidad
+    for c in comps_df.columns:
+        out[f"comp.{c}"] = comps_df[c]
+
+    return out.reset_index(drop=True)
+
+
+def compute_and_persist_scores(
+    asset: str,
+    df: pd.DataFrame,
+    config: Dict[str, Any],
+    storage: Optional[Any] = None,
+    method: Optional[str] = None,
+    persist: bool = True,
+) -> pd.DataFrame:
+    """
+    Calcula el score (histórico) y, si se indica, lo guarda en BD.
+
+    - asset: símbolo del activo (ej. "BTCUSDT")
+    - df: DataFrame con 'ts' y columnas de indicadores (p.ej. tras apply_indicators)
+    - config: ver docstring arriba
+    - storage: instancia que expone upsert_score(asset, ts, score, components, method)
+    - method: fuerza un método distinto a config['method'] (opcional)
+    - persist: guarda en BD si True y hay storage
+
+    Devuelve el DataFrame con columnas ['ts','score','score_base','score_alt'(si aplica),'comp.*']
+    """
+    if not isinstance(df, pd.DataFrame) or "ts" not in df.columns:
+        raise ValueError("df debe ser un DataFrame con columna 'ts'")
+
+    _config = dict(config or {})
+    if method:
+        _config["method"] = method
+
+    scored = compute_score_timeseries(df, _config)
+
+    if persist and storage is not None:
+        meth = (_config.get("method") or "weighted").lower()
+        # guardamos fila a fila para mantener histórico consistente y permitir upsert
+        # (optimizable más adelante a batch si lo necesitas)
+        for _, row in scored.iterrows():
+            ts = int(row["ts"])
+            score_val = float(row["score"]) if pd.notna(row["score"]) else None
+            # componemos dict de componentes (solo comp.*)
+            comps = {k.replace("comp.", ""): (float(row[k]) if pd.notna(row[k]) else None)
+                     for k in scored.columns if k.startswith("comp.")}
             try:
-                if lgb is not None and isinstance(model, lgb.Booster):
-                    preds_block = model.predict(block)
-                else:
-                    preds_block = model.predict(block.values)
-                preds.extend(list(preds_block))
-            except Exception:
-                preds.extend([None] * len(block))
-        preds = np.array(preds)
+                storage.upsert_score(asset, ts, score_val, comps, meth)
+            except Exception as e:
+                logger.exception("Error guardando score (asset=%s ts=%s): %s", asset, ts, e)
 
-    # construir DataFrame para persistir
-    df_scores = pd.DataFrame({"ts": feats["ts"].astype("int64"), "score": [None] * len(feats)}, index=feats.index)
-    for i, p in enumerate(preds):
-        # asume regresor -> valor numérico
-        val = float(p) if p is not None and not np.isnan(p) else None
-        df_scores.iat[i, df_scores.columns.get_loc("score")] = {"pred": val}
-
-    # Persistir usando storage.save_scores (espera df_scores, asset, interval)
-    try:
-        storage.save_scores(df_scores, asset, interval)
-    except Exception:
-        logger.exception("storage.save_scores falló — intentar persistir por lotes")
-        # intento de persistencia manual (si save_scores no existe)
-        if hasattr(storage, "save_scores"):
-            raise
-        else:
-            # fallback: intentar insertar fila por fila con save_scores/otro método no implementado -> raise
-            raise RuntimeError("storage.save_scores no implementado y no se pudo persistir scores")
-
-    return df_scores
+    return scored
 
 
-# Export API
-__all__ = [
-    "features_from_candles",
-    "make_target",
-    "train_and_persist",
-    "infer_and_persist",
-]
+def compute_latest_score(
+    asset: str,
+    df: pd.DataFrame,
+    config: Dict[str, Any],
+    storage: Optional[Any] = None,
+    persist: bool = True,
+) -> Dict[str, Any]:
+    """
+    Calcula el score SOLO para la última fila de df.
+    Ideal para ciclos en tiempo real.
+
+    Devuelve:
+      {"ts": int, "score": float, "score_base": float, "components": {..}, "method": str}
+    """
+    scored = compute_score_timeseries(df.tail(1000), config)
+    last = scored.iloc[-1].to_dict()
+    out = {
+        "ts": int(last["ts"]),
+        "score": float(last["score"]) if pd.notna(last["score"]) else None,
+        "score_base": float(last["score_base"]) if pd.notna(last["score_base"]) else None,
+        "components": {k.replace("comp.", ""): (float(last[k]) if pd.notna(last[k]) else None)
+                       for k in scored.columns if k.startswith("comp.")},
+        "method": (config.get("method") or "weighted").lower(),
+    }
+    if persist and storage is not None:
+        try:
+            storage.upsert_score(asset, out["ts"], out["score"], out["components"], out["method"])
+        except Exception as e:
+            logger.exception("Error guardando último score (asset=%s ts=%s): %s", asset, out["ts"], e)
+    return out

@@ -1,0 +1,25 @@
+{
+  "method": "weighted",
+  "blend": {
+    "enabled": false,
+    "alpha": 0.25,
+    "alt_col": "ai_score"
+  },
+  "components": {
+    "rsi": {
+      "source": "rsi_14",
+      "norm": { "type": "minmax", "min": 0, "max": 100, "clip": [0,1], "invert": false },
+      "weight": 0.3
+    },
+    "trend": {
+      "expr": "(close / ema_50) - 1",
+      "norm": { "type": "zscore", "window": 200, "clip": [0,1], "invert": false },
+      "weight": 0.4
+    },
+    "macd": {
+      "source": "macd_hist",
+      "norm": { "type": "zscore", "window": 200, "clip": [0,1], "invert": false },
+      "weight": 0.3
+    }
+  }
+}
