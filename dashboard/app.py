@@ -63,9 +63,37 @@ class StreamlitMemoryHandler(logging.Handler):
 root_logger = logging.getLogger()
 if not any(isinstance(h, RotatingFileHandler) for h in root_logger.handlers):
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    fh = RotatingFileHandler(LOG_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
-    fh.setFormatter(fmt)
-    root_logger.addHandler(fh)
+    # --- Safe log handler creation (creates dir, fallback to stdout) ---
+    import os, tempfile
+    from logging import StreamHandler
+    
+    log_dir = os.path.dirname(LOG_PATH) or "."
+    
+    # Intentar crear la carpeta logs
+    try:
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+    except Exception as e:
+        # Si no se puede crear, usar /tmp
+        temp_log = os.path.join(tempfile.gettempdir(), "watchlist_app.log")
+        root_logger.warning("No se pudo crear %s (err=%s). Usando fallback %s", log_dir, e, temp_log)
+        LOG_PATH = temp_log
+        log_dir = os.path.dirname(LOG_PATH)
+    
+    # Intentar crear el RotatingFileHandler; si falla usar StreamHandler
+    try:
+        fh = RotatingFileHandler(LOG_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
+        fh.setFormatter(fmt)
+        root_logger.addHandler(fh)
+    except Exception as e:
+        root_logger.warning(
+            "RotatingFileHandler no disponible para %s (err=%s). Usando StreamHandler (stdout).",
+            LOG_PATH, e
+        )
+    sh = StreamHandler()
+    sh.setFormatter(fmt)
+    root_logger.addHandler(sh)
+
     memh = StreamlitMemoryHandler()
     memh.setFormatter(fmt)
     root_logger.addHandler(memh)
@@ -1037,4 +1065,3 @@ else:
 
 st.markdown("---")
 
-st.write("Dashboard listo. Si algo no funciona, pega aquí el primer traceback del terminal y lo soluciono. Voy a mantener esto compacto y compatible con tu repo existente.")
