@@ -1,22 +1,23 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-echo "===== START DASHBOARD: instalar dependencias ====="
-pip install -r requirements_prod.txt
-
-echo "===== START DASHBOARD: asegurar DB (opcional) ====="
-python - <<'PYCODE'
+echo "[start] Inicializando DB..."
+python - <<'PY'
 from core.storage_postgres import PostgresStorage
 try:
     s = PostgresStorage()
-    s.init_db()
-    print("DB init OK (dashboard)")
+    print("[start] DB OK")
 except Exception as e:
-    import sys, traceback
-    traceback.print_exc()
-    print("DB init FAILED (dashboard)", file=sys.stderr)
-PYCODE
+    print("[start] Error inicializando Postgres connection pool:", e)
+    raise
+PY
 
-echo "===== START DASHBOARD: arrancar streamlit ====="
-# Streamlit por defecto escucha en $PORT en Render; usamos opciones para servir correctamente
-streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0 --server.enableCORS false
+mkdir -p /tmp/watchlist_logs
+
+echo "[start] Arrancando worker en background (nohup)..."
+nohup python run_service.py > /tmp/watchlist_logs/worker.log 2>&1 &
+
+echo "[start] Worker log: /tmp/watchlist_logs/worker.log"
+
+echo "[start] Arrancando Streamlit en puerto 10000..."
+exec streamlit run dashboard/app.py --server.port 10000 --server.address 0.0.0.0
