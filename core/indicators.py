@@ -1,254 +1,236 @@
 # core/indicators.py
 """
-core/indicators.py
--------------------
-Funciones para calcular indicadores técnicos y un wrapper `apply_indicators`
-que devuelve un DataFrame con columnas canónicas y una fila por vela con:
- - ts (unix seconds)
- - open, high, low, close, volume (si vienen)
- - ema, rsi, macd (hist), atr, fibonacci (dict), support (dict)
+Gestión centralizada de indicadores técnicos.
 
-La salida está preparada para serializarse a JSON y guardarse en la tabla `indicators`
-como `value` (ej. value: { "ema": ..., "rsi": ..., "macd": ..., "atr": ..., "fibonacci": {...}, "support": {...} })
+Este módulo unifica el cálculo de indicadores desde los scripts en `indicators/`
+y proporciona una API uniforme para aplicarlos a activos. Además, permite
+guardar los resultados en la base de datos si se pasa un PostgresStorage.
 
-Design goals:
- - vectorizado con pandas / numpy
- - tolerante a datos faltantes
- - parámetros configurables
+Ejemplo de uso:
+    from core.indicators import apply_indicators
+    df = fetcher.fetch_asset("BTCUSDT", "5m", "2024-01-01", "2024-01-10")
+    df_ind = apply_indicators("BTCUSDT", df, {
+        "ema": {"period": 14},
+        "rsi": {"period": 14},
+        "macd": {"fast": 12, "slow": 26, "signal": 9},
+    }, storage=storage, interval="5m")
 """
 
 from __future__ import annotations
-from typing import Dict, Any, Optional, Tuple
-import numpy as np
-import pandas as pd
 import logging
+import pandas as pd
+from typing import Dict, Any, Optional
 
-log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)
+# Importamos los módulos de indicadores existentes
+from indicators.ema import ema
+from indicators.rsi import rsi
+from indicators.macd import macd
+# Si tienes ATR, Bollinger u otros, los importas aquí
+# from indicators.atr import atr
 
+logger = logging.getLogger("indicators")
 
-# ---------------------- low-level indicator implementations ---------------------- #
-def ema(series: pd.Series, span: int) -> pd.Series:
-    """Exponential moving average (pandas ewm)."""
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Relative Strength Index (classic Wilder smoothing). Returns 0..100."""
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = -delta.clip(upper=0.0)
-    # Wilder's smoothing
-    roll_up = up.ewm(alpha=1.0/period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1.0/period, adjust=False).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    rsi_series = 100 - (100 / (1 + rs))
-    return rsi_series.fillna(50.0)  # neutral for early values
+# Registro de funciones disponibles
+_INDICATOR_FUNCS = {
+    "ema": ema,
+    "rsi": rsi,
+    "macd": macd,
+    # "atr": atr,
+}
 
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+def list_available_indicators() -> list[str]:
     """
-    MACD line, signal line, histogram (macd - signal)
+    Devuelve una lista con los nombres de indicadores soportados.
     """
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+    return list(_INDICATOR_FUNCS.keys())
 
 
-def true_range(df: pd.DataFrame) -> pd.Series:
-    """True range for ATR calculation. Expects columns high, low, close."""
-    high = df['high']
-    low = df['low']
-    prev_close = df['close'].shift(1).fillna(df['close'])
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range (Wilder). Returns same index as df."""
-    tr = true_range(df)
-    # Wilder smoothing
-    atr_series = tr.ewm(alpha=1.0/period, adjust=False).mean()
-    return atr_series.fillna(method='backfill')  # fill initial NaNs
-
-
-# ---------------------- support / fibonacci helpers ---------------------- #
-def find_recent_swing_high_low(df: pd.DataFrame, lookback: int = 100) -> Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]:
+def calculate_indicator(name: str, df: pd.DataFrame, **params) -> pd.DataFrame:
     """
-    Busca el swing high y swing low más relevantes en un lookback (simple heuristic):
-    - swing_high: máximo de highs en window lookback
-    - swing_low: mínimo de lows en window lookback
-    Devuelve (swing_high_price, swing_low_price, index_high, index_low)
+    Calcula un indicador sobre un DataFrame.
+
+    Args:
+        name: nombre del indicador ("ema", "rsi", "macd", etc.)
+        df: DataFrame OHLCV (con columnas ['ts','open','high','low','close','volume'])
+        params: parámetros específicos del indicador (ej: period, fast, slow, signal)
+
+    Returns:
+        DataFrame con nuevas columnas para el indicador calculado.
     """
-    if df.shape[0] < 2:
-        return None, None, None, None
-    sub = df.tail(lookback)
-    idx_high = int(sub['high'].idxmax())
-    idx_low = int(sub['low'].idxmin())
-    return float(sub.loc[idx_high, 'high']), float(sub.loc[idx_low, 'low']), idx_high, idx_low
+    name = name.lower()
+    if name not in _INDICATOR_FUNCS:
+        raise ValueError(f"Indicador no soportado: {name}")
+    func = _INDICATOR_FUNCS[name]
+    try:
+        df_out = func(df.copy(), **params)
+        return df_out
+    except Exception as e:
+        logger.exception("Error calculando indicador %s: %s", name, e)
+        raise
 
 
-def fibonacci_levels_from_range(high: float, low: float) -> Dict[str, float]:
+def apply_indicators(
+    asset: str,
+    df: pd.DataFrame,
+    indicators_cfg: Dict[str, Dict[str, Any]],
+    storage: Optional[Any] = None,
+    interval: Optional[str] = None,
+) -> pd.DataFrame:
     """
-    Devuelve niveles fibonacci básicos (0.0..1.0) traducidos a precios:
-    common retracements: 0.236, 0.382, 0.5, 0.618, 0.786
+    Aplica múltiples indicadores a un DataFrame y opcionalmente guarda resultados en BD.
+
+    Args:
+        asset: símbolo del activo (ej: "BTCUSDT" o "AAPL")
+        df: DataFrame OHLCV
+        indicators_cfg: diccionario con configuraciones, ej:
+            {
+                "ema": {"period": 14},
+                "rsi": {"period": 14},
+                "macd": {"fast": 12, "slow": 26, "signal": 9}
+            }
+        storage: instancia de PostgresStorage (opcional)
+        interval: timeframe (ej: "5m", "1h") si se quiere guardar en BD
+
+    Returns:
+        DataFrame con todas las columnas de indicadores añadidas.
     """
-    span = high - low if high is not None and low is not None else None
-    if span is None or span == 0:
-        return {}
-    levels = {}
-    for r in (0.236, 0.382, 0.5, 0.618, 0.786):
-        levels[f"fib_{r}"] = high - r * span
-    levels["fib_0"] = high
-    levels["fib_1"] = low
-    return levels
+    out_df = df.copy()
+    for ind_name, params in indicators_cfg.items():
+        logger.info("Calculando indicador %s para %s con params=%s", ind_name, asset, params)
+        out_df = calculate_indicator(ind_name, out_df, **params)
 
+    if storage and interval:
+        try:
+            storage.upsert_indicators(asset, interval, out_df, indicators_cfg)
+            logger.info("Indicadores guardados en BD para %s [%s]", asset, interval)
+        except Exception as e:
+            logger.exception("Error guardando indicadores en BD: %s", e)
 
-def support_score_from_levels(close: float, support_price: float, span: float) -> float:
+    return out_df
+
+# --- Inicio parche core/indicators.py: registrar ATR y wrapper robusto ---
+import inspect
+import pandas as pd
+from indicators.atr import atr as _atr  # registrar ATR si existe
+
+# registrar atr si no estaba ya
+try:
+    if "atr" not in _INDICATOR_FUNCS:
+        _INDICATOR_FUNCS["atr"] = _atr
+except Exception:
+    # si por alguna razón _INDICATOR_FUNCS no existe, no romper
+    pass
+
+def _name_for_scalar_indicator(name: str, params: dict) -> str:
     """
-    Calcula un soporte simple: cuanto más cercano esté el precio al soporte (por debajo o encima),
-    mejor puntuación. Retorna 0..1.
+    Genera nombre de columna para indicadores que devuelven una sola serie.
+    Ej: ema period=14 -> 'ema_14'
     """
-    if support_price is None or span is None or span == 0:
-        return 0.5
-    # distancia relativa
-    dist = abs(close - support_price) / span
-    score = max(0.0, 1.0 - dist)  # si close==support -> 1.0 ; si muy lejos -> cercano a 0
-    return float(min(max(score, 0.0), 1.0))
+    if not params:
+        return name
+    # prefer 'period' param, si existe
+    p = params.get("period") or params.get("window") or params.get("length")
+    if p:
+        return f"{name}_{p}"
+    return name
 
-
-# ---------------------- main wrapper: apply_indicators ---------------------- #
-def apply_indicators(df: pd.DataFrame, asset: Optional[str] = None, interval: Optional[str] = None,
-                     cfg: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+def _call_indicator_func(func, name, df: pd.DataFrame, **params):
     """
-    Calcula indicadores sobre df de velas.
-
-    Entradas:
-      df: DataFrame que debe contener columnas: ts (unix seconds), open, high, low, close, volume (volume opcional).
-          Puede tener un índice arbitrario; retornará ordenado por ts asc.
-      asset, interval: opcionales, para meta logging/guardado.
-      cfg: dict con parámetros opcionales:
-          - ema_fast, ema_slow (int)
-          - rsi_period (int)
-          - macd_fast, macd_slow, macd_signal (int)
-          - atr_period (int)
-          - fib_lookback (int)
-          - support_lookback (int)
-
-    Salida:
-      DataFrame ordenado por ts asc, con columnas:
-        ts, open, high, low, close, volume,
-        ema_short, ema_long, ema (float normalized approx -1..1),
-        rsi (0..100),
-        macd_line, macd_signal, macd_hist,
-        atr,
-        fibonacci (dict),
-        support (dict)
+    Intenta varias firmas de llamada y normaliza la salida a DataFrame con columnas ya nombradas.
+    - intentos de llamada: func(series, **params) -> Series
+                       func(df, **params) -> Series/DataFrame/tuple
+                       func(close=series, **params)
+    - normaliza a DataFrame con nombres razonables.
     """
-    if df is None or df.empty:
-        return pd.DataFrame()
+    # prefer close series for single-series indicators
+    close = None
+    if isinstance(df, pd.DataFrame) and "close" in df.columns:
+        close = df["close"]
 
-    cfg = cfg or {}
-    ema_fast = int(cfg.get("ema_fast", 9))
-    ema_slow = int(cfg.get("ema_slow", 21))
-    rsi_period = int(cfg.get("rsi_period", 14))
-    macd_fast = int(cfg.get("macd_fast", 12))
-    macd_slow = int(cfg.get("macd_slow", 26))
-    macd_signal = int(cfg.get("macd_signal", 9))
-    atr_period = int(cfg.get("atr_period", 14))
-    fib_lookback = int(cfg.get("fib_lookback", 200))
-    support_lookback = int(cfg.get("support_lookback", 200))
+    # intentos de llamada ordenados
+    call_attempts = []
+    if close is not None:
+        call_attempts.append(lambda: func(close, **params))
+    call_attempts.append(lambda: func(df, **params))
+    call_attempts.append(lambda: func(**{"series": close, **params}) if close is not None else func(**params))
+    call_attempts.append(lambda: func(**params))
 
-    # copy and ensure columns
-    df = df.copy()
-    required = ['ts', 'open', 'high', 'low', 'close']
-    for c in required:
-        if c not in df.columns:
-            raise ValueError(f"apply_indicators: dataframe missing required column '{c}'")
-
-    # order by ts asc
-    df = df.sort_values("ts").reset_index(drop=True)
-    close = df['close'].astype(float)
-
-    # EMA
-    df['ema_short'] = ema(close, ema_fast)
-    df['ema_long'] = ema(close, ema_slow)
-    # normalized ema signal in -1..1: use relative difference
-    df['ema'] = ((df['ema_short'] - df['ema_long']) / df['ema_long'].replace(0, np.nan)).fillna(0.0)
-    # clip to prevent extreme outliers
-    df['ema'] = np.tanh(df['ema'] * 5)  # heuristic scaling
-
-    # RSI
-    df['rsi'] = rsi(close, period=rsi_period).clip(0, 100)
-
-    # MACD
-    macd_line, macd_signal_s, macd_hist = macd(close, fast=macd_fast, slow=macd_slow, signal=macd_signal)
-    df['macd_line'] = macd_line
-    df['macd_signal'] = macd_signal_s
-    df['macd_hist'] = macd_hist
-    # normalize macd_hist to -1..1 using tanh
-    df['macd'] = np.tanh(df['macd_hist'] / (df['close'].rolling(window=20).mean().replace(0, np.nan)))  # avoids scale issues
-    df['macd'] = df['macd'].fillna(0.0)
-
-    # ATR
-    df['atr'] = atr(df[['high', 'low', 'close']].rename(columns={'high':'high','low':'low','close':'close'}), period=atr_period).fillna(method='bfill')
-
-    # Fibonacci & support (per-row computed using lookback windows)
-    fib_levels_list = []
-    support_info_list = []
-
-    # We'll compute swing high/low using rolling windows for each row (but optimized by reusing tail slices)
-    # Simpler approach: compute single recent swing using the last fib_lookback rows (appropriate for indicators stored per ts)
-    for idx in range(df.shape[0]):
-        # slice up to current idx inclusive, but keep at least 2 rows
-        start_idx = max(0, idx - fib_lookback + 1)
-        window = df.iloc[start_idx:idx+1]
-        if window.shape[0] < 2:
-            fib_levels_list.append({})
-            support_info_list.append({})
+    last_exc = None
+    out = None
+    for attempt in call_attempts:
+        try:
+            out = attempt()
+            break
+        except TypeError as e:
+            last_exc = e
             continue
-        high, low, hi_idx, lo_idx = find_recent_swing_high_low(window, lookback=window.shape[0])
-        if high is None or low is None or high == low:
-            fib_levels_list.append({})
-            support_info_list.append({})
-            continue
-        fib_levels = fibonacci_levels_from_range(high, low)
-        # compute support_score candidate: use lowest low as support
-        span = high - low
-        support_price = low  # pragmatic support = recent low
-        close_price = float(df.iloc[idx]['close'])
-        support_score = support_score_from_levels(close_price, support_price, span)
-        support_info = {"support_price": support_price, "span": span, "support_score": support_score}
-        fib_levels_list.append(fib_levels)
-        support_info_list.append(support_info)
+        except Exception as e:
+            # si hay otro error, lo elevamos (indicador probablemente falló)
+            raise
 
-    df['fibonacci'] = fib_levels_list
-    df['support'] = support_info_list
+    if out is None:
+        raise RuntimeError(f"No se pudo ejecutar indicador {name}; último error: {last_exc}")
 
-    # prepare final compact "value" column with canonical keys for storage
-    # For each row, create a dict with keys: ema, rsi, macd, atr, fibonacci, support
-    values = []
-    for _, row in df.iterrows():
-        val = {
-            "ema": float(row['ema']) if not pd.isna(row['ema']) else 0.0,
-            "rsi": float(row['rsi']) if not pd.isna(row['rsi']) else 50.0,
-            "macd": float(row['macd']) if not pd.isna(row['macd']) else 0.0,
-            "atr": float(row['atr']) if not pd.isna(row['atr']) else 0.0,
-            "fibonacci": (row['fibonacci'] if isinstance(row['fibonacci'], dict) else {}),
-            "support": (row['support'] if isinstance(row['support'], dict) else {})
-        }
-        values.append(val)
+    # normalizar salida
+    # 1) tuple (macd_line, signal_line, hist)
+    if isinstance(out, tuple) or isinstance(out, list):
+        # caso típico: macd -> (macd_line, signal, hist)
+        cols = {}
+        if len(out) >= 1:
+            cols[f"{name}_line"] = pd.Series(out[0], index=close.index if close is not None else None) if isinstance(out[0], (pd.Series, list)) else pd.Series(out[0])
+        if len(out) >= 2:
+            cols[f"{name}_signal"] = pd.Series(out[1], index=close.index if close is not None else None) if isinstance(out[1], (pd.Series, list)) else pd.Series(out[1])
+        if len(out) >= 3:
+            cols[f"{name}_hist"] = pd.Series(out[2], index=close.index if close is not None else None) if isinstance(out[2], (pd.Series, list)) else pd.Series(out[2])
+        return pd.DataFrame(cols)
 
-    df_out = df.copy()
-    # attach canonical value dict and keep minimal columns
-    df_out['value'] = values
+    # 2) pandas Series
+    if isinstance(out, pd.Series):
+        col_name = _name_for_scalar_indicator(name, params)
+        ser = out
+        ser.index = df.index if isinstance(df, pd.DataFrame) else ser.index
+        return pd.DataFrame({col_name: ser})
 
-    # Recommended returned columns: ts, open, high, low, close, volume, value
-    keep_cols = [c for c in ['ts', 'open', 'high', 'low', 'close', 'volume', 'value'] if c in df_out.columns]
-    return df_out[keep_cols]
+    # 3) pandas DataFrame
+    if isinstance(out, pd.DataFrame):
+        # prefix columns with name if ambiguous
+        return out
+
+    # 4) numeric scalar (rare), broadcast to index
+    if isinstance(out, (int, float)):
+        col_name = _name_for_scalar_indicator(name, params)
+        idx = df.index if isinstance(df, pd.DataFrame) else None
+        return pd.DataFrame({col_name: pd.Series([out]*len(idx), index=idx)})
+
+    # fallback: intentar convertir a Series
+    try:
+        ser = pd.Series(out)
+        col_name = _name_for_scalar_indicator(name, params)
+        return pd.DataFrame({col_name: ser})
+    except Exception:
+        raise RuntimeError(f"Tipo de retorno no soportado por indicador {name}: {type(out)}")
+
+
+# Reemplazar la función calculate_indicator con una versión robusta si no está ya correctamente implementada
+try:
+    # solo reemplazar si la versión existente es corta o frágil; en cualquier caso adjuntamos la versión robusta
+    def calculate_indicator_safe(name: str, df: pd.DataFrame, **params) -> pd.DataFrame:
+        name = name.lower()
+        if name not in _INDICATOR_FUNCS:
+            raise ValueError(f"Indicador no soportado: {name}")
+        func = _INDICATOR_FUNCS[name]
+        # llamar y normalizar
+        out_df = _call_indicator_func(func, name, df, **params)
+        # asegurar que los índices coinciden con df
+        if isinstance(df, pd.DataFrame) and not out_df.empty:
+            out_df = out_df.reset_index(drop=True) if not out_df.index.equals(df.index) else out_df
+        return out_df
+
+    # override
+    calculate_indicator = calculate_indicator_safe
+except Exception:
+    # si falla, no rompemos la importación
+    pass
+
+# --- Fin parche core/indicators.py ---

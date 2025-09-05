@@ -1,316 +1,464 @@
 # core/adapter.py
 """
-core/adapter.py
-
-Factory + wrapper que expone una API uniforme para persistencia.
-- Si existe DATABASE_URL (Postgres/Supabase) -> usa PostgresStorage (core.storage_postgres.PostgresStorage).
-- Si no, usa un fallback SQLite ligero (LocalStorage) que implementa la misma API mínima.
-- Expone funciones/objeto con métodos:
-    - create_schema_if_missing()
-    - upsert_asset(symbol, tipo, meta)
-    - bulk_insert_candles(rows, batch_size=1000)
-    - get_last_candle_ts(asset, interval)
-    - bulk_insert_indicators(rows, batch_size=500)
-    - bulk_insert_scores(rows, batch_size=500)
-    - insert_score(asset, ts, method, score, details)
-    - upsert_backfill_status(asset, interval, last_ts, status)
-    - get_backfill_status(asset, interval)
-    - apply_retention(retention_days)
-    - list_assets()
-    - export_last_candles(asset, interval, limit)
-    - close()
-- También exporta normalize_weights(weights, expected_keys=None)
+Adapter seguro entre dashboard y el core del repo.
+Incluye:
+ - load/save de velas (intenta core.storage o core.fetch; fallback a CSV)
+ - apply_indicators (intenta core.indicators; fallback EMA/RSI)
+ - run_full_backfill / update_symbol / run_initial_backtests
+ - run_backtest_for / train_ai / infer_ai (llama a core.orchestrator / core.ai_* si existen)
+ - save/load settings (intenta core.storage, luego sqlite fallback, luego json)
+ - health_status
+Diseñado para no romper nada si faltan módulos.
 """
 
-from __future__ import annotations
 import os
-import logging
-from typing import Optional, Dict, Any, List
-
-log = logging.getLogger(__name__)
-log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
-
-# Try to import the professional Postgres implementation
-try:
-    from .storage_postgres import PostgresStorage  # professional implementation
-    _HAS_POSTGRES_IMPL = True
-except Exception:
-    PostgresStorage = None
-    _HAS_POSTGRES_IMPL = False
-
-# Lightweight SQLite fallback using SQLAlchemy Core (keeps API parity)
-from sqlalchemy import create_engine, MetaData, Table, Column, Integer, BigInteger, String, Float, UniqueConstraint, select, and_, delete, text
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.exc import IntegrityError
-import pathlib
+import sys
 import json
-from datetime import datetime, timezone
+import logging
+import sqlite3
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-class LocalStorageFallback:
-    """Fallback local sqlite storage with a subset of Postgres API (for dev/local)."""
-    def __init__(self, db_path: Optional[str] = None):
-        db_path = db_path or os.getenv("SQLITE_PATH", "data/db/data.db")
-        os.makedirs(pathlib.Path(db_path).parent, exist_ok=True)
-        url = f"sqlite:///{db_path}"
-        self.engine = create_engine(url, pool_pre_ping=True, future=True)
-        self.metadata = MetaData()
-        # define schema (compatible)
-        self._define_tables()
-        self.metadata.create_all(self.engine)
-        log.info("LocalStorageFallback initialized at %s", db_path)
+import pandas as pd
+import numpy as np
 
-    def _define_tables(self):
-        self.assets = Table(
-            "assets", self.metadata,
-            Column("symbol", String, primary_key=True),
-            Column("type", String, nullable=False, default="crypto"),
-            Column("meta", String, nullable=True),
-        )
-        self.candles = Table(
-            "candles", self.metadata,
-            Column("id", Integer, primary_key=True, autoincrement=True),
-            Column("asset", String, nullable=False, index=True),
-            Column("interval", String, nullable=False, index=True),
-            Column("ts", BigInteger, nullable=False),
-            Column("open", Float, nullable=False),
-            Column("high", Float, nullable=False),
-            Column("low", Float, nullable=False),
-            Column("close", Float, nullable=False),
-            Column("volume", Float, nullable=True),
-            UniqueConstraint("asset", "interval", "ts", name="u_candle"),
-        )
-        self.indicators = Table(
-            "indicators", self.metadata,
-            Column("id", Integer, primary_key=True, autoincrement=True),
-            Column("asset", String, nullable=False),
-            Column("interval", String, nullable=False),
-            Column("ts", BigInteger, nullable=False),
-            Column("name", String, nullable=False),
-            Column("value", String, nullable=True),
-        )
-        self.scores = Table(
-            "scores", self.metadata,
-            Column("id", Integer, primary_key=True, autoincrement=True),
-            Column("asset", String, nullable=False),
-            Column("ts", BigInteger, nullable=False),
-            Column("method", String, nullable=False),
-            Column("score", Float, nullable=False),
-            Column("details", String, nullable=True),
-        )
-        self.backfill_status = Table(
-            "backfill_status", self.metadata,
-            Column("asset", String, nullable=False),
-            Column("interval", String, nullable=False),
-            Column("last_ts", BigInteger, nullable=True),
-            Column("status", String, nullable=True),
-            Column("updated_at", String, nullable=True),
-            UniqueConstraint("asset", "interval", name="u_backfill"),
-        )
+LOG = logging.getLogger("core.adapter")
+LOG.setLevel(logging.INFO)
 
-    def create_schema_if_missing(self):
-        self.metadata.create_all(self.engine)
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_DIR = os.path.join(ROOT, "data")
+CACHE_DIR = os.path.join(DATA_DIR, "cache")
+CONF_DIR = os.path.join(DATA_DIR, "config")
+DB_DIR = os.path.join(DATA_DIR, "db")
+SETTINGS_DB = os.path.join(DB_DIR, "settings.db")
+SETTINGS_JSON = os.path.join(CONF_DIR, "settings.json")
+BACKTESTS_DIR = os.path.join(DB_DIR, "backtests")
 
-    def upsert_asset(self, symbol: str, tipo: str = "crypto", meta: Optional[dict] = None):
-        meta_s = json.dumps(meta or {})
-        stmt = sqlite_insert(self.assets).values(symbol=symbol, type=tipo, meta=meta_s)
-        # sqlite insert...on_conflict is supported via dialect extension; fallback simple try/except
-        with self.engine.begin() as conn:
-            try:
-                conn.execute(stmt)
-            except IntegrityError:
-                conn.execute(self.assets.update().where(self.assets.c.symbol == symbol).values(type=tipo, meta=meta_s))
+# ensure dirs exist
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CONF_DIR, exist_ok=True)
+os.makedirs(DB_DIR, exist_ok=True)
+os.makedirs(BACKTESTS_DIR, exist_ok=True)
 
-    def bulk_insert_candles(self, rows: List[dict], batch_size: int = 500):
-        if not rows:
-            return 0
-        inserted = 0
-        with self.engine.begin() as conn:
-            for r in rows:
-                try:
-                    conn.execute(self.candles.insert().values(**r))
-                    inserted += 1
-                except IntegrityError:
-                    continue
-        return inserted
+def _import_safe(module_path: str, attr: Optional[str] = None):
+    """Importa dinámicamente sin lanzar excepción (devuelve None si no existe)."""
+    try:
+        module = __import__(module_path, fromlist=[attr] if attr else [])
+        return getattr(module, attr) if attr else module
+    except Exception:
+        return None
 
-    def get_last_candle_ts(self, asset: str, interval: str):
-        with self.engine.connect() as conn:
-            q = select(self.candles.c.ts).where(and_(self.candles.c.asset == asset, self.candles.c.interval == interval)).order_by(self.candles.c.ts.desc()).limit(1)
-            r = conn.execute(q).fetchone()
-            return int(r[0]) if r else None
+# intentamos ligar con implementaciones reales si están
+_storage = _import_safe("core.storage")
+_fetch = _import_safe("core.fetch")
+_indicators = _import_safe("core.indicators")
+_orchestrator = _import_safe("core.orchestrator")
+_ai_train = _import_safe("core.ai_train")
+_ai_inf = _import_safe("core.ai_inference")
 
-    def bulk_insert_indicators(self, rows: List[dict], batch_size: int = 200):
-        if not rows:
-            return 0
-        count = 0
-        with self.engine.begin() as conn:
-            for r in rows:
-                try:
-                    r2 = r.copy()
-                    r2['value'] = json.dumps(r2.get('value', {}))
-                    conn.execute(self.indicators.insert().values(**r2))
-                    count += 1
-                except Exception:
-                    continue
-        return count
+class Adapter:
+    def __init__(self):
+        LOG.info("Adapter inicializado. storage=%s fetch=%s indicators=%s orchestrator=%s ai_train=%s ai_infer=%s",
+                 bool(_storage), bool(_fetch), bool(_indicators), bool(_orchestrator), bool(_ai_train), bool(_ai_inf))
 
-    def bulk_insert_scores(self, rows: List[dict], batch_size: int = 200):
-        if not rows:
-            return 0
-        count = 0
-        with self.engine.begin() as conn:
-            for r in rows:
-                try:
-                    r2 = r.copy()
-                    r2['details'] = json.dumps(r2.get('details', {}))
-                    conn.execute(self.scores.insert().values(**r2))
-                    count += 1
-                except Exception:
-                    continue
-        return count
-
-    def insert_score(self, asset: str, ts: int, method: str, score: float, details: Optional[dict] = None):
-        d = json.dumps(details or {})
-        with self.engine.begin() as conn:
-            conn.execute(self.scores.insert().values(asset=asset, ts=int(ts), method=method, score=float(score), details=d))
-
-    def upsert_backfill_status(self, asset: str, interval: str, last_ts: Optional[int], status: str):
-        now = datetime.now(timezone.utc).isoformat()
-        with self.engine.begin() as conn:
-            try:
-                conn.execute(self.backfill_status.insert().values(asset=asset, interval=interval, last_ts=last_ts, status=status, updated_at=now))
-            except IntegrityError:
-                conn.execute(self.backfill_status.update().where(and_(self.backfill_status.c.asset == asset, self.backfill_status.c.interval == interval)).values(last_ts=last_ts, status=status, updated_at=now))
-
-    def get_backfill_status(self, asset: str, interval: str):
-        with self.engine.connect() as conn:
-            r = conn.execute(select(self.backfill_status).where(and_(self.backfill_status.c.asset == asset, self.backfill_status.c.interval == interval))).fetchone()
-            return dict(r._mapping) if r else None
-
-    def apply_retention(self, retention_days: Dict[str, int]):
-        if not retention_days:
-            return 0
-        now_ts = int(datetime.utcnow().timestamp())
-        total = 0
-        with self.engine.begin() as conn:
-            for tf, days in retention_days.items():
-                try:
-                    days_i = int(days)
-                except Exception:
-                    continue
-                thresh = now_ts - days_i * 24 * 3600
-                res = conn.execute(delete(self.candles).where(and_(self.candles.c.interval == tf, self.candles.c.ts < thresh)))
-                try:
-                    total += int(res.rowcount or 0)
-                except Exception:
-                    total += 0
-        return total
-
-    def list_assets(self):
-        with self.engine.connect() as conn:
-            r = conn.execute(select(self.assets.c.symbol).order_by(self.assets.c.symbol)).fetchall()
-            return [row[0] for row in r]
-
-    def export_last_candles(self, asset: str, interval: str, limit: int = 500):
-        with self.engine.connect() as conn:
-            r = conn.execute(select(self.candles).where(and_(self.candles.c.asset == asset, self.candles.c.interval == interval)).order_by(self.candles.c.ts.desc()).limit(limit)).fetchall()
-            return [dict(row._mapping) for row in r]
-
-    def close(self):
+    # ---------------------------
+    # Assets / candles interface
+    # ---------------------------
+    def list_assets(self) -> List[str]:
+        """Devuelve lista de símbolos (watchlist)."""
         try:
-            self.engine.dispose()
+            if _storage and hasattr(_storage, "list_assets"):
+                return _storage.list_assets()
+            if _fetch and hasattr(_fetch, "list_watchlist_assets"):
+                return _fetch.list_watchlist_assets()
+        except Exception:
+            LOG.exception("list_assets core failed")
+        return self._fallback_list_assets()
+
+    def _fallback_list_assets(self) -> List[str]:
+        candidates = [
+            os.path.join(CONF_DIR, "watchlist.csv"),
+            os.path.join(CONF_DIR, "watchlist.json"),
+            os.path.join(CONF_DIR, "assets.csv"),
+            os.path.join(CONF_DIR, "assets.json"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                try:
+                    if c.endswith(".csv"):
+                        df = pd.read_csv(c)
+                        if "symbol" in df.columns:
+                            return df["symbol"].astype(str).tolist()
+                        return df.iloc[:, 0].astype(str).tolist()
+                    else:
+                        j = pd.read_json(c)
+                        return j.iloc[:, 0].astype(str).tolist()
+                except Exception:
+                    continue
+        # fallback default
+        return ["BTCUSDT", "ETHUSDT", "AAPL", "TSLA"]
+
+    def load_candles(self, symbol: str, limit: int = 1000) -> pd.DataFrame:
+        """Carga velas desde storage/fetch/csv fallback."""
+        try:
+            if _storage and hasattr(_storage, "load_candles"):
+                return _storage.load_candles(symbol, limit=limit)
+            if _fetch:
+                # aceptar varios nombres posibles
+                for fn in ("get_candles", "get_latest_candles", "get_historical", "fetch_candles"):
+                    f = getattr(_fetch, fn, None)
+                    if callable(f):
+                        try:
+                            df = f(symbol, limit=limit)
+                            if isinstance(df, pd.DataFrame):
+                                return df
+                        except Exception:
+                            LOG.exception("fetch.%s failed for %s", fn, symbol)
+        except Exception:
+            LOG.exception("load_candles core failed")
+
+        # CSV fallback
+        path_csv = os.path.join(CACHE_DIR, f"{symbol}.csv")
+        if os.path.exists(path_csv):
+            try:
+                df = pd.read_csv(path_csv, parse_dates=["timestamp"])
+                return df.sort_values("timestamp").reset_index(drop=True)
+            except Exception:
+                LOG.exception("CSV fallback read failed for %s", path_csv)
+        # empty df standard
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    def save_candles(self, symbol: str, df: pd.DataFrame) -> bool:
+        """Guarda velas en storage o CSV fallback."""
+        try:
+            if _storage and hasattr(_storage, "save_candles"):
+                return _storage.save_candles(symbol, df)
+        except Exception:
+            LOG.exception("save_candles using core.storage failed")
+        try:
+            path = os.path.join(CACHE_DIR, f"{symbol}.csv")
+            df.to_csv(path, index=False)
+            return True
+        except Exception:
+            LOG.exception("save_candles csv fallback failed for %s", symbol)
+        return False
+
+    # ---------------------------
+    # Indicators
+    # ---------------------------
+    def apply_indicators(self, df: pd.DataFrame, indicators: List[str] = None, params: Dict[str, Any] = None) -> pd.DataFrame:
+        """Intenta core.indicators.apply_indicators, si no calcula EMA/RSI minimal."""
+        indicators = indicators or ["ema", "rsi"]
+        params = params or {}
+        try:
+            if _indicators and hasattr(_indicators, "apply_indicators"):
+                return _indicators.apply_indicators(df.copy(), indicators=indicators, params=params)
+        except Exception:
+            LOG.exception("apply_indicators via core.indicators failed")
+        # fallback minimal
+        df = df.copy()
+        if "close" in df.columns:
+            close = df["close"].astype(float)
+            ema_short = int(params.get("ema_short", 9))
+            ema_long = int(params.get("ema_long", 50))
+            df[f"ema_{ema_short}"] = close.ewm(span=ema_short, adjust=False).mean()
+            df[f"ema_{ema_long}"] = close.ewm(span=ema_long, adjust=False).mean()
+            period = int(params.get("rsi_period", 14))
+            df[f"rsi_{period}"] = self._rsi(close, period)
+        return df
+
+    def _rsi(self, series: pd.Series, period: int = 14) -> pd.Series:
+        delta = series.diff()
+        up = delta.clip(lower=0).fillna(0)
+        down = -1 * delta.clip(upper=0).fillna(0)
+        ma_up = up.ewm(com=(period - 1), adjust=False).mean()
+        ma_down = down.ewm(com=(period - 1), adjust=False).mean()
+        rs = ma_up / (ma_down.replace(0, np.nan))
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.fillna(50)
+
+    # ---------------------------
+    # Backfill / update helpers
+    # ---------------------------
+    def update_symbol(self, symbol: str, limit: int = 200) -> Dict[str, Any]:
+        """
+        Recupera las últimas velas para un símbolo y las guarda.
+        Busca funciones en core.fetch o core.storage; si falla retorna info de cache.
+        """
+        try:
+            if _fetch:
+                for fn_name in ("get_latest_candles", "get_candles", "fetch_candles", "get_historical"):
+                    fn = getattr(_fetch, fn_name, None)
+                    if callable(fn):
+                        try:
+                            df = fn(symbol, limit=limit)
+                            if isinstance(df, pd.DataFrame) and not df.empty:
+                                self.save_candles(symbol, df)
+                                return {"symbol": symbol, "rows": len(df), "source": f"fetch::{fn_name}"}
+                        except Exception:
+                            LOG.exception("fetch fn %s failed for %s", fn_name, symbol)
+            df = self.load_candles(symbol, limit=limit)
+            return {"symbol": symbol, "rows": len(df) if isinstance(df, pd.DataFrame) else 0, "source": "cache/fallback"}
+        except Exception as e:
+            LOG.exception("update_symbol error: %s", e)
+            return {"symbol": symbol, "error": str(e)}
+
+    def run_full_backfill(self, symbols: Optional[List[str]] = None, per_symbol_limit: int = 1000) -> Dict[str, Any]:
+        """
+        Ejecuta backfill para todos los símbolos o la lista dada.
+        Si core.fetch tiene run_full_backfill, lo utiliza.
+        """
+        res = {"started_at": datetime.utcnow().isoformat(), "per_symbol_limit": per_symbol_limit, "results": {}}
+        try:
+            if _fetch and hasattr(_fetch, "run_full_backfill"):
+                try:
+                    out = _fetch.run_full_backfill(symbols=symbols, limit=per_symbol_limit)
+                    res["results"] = {"core_fetch": out}
+                    res["finished_at"] = datetime.utcnow().isoformat()
+                    return res
+                except Exception:
+                    LOG.exception("core.fetch.run_full_backfill failed")
+
+            syms = symbols or self.list_assets()
+            for s in syms:
+                try:
+                    r = self.update_symbol(s, limit=per_symbol_limit)
+                    res["results"][s] = r
+                except Exception as e:
+                    LOG.exception("backfill for %s failed: %s", s, e)
+                    res["results"][s] = {"error": str(e)}
+            res["finished_at"] = datetime.utcnow().isoformat()
+        except Exception as e:
+            LOG.exception("run_full_backfill top error: %s", e)
+            res["error"] = str(e)
+        return res
+
+    # ---------------------------
+    # Backtest / AI helpers
+    # ---------------------------
+    def run_backtest_for(self, symbol: str) -> Dict[str, Any]:
+        """Llama a core.orchestrator.run_backtest_for si existe."""
+        try:
+            if _orchestrator and hasattr(_orchestrator, "run_backtest_for"):
+                return _orchestrator.run_backtest_for(symbol)
+        except Exception as e:
+            LOG.exception("run_backtest_for error: %s", e)
+            return {"error": "backtest_failed", "message": str(e)}
+        return {"error": "not_implemented", "message": "Backtest engine no disponible."}
+
+    def run_initial_backtests(self, symbols: Optional[List[str]] = None, limit: int = 5) -> Dict[str, Any]:
+        """Ejecuta backtests para primeros 'limit' símbolos y devuelve resumen."""
+        syms = symbols or self.list_assets()
+        res = {}
+        count = 0
+        for s in syms:
+            if count >= limit:
+                break
+            try:
+                r = self.run_backtest_for(s)
+                res[s] = r
+            except Exception as e:
+                LOG.exception("initial backtest failed for %s: %s", s, e)
+                res[s] = {"error": str(e)}
+            count += 1
+        return res
+
+    def train_ai(self, params: Dict[str, Any] = None) -> Dict[str, Any]:
+        try:
+            if _ai_train and hasattr(_ai_train, "train"):
+                return _ai_train.train(params or {})
+        except Exception as e:
+            LOG.exception("train_ai error: %s", e)
+            return {"error": "train_failed", "message": str(e)}
+        return {"error": "not_implemented", "message": "Modulo IA no disponible."}
+
+    def infer_ai(self, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            if _ai_inf and hasattr(_ai_inf, "predict"):
+                return _ai_inf.predict(symbol)
+            if _ai_inf and hasattr(_ai_inf, "infer"):
+                return _ai_inf.infer(symbol)
+        except Exception as e:
+            LOG.exception("infer_ai error: %s", e)
+            return {"error": "infer_failed", "message": str(e)}
+        return None
+
+    # ---------------------------
+    # Settings persistence
+    # ---------------------------
+    def save_setting(self, key: str, value: Any) -> bool:
+        """Guarda setting intentando storage.real -> sqlite -> json."""
+        try:
+            if _storage and hasattr(_storage, "save_setting"):
+                return _storage.save_setting(key, value)
+        except Exception:
+            LOG.exception("save_setting via core.storage failed")
+
+        # sqlite fallback
+        try:
+            conn = sqlite3.connect(SETTINGS_DB)
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)""")
+            cur.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                        (key, json.dumps(value, default=str), datetime.utcnow().isoformat()))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception:
+            LOG.exception("save_setting sqlite fallback failed")
+
+        # json fallback
+        try:
+            data = {}
+            if os.path.exists(SETTINGS_JSON):
+                with open(SETTINGS_JSON, "r", encoding="utf8") as f:
+                    data = json.load(f)
+            data[key] = value
+            with open(SETTINGS_JSON, "w", encoding="utf8") as f:
+                json.dump(data, f, indent=2, default=str)
+            return True
+        except Exception:
+            LOG.exception("save_setting json fallback failed")
+        return False
+
+    def load_setting(self, key: str, default: Any = None) -> Any:
+        """Carga setting: intenta storage.real -> sqlite -> json -> default."""
+        try:
+            if _storage and hasattr(_storage, "load_setting"):
+                return _storage.load_setting(key, default)
         except Exception:
             pass
+        try:
+            conn = sqlite3.connect(SETTINGS_DB)
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)""")
+            cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                try:
+                    return json.loads(row[0])
+                except Exception:
+                    return row[0]
+        except Exception:
+            pass
+        try:
+            if os.path.exists(SETTINGS_JSON):
+                with open(SETTINGS_JSON, "r", encoding="utf8") as f:
+                    j = json.load(f)
+                return j.get(key, default)
+        except Exception:
+            pass
+        return default
 
-# ---------- Factory ----------
-def _use_postgres() -> bool:
-    db_url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DATABASE_URL")
-    return bool(db_url and _HAS_POSTGRES_IMPL)
+    # ---------------------------
+    # Health / status
+    # ---------------------------
+    def health_status(self) -> Dict[str, Any]:
+        status = {
+            "time": datetime.utcnow().isoformat(),
+            "modules": {
+                "storage": bool(_storage),
+                "fetch": bool(_fetch),
+                "indicators": bool(_indicators),
+                "orchestrator": bool(_orchestrator),
+                "ai_train": bool(_ai_train),
+                "ai_infer": bool(_ai_inf),
+            },
+            "data_cache": {
+                "cache_dir_exists": os.path.exists(CACHE_DIR),
+                "cache_files": len([f for f in os.listdir(CACHE_DIR) if f.endswith(".csv")]) if os.path.exists(CACHE_DIR) else 0
+            }
+        }
+        return status
 
-class StorageAdapter:
+# singleton
+# ----------------------------
+# Adapter compatibility shim: safe load_candles method for Adapter instances.
+# Append this at end to ensure Adapter has a robust method that tolerates backend signature differences.
+# ----------------------------
+import inspect
+import logging
+from typing import Optional
+
+_LOG = logging.getLogger(__name__)
+
+def _adapter_load_candles_compat(self, symbol: str, interval: Optional[str] = None, limit: int = 1000):
     """
-    Wrapper that exposes a uniform API but delegates to PostgresStorage when available.
+    Robust Adapter.load_candles implementation:
+      - tries storage module's load_candles with a few signatures
+      - tries fetch module if needed
+      - falls back to CSV cache
     """
-    def __init__(self, db_url: Optional[str] = None, config: Optional[dict] = None):
-        self.config = config or {}
-        db_url = db_url or os.getenv("DATABASE_URL")
-        if db_url and _HAS_POSTGRES_IMPL:
-            log.info("StorageAdapter -> using PostgresStorage (Supabase).")
-            self.impl = PostgresStorage(db_url=db_url)
-            # ensure schema
+    try:
+        # If there is a storage backend object referenced as _storage in module scope, try it first.
+        _storage = globals().get("_storage")
+        _fetch = globals().get("_fetch")
+        # Try _storage if available
+        if _storage and hasattr(_storage, "load_candles"):
+            fn = getattr(_storage, "load_candles")
             try:
-                self.impl.create_schema_if_missing()
+                sig = inspect.signature(fn)
+                params = sig.parameters
+                if "interval" in params:
+                    use_interval = interval or "1h"
+                    try:
+                        return fn(symbol, interval=use_interval, limit=limit)
+                    except TypeError:
+                        # try other pos/kw combos
+                        try:
+                            return fn(symbol, use_interval, None, limit)
+                        except Exception:
+                            return fn(symbol, use_interval, limit)
+                else:
+                    # backend expects (symbol, limit=...)
+                    try:
+                        return fn(symbol, limit=limit)
+                    except TypeError:
+                        return fn(symbol, limit)
             except Exception:
-                log.exception("Error creando schema en PostgresStorage.")
-        else:
-            log.info("StorageAdapter -> using LocalStorageFallback (SQLite).")
-            self.impl = LocalStorageFallback(db_path=os.getenv("SQLITE_PATH", "data/db/data.db"))
+                # Last resort: attempt call with limit only
+                try:
+                    return fn(symbol, limit=limit)
+                except Exception:
+                    _LOG.exception("adapter: _storage.load_candles attempts failed")
+        # Try fetch module next (some fetchers expose load_candles)
+        if _fetch and hasattr(_fetch, "load_candles"):
+            try:
+                ffn = getattr(_fetch, "load_candles")
+                return ffn(symbol, interval=interval, limit=limit)
+            except Exception:
+                try:
+                    return ffn(symbol, limit=limit)
+                except Exception:
+                    _LOG.exception("adapter: _fetch.load_candles attempts failed")
+    except Exception:
+        _LOG.exception("adapter load_candles compatibility wrapper failed")
 
-    # Delegate methods
-    def create_schema_if_missing(self):
-        return self.impl.create_schema_if_missing()
+    # CSV fallback (CACHE_DIR likely defined in the module)
+    try:
+        CACHE_DIR = globals().get("CACHE_DIR", None)
+        import os, pandas as _pd
+        if CACHE_DIR:
+            path_csv = os.path.join(CACHE_DIR, f"{symbol}.csv")
+            if os.path.exists(path_csv):
+                df = _pd.read_csv(path_csv)
+                return df
+    except Exception:
+        _LOG.exception("adapter CSV fallback failed for %s", symbol)
 
-    def upsert_asset(self, symbol: str, tipo: str = "crypto", meta: Optional[dict] = None):
-        return self.impl.upsert_asset(symbol, tipo, meta)
+    # final empty df
+    import pandas as _pd
+    return _pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    def bulk_insert_candles(self, rows: List[dict], batch_size: int = 1000):
-        return self.impl.bulk_insert_candles(rows, batch_size=batch_size)
+# Attach to Adapter class if it exists in module scope
+if "Adapter" in globals():
+    try:
+        Adapter.load_candles = _adapter_load_candles_compat
+        _LOG.info("Adapter.load_candles replaced with compatibility wrapper")
+    except Exception:
+        _LOG.exception("Could not attach load_candles compat to Adapter")
+else:
+    _LOG.info("Adapter class not found in adapter.py when attaching load_candles compat")
 
-    def get_last_candle_ts(self, asset: str, interval: str):
-        return self.impl.get_last_candle_ts(asset, interval)
-
-    def bulk_insert_indicators(self, rows: List[dict], batch_size: int = 500):
-        return self.impl.bulk_insert_indicators(rows, batch_size=batch_size)
-
-    def bulk_insert_scores(self, rows: List[dict], batch_size: int = 500):
-        return self.impl.bulk_insert_scores(rows, batch_size=batch_size)
-
-    def insert_score(self, asset: str, ts: int, method: str, score: float, details: Optional[dict] = None):
-        return self.impl.insert_score(asset, ts, method, score, details)
-
-    def upsert_backfill_status(self, asset: str, interval: str, last_ts: Optional[int], status: str):
-        return self.impl.upsert_backfill_status(asset, interval, last_ts, status)
-
-    def get_backfill_status(self, asset: str, interval: str):
-        return self.impl.get_backfill_status(asset, interval)
-
-    def apply_retention(self, retention_days: Dict[str, int]):
-        return self.impl.apply_retention(retention_days)
-
-    def list_assets(self):
-        return self.impl.list_assets()
-
-    def export_last_candles(self, asset: str, interval: str, limit: int = 500):
-        return self.impl.export_last_candles(asset, interval, limit=limit)
-
-    def close(self):
-        return self.impl.close()
-
-
-# ---------- utils ----------
-def normalize_weights(weights: Dict[str, float], expected_keys: Optional[List[str]] = None) -> Dict[str, float]:
-    """
-    Normaliza y valida un dict de pesos. Evita problemas como nombres distintos
-    y sumas > 1. Se alinea con expected_keys si se pasa.
-    """
-    if not weights:
-        weights = {}
-    w = {k.lower(): float(v) for k, v in weights.items() if v is not None}
-    # quitar negativos
-    w = {k: max(0.0, v) for k, v in w.items()}
-    # keys esperadas (normalizar nombres simples)
-    keys = [k.lower() for k in (expected_keys or list(w.keys()) or ["ema", "support", "atr", "macd", "rsi", "fibonacci"])]
-    # construir base
-    base = {k: float(w.get(k, 0.0)) for k in keys}
-    total = sum(base.values())
-    if total <= 0:
-        # repartir uniformemente
-        n = len(base)
-        if n == 0:
-            return {}
-        val = 1.0 / n
-        base = {k: val for k in base}
-        return base
-    # normalizar a suma 1.0 (mantener proporciones)
-    base = {k: (v / total) for k, v in base.items()}
-    return base
+adapter = Adapter()

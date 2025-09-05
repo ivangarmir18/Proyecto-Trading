@@ -1,6 +1,0 @@
-# Procfile - define process types
-# Web UI (Streamlit)
-web: SERVICE=web bash start.sh
-
-# API (FastAPI via Uvicorn)
-api: SERVICE=api bash start.sh
