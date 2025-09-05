@@ -6,20 +6,45 @@
     "alt_col": "ai_score"
   },
   "components": {
-    "rsi": {
-      "source": "rsi_14",
-      "norm": { "type": "minmax", "min": 0, "max": 100, "clip": [0,1], "invert": false },
-      "weight": 0.3
+    "ema": {
+      "type": "ema_diff",
+      "params": { "short": 9, "long": 50 },
+      "expr": "ema_signal",
+      "weight": 0.25,
+      "norm": { "type": "zscore", "window": 200, "clip": [0, 1], "invert": false }
     },
-    "trend": {
-      "expr": "(close / ema_50) - 1",
-      "norm": { "type": "zscore", "window": 200, "clip": [0,1], "invert": false },
-      "weight": 0.4
+    "support": {
+      "type": "support_resistance",
+      "source": "support",
+      "weight": 0.20,
+      "norm": { "type": "minmax", "min": 0, "max": 1 }
+    },
+    "atr": {
+      "type": "atr",
+      "params": { "window": 14 },
+      "source": "atr_14",
+      "weight": 0.20,
+      "norm": { "type": "zscore", "window": 200, "clip": [0, 1] }
     },
     "macd": {
+      "type": "macd",
       "source": "macd_hist",
-      "norm": { "type": "zscore", "window": 200, "clip": [0,1], "invert": false },
-      "weight": 0.3
+      "weight": 0.15,
+      "norm": { "type": "zscore", "window": 200, "clip": [0, 1] }
+    },
+    "rsi": {
+      "type": "rsi",
+      "source": "rsi_14",
+      "params": { "window": 14 },
+      "weight": 0.10,
+      "norm": { "type": "minmax", "min": 0, "max": 100 }
+    },
+    "fibonacci": {
+      "type": "fibonacci",
+      "source": "fibo_signal",
+      "weight": 0.10,
+      "norm": { "type": "minmax", "min": 0, "max": 1 }
     }
-  }
+  },
+  "score_scale": { "min": 0.0, "max": 1.0 }
 }
